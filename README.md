@@ -165,4 +165,10 @@ src/
 
 ## 设计参考
 
-工程设计参考 [claude-code-best/claude-code](https://github.com/claude-code-best/claude-code) 的工具池稳定化、超长工具结果落盘、会话恢复、权限分层和任务状态可观测性；参考 [Exa MCP Server](https://github.com/exa-labs/exa-mcp-server) 的 search/fetch 分层、查询多样化、硬过滤、去重与来源质量策略；参考 [Pi Agent Harness](https://github.com/earendil-works/pi) 的参数预处理、执行状态机、截断防护、容错编辑和大输出落盘思路。许可证与固定参考版本见 `THIRD_PARTY_NOTICES.md`。
+工程设计参考 [claude-code-best/claude-code](https://github.com/claude-code-best/claude-code) 的工具池稳定化、超长工具结果落盘、会话恢复、权限分层和任务状态可观测性；参考 [Exa MCP Server](https://github.com/exa-labs/exa-mcp-server) 的 search/fetch 分层、查询多样化、硬过滤、去重与来源质量策略；参考 [Pi Agent Harness](https://github.com/earendil-works/pi) 的参数预处理、执行状态机、截断防护、容错编辑和大输出落盘思路。固定参考版本见 `THIRD_PARTY_NOTICES.md`。
+
+## 许可证
+
+本项目采用 [GPL-3.0-only](LICENSE) 协议。
+
+注意：上下文压缩模块移植自 [openai/codex](https://github.com/openai/codex)（Apache-2.0）。Apache-2.0 与 GPLv3 兼容，对应出处声明见上文表格。

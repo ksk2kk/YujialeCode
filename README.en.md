@@ -163,4 +163,10 @@ Threading model: main rendering loop + stdin input thread + one agent worker thr
 
 ## Design References
 
-Engineering design draws on [claude-code-best/claude-code](https://github.com/claude-code-best/claude-code) for tool-pool stabilization, oversized tool-result persistence, session recovery, permission tiers, and task-state observability; on [Exa MCP Server](https://github.com/exa-labs/exa-mcp-server) for search/fetch layering, query diversification, hard filtering, deduplication, and source-quality strategies; and on [Pi Agent Harness](https://github.com/earendil-works/pi) for parameter preprocessing, execution state machines, truncation guards, fault-tolerant editing, and large-output persistence. YujialeCode keeps an independent Rust implementation and short system prompt and copies no reference project's system prompt. Licenses and pinned reference versions are listed in `THIRD_PARTY_NOTICES.md`.
+Engineering design draws on [claude-code-best/claude-code](https://github.com/claude-code-best/claude-code) for tool-pool stabilization, oversized tool-result persistence, session recovery, permission tiers, and task-state observability; on [Exa MCP Server](https://github.com/exa-labs/exa-mcp-server) for search/fetch layering, query diversification, hard filtering, deduplication, and source-quality strategies; and on [Pi Agent Harness](https://github.com/earendil-works/pi) for parameter preprocessing, execution state machines, truncation guards, fault-tolerant editing, and large-output persistence. YujialeCode keeps an independent Rust implementation and short system prompt and copies no reference project's system prompt. Pinned reference versions are listed in `THIRD_PARTY_NOTICES.md`.
+
+## License
+
+This project is licensed under [GPL-3.0-only](LICENSE).
+
+Note: the context compression module is ported from [openai/codex](https://github.com/openai/codex) (Apache-2.0). Apache-2.0 is compatible with GPLv3; the corresponding attribution is in the table above.
