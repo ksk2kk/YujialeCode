@@ -2,7 +2,7 @@
 
 A code agent built for local model enthusiasts. Pure Rust, an extremely minimal system prompt, and smooth operation even at a 30-token speed budget. Fully compatible with Claude-style skills.
 
-A minimal pure-Rust local model CLI agent: zero runtime dependencies, hand-rolled TUI, and a low-token system prompt design. Works with any OpenAI-compatible endpoint including DeepSeek / Ollama / LM Studio / vLLM. The `--mock` offline demo runs the entire flow without any API key. Optional QQ integration (OneBot v11, NapCat / Lagrange) supports fast group chat and private chat responses.
+A minimal pure-Rust local model CLI agent: few dependencies (8 crates: serde / ureq / reqwest / tokio / tungstenite, etc.), a hand-rolled TUI, and a low-token system prompt design. Works with any OpenAI-compatible endpoint including DeepSeek / Ollama / LM Studio / vLLM. The `--mock` offline demo runs the entire flow without any API key. Optional QQ integration (OneBot v11, NapCat / Lagrange) supports fast group chat and private chat responses.
 
 ## Dedication
 
@@ -159,7 +159,7 @@ src/
   skills.rs      skill install / list / inject
 ```
 
-Threading model: main rendering loop + stdin input thread + one agent worker thread per turn (`std::sync::mpsc`), with the QQ bridge on its own thread. Blocking I/O + std threads, no tokio. Dependencies are only serde / serde_json / ureq / tungstenite / libc / unicode-width.
+Threading model: main rendering loop + stdin input thread + one agent worker thread per turn (`std::sync::mpsc`), with the QQ bridge on its own thread. The rest uses blocking I/O on std threads; only llm.rs runs a single-threaded tokio runtime for cancellable reqwest streaming SSE requests. Direct dependencies (8): serde / serde_json / ureq / reqwest / tokio / tungstenite / libc / unicode-width.
 
 ## Design References
 
