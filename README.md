@@ -8,7 +8,7 @@
 
 本项目以我的朋友 [Yujiale](https://github.com/dawalishi821) 的名字命名——YujialeCode 中的 "Yujiale" 正是他的名字。祝 Yujiale 生日快乐！
 
-极简纯 Rust 本地模型 CLI Agent：零运行时依赖、手搓 TUI、低系统提示词设计。面向 DeepSeek / Ollama / LM Studio / vLLM 等任意 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊极速响应。
+极简纯 Rust 本地模型 CLI Agent：依赖少（serde / ureq / reqwest / tokio / tungstenite 等 8 个 crate）、手搓 TUI、低系统提示词设计。面向 DeepSeek / Ollama / LM Studio / vLLM 等任意 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊极速响应。
 
 ## 特性
 
@@ -161,7 +161,7 @@ src/
   skills.rs      技能安装 / 列表 / 注入
 ```
 
-线程模型：主线程渲染循环 + stdin 输入线程 + 每轮一个 agent 工作线程（`std::sync::mpsc` 通信），QQ 桥接独立线程。阻塞 I/O + std 线程，无 tokio。依赖仅 serde / serde_json / ureq / tungstenite / libc / unicode-width。
+线程模型：主线程渲染循环 + stdin 输入线程 + 每轮一个 agent 工作线程（`std::sync::mpsc` 通信），QQ 桥接独立线程。其余阻塞 I/O 用 std 线程；仅 llm.rs 用单线程 tokio runtime 跑可取消的 reqwest 流式 SSE 请求。直接依赖 8 个：serde / serde_json / ureq / reqwest / tokio / tungstenite / libc / unicode-width。
 
 ## 设计参考
 
