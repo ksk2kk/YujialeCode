@@ -1,26 +1,3 @@
-                          
-   
-                                                          
-                                                                 
-                           
-   
-                  
-   
-                                                                        
-                                                                  
-                                                              
-                     
-   
-                                           
-                                   
-   
-                
-   
-                                                      
-                                                             
-                                                      
-                                
-
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -29,7 +6,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-
 use crate::backend::TokenBudget;
 use crate::compress;
 use crate::config::Config;
@@ -43,43 +19,20 @@ use crate::session::SessionStore;
 use crate::tools::{
     AskAnswer, AskRequest, PermDecision, PermRequest, QqOut, ToolCtx, execute,
 };
-
-                                                   
-                                           
 const MAX_RELOADS: usize = 2;
-
-                                 
-                                      
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
-
-                                  
 const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;
-
-                             
 const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 4;
-
-                          
 const NO_PERM_MSG: &str = "（无权限：当前用户只能闲聊，无法操作电脑或调用工具。请礼貌拒绝，不要尝试其他工具。）";
-
 #[derive(Default)]
 struct ToolLoopGuard {
-                                               
     last_call: Option<String>,
-                              
     identical_calls: usize,
-                                    
     last_result_hash: Option<u64>,
-                                     
     identical_results: usize,
-                          
     consecutive_failures: usize,
 }
-
 impl ToolLoopGuard {
-                  
-       
-                                                                 
-                                          
     fn before_call(&mut self, op: &str, args: &Value) -> Option<String> {
         let signature = effective_tool_signature(op, args);
         if self.last_call.as_deref() == Some(signature.as_str()) {
@@ -97,8 +50,6 @@ impl ToolLoopGuard {
             None
         }
     }
-
-                                                    
     fn after_result(&mut self, output: &str) -> Option<String> {
         let mut hasher = DefaultHasher::new();
         output.hash(&mut hasher);
@@ -109,13 +60,11 @@ impl ToolLoopGuard {
             self.last_result_hash = Some(hash);
             self.identical_results = 1;
         }
-
         if tool_result_failed(output) {
             self.consecutive_failures += 1;
         } else {
             self.consecutive_failures = 0;
         }
-
         if self.identical_results >= MAX_IDENTICAL_TOOL_RESULTS {
             return Some(format!(
                 "工具已连续 {} 次返回相同结果，已停止空转",
@@ -131,23 +80,6 @@ impl ToolLoopGuard {
         None
     }
 }
-
-                                
-   
-        
-                        
-                            
-   
-               
-                                                          
-                                                                
-                                      
-                                                               
-                                 
-                   
-   
-                                                                
-                                    
 fn effective_tool_signature(op: &str, args: &Value) -> String {
     let (effective_op, effective_args) = if op == "execute_command" {
         match args.get("op").and_then(Value::as_str) {
@@ -165,14 +97,6 @@ fn effective_tool_signature(op: &str, args: &Value) -> String {
         serde_json::to_string(effective_args).unwrap_or_default()
     )
 }
-
-                                         
-                                           
-   
-                                                 
-                                                  
-                                            
-                                  
 fn tool_result_failed(output: &str) -> bool {
     if output.trim_start().starts_with("错误:") {
         return true;
@@ -184,9 +108,6 @@ fn tool_result_failed(output: &str) -> bool {
         .and_then(|code| code.trim().parse::<i32>().ok())
         .is_some_and(|code| code != 0)
 }
-
-                                         
-                                            
 fn focused_finalize_messages(history: &[Msg], reason: &str) -> Vec<Msg> {
     let is_real_user = |m: &&Msg| {
         m.role == "user"
@@ -206,26 +127,20 @@ fn focused_finalize_messages(history: &[Msg], reason: &str) -> Vec<Msg> {
         .get(question_idx)
         .map(|m| m.content.trim())
         .unwrap_or("");
-
     let evidence: Vec<&str> = history
         .iter()
         .skip(question_idx.saturating_add(1))
         .filter(|m| m.role == "tool" || m.content.starts_with("【工具结果】"))
         .map(|m| m.content.as_str())
         .collect();
-
     let mut packet = format!("用户问题：\n{question}\n\n收尾原因：\n{reason}");
     if !evidence.is_empty() {
         packet.push_str("\n\n本回合已有工具结果（这是唯一事实来源）：\n");
         packet.push_str(&evidence.join("\n\n---\n\n"));
     }
     packet.push_str("\n\n直接输出最终答案正文，不要写思考过程或工具调用。");
-
     vec![Msg::new("system", FINALIZE_PROMPT), Msg::new("user", packet)]
 }
-
-                                      
-                                      
 fn deterministic_read_line_answer(user_input: &str, output: &str) -> Option<String> {
     let line_no = requested_line_number(user_input)?;
     let prefix = format!("{line_no}\t");
@@ -238,27 +153,6 @@ fn deterministic_read_line_answer(user_input: &str, output: &str) -> Option<Stri
         Some(format!("第 {line_no} 行的完整内容是：\n{content}"))
     }
 }
-
-                                                           
-   
-                                           
-                                                      
-   
-                     
-                                           
-                                             
-                                                        
-                                           
-                                                 
-                                                            
-                                                      
-                                                        
-                                      
-                            
-   
-        
-                                         
-                                               
 fn requested_line_number(input: &str) -> Option<usize> {
     for (idx, _) in input.match_indices('第') {
         let tail = input[idx + '第'.len_utf8()..].trim_start();
@@ -273,10 +167,7 @@ fn requested_line_number(input: &str) -> Option<usize> {
             }
         }
     }
-
     let lower = input.to_ascii_lowercase();
-                                                  
-                                             
     for marker in ["line ", "line:", "line #"] {
         if let Some(idx) = lower.find(marker) {
             let tail = lower[idx + marker.len()..].trim_start();
@@ -288,27 +179,16 @@ fn requested_line_number(input: &str) -> Option<usize> {
     }
     None
 }
-
 pub enum AgentEvent {
-                                                  
     Delta(String),
-                                             
     Reasoning(String),
-                                    
     ToolRun { op: String, args: String },
-                     
     ToolResult(String),
-                           
     Notice(String),
-                                              
     Error(String),
-                                          
     Garbage { kind: String, sample: String, run: usize, total: usize, limit: usize },
-                    
     Done(String),
 }
-
-                                       
 fn fwd_stream(ev: crate::llm::StreamEvent, on_event: &mut impl FnMut(AgentEvent)) {
     match ev {
         crate::llm::StreamEvent::Delta(d) => on_event(AgentEvent::Delta(d)),
@@ -318,10 +198,6 @@ fn fwd_stream(ev: crate::llm::StreamEvent, on_event: &mut impl FnMut(AgentEvent)
         }
     }
 }
-
-                                     
-                                                       
-                                         
 fn trace_record_at(data_root: &std::path::Path, session: &str, ev: &AgentEvent) {
     let dir = data_root.join("trace");
     let _ = std::fs::create_dir_all(&dir);
@@ -351,37 +227,24 @@ fn trace_record_at(data_root: &std::path::Path, session: &str, ev: &AgentEvent) 
         let _ = f.flush();
     }
 }
-
 pub struct Agent {
-                                                   
     pub llm: Llm,
-                                    
     pub store: SessionStore,
-                    
     pub cfg: Config,
-                                     
     pub qq_tx: Option<Sender<QqOut>>,
-                                         
     pub cancel: Arc<AtomicBool>,
-                             
     pub chat_mode: bool,
-                               
     pub chat_only: bool,
-                                                 
     ask_tx: Option<Sender<AskRequest>>,
     answer_rx: Option<Receiver<AskAnswer>>,
     ask_seq: Arc<AtomicU64>,
-                                         
     perm_tx: Option<Sender<PermRequest>>,
     perm_rx: Option<Receiver<PermDecision>>,
-                                           
     perm_auto: Arc<AtomicBool>,
     perm_allowed: Arc<Mutex<HashSet<String>>>,
     perm_seq: Arc<AtomicU64>,
 }
-
 impl Agent {
-                            
     pub fn with_store(
         cfg: Config,
         llm: Llm,
@@ -409,15 +272,10 @@ impl Agent {
             perm_seq: Arc::new(AtomicU64::new(0)),
         }
     }
-
-                                                            
     pub fn set_ask_channels(&mut self, tx: Sender<AskRequest>, rx: Receiver<AskAnswer>) {
         self.ask_tx = Some(tx);
         self.answer_rx = Some(rx);
     }
-
-                                                  
-                                                                
     pub fn set_perm_channels(
         &mut self,
         tx: Sender<PermRequest>,
@@ -430,8 +288,6 @@ impl Agent {
         self.perm_auto = auto;
         self.perm_allowed = allowed;
     }
-
-                               
     pub fn for_session(
         cfg: Config,
         llm: Llm,
@@ -445,22 +301,6 @@ impl Agent {
         store.new_session(session_id);
         Agent::with_store(cfg, llm, store, qq_tx, chat_mode, chat_only, cancel)
     }
-
-                                  
-       
-                        
-                                                           
-                                              
-                                                                                 
-                             
-                                                  
-                                                          
-                                       
-       
-              
-                                                     
-                                                
-                                                     
     fn active_system_prompt(&self) -> String {
         let base = if self.chat_only {
             CHAT_ONLY_PROMPT
@@ -479,8 +319,6 @@ impl Agent {
             base.to_string()
         }
     }
-
-                                               
     fn maybe_auto_compact(&mut self, on_event: &mut impl FnMut(AgentEvent)) {
         let msgs = self.store.current().messages;
         if msgs.is_empty() {
@@ -488,7 +326,6 @@ impl Agent {
         }
         let sys_tokens = compress::approx_token_count(&self.active_system_prompt());
         let tokens = sys_tokens + compress::approx_total_tokens(&msgs);
-                                                          
         let window = crate::backend::effective_window(
             self.cfg.provider.ctx_override,
             self.llm.n_ctx(),
@@ -499,8 +336,6 @@ impl Agent {
             on_event(AgentEvent::Notice(format!(
                 "上下文 {tokens}/{window} tok 超阈值，自动压缩中…"
             )));
-                                               
-                                                 
             let target_total = (window as f64 * threshold * 0.8) as usize;
             let history_budget = target_total.saturating_sub(sys_tokens).max(128);
             match compress::compact_to_limit(&self.llm, &msgs, &self.cancel, history_budget) {
@@ -516,40 +351,25 @@ impl Agent {
             }
         }
     }
-
-                               
     pub fn run_turn(&mut self, user_input: &str, on_event: &mut impl FnMut(AgentEvent)) -> Result<String, String> {
         self.cancel.store(false, Ordering::Relaxed);
-                                              
-                                                
         let trace_enabled = self.cfg.trace.enabled;
         let session_id = self.store.current_id().to_string();
         let trace_session = session_id.clone();
         let trace_root = self.cfg.data_dir();
         let mut traced = move |ev: AgentEvent| {
-                                                          
-                                                              
             if trace_enabled && !matches!(&ev, AgentEvent::Delta(_) | AgentEvent::Reasoning(_)) {
                 trace_record_at(&trace_root, &trace_session, &ev);
             }
             on_event(ev);
         };
         self.maybe_auto_compact(&mut traced);
-
         self.store.append(&Msg::new("user", user_input));
         if self.store.is_dirty() {
-                              
             self.store.set_dirty(false);
         }
         let mut tool_guard = ToolLoopGuard::default();
-                                            
-                                                       
-                                    
         let mut has_tool_result = false;
-
-                                                     
-                                           
-                                    
         if !self.chat_only {
             if let Some((op, args)) = crate::tools::keyword_tool(user_input) {
             let _ = tool_guard.before_call(op, &args);
@@ -580,20 +400,14 @@ impl Agent {
             }
             }
         }
-
         let final_text: String;
         let mut iter = 0;
-                                                 
-                                       
         let mut reloads = 0;
-                                                 
-                                              
         let mut interrupts = 0;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err("已取消".into());
             }
-                                                             
             if iter >= self.cfg.tool_times {
                 let reason = format!(
                     "工具循环次数已达上限（{}），结束本轮",
@@ -604,27 +418,19 @@ impl Agent {
                 break;
             }
             iter += 1;
-
             let msgs = self.store.current().messages;
             let sys = self.active_system_prompt();
             let mut req_msgs = vec![Msg::new("system", sys)];
             req_msgs.extend(msgs.clone());
-                                
             let req = ChatRequest {
                 messages: req_msgs,
                 tools: if self.cfg.provider.native_tools && !self.chat_only { Some(native_tools_json()) } else { None },
-                                                             
-                                                                 
                 max_tokens: self.llm.max_tokens_for(
                     if self.chat_mode { TokenBudget::QqMain } else { TokenBudget::TuiMain },
                     self.cfg.qq.max_tokens,
                 ),
-                                                    
                 stream: !self.chat_mode,
             };
-
-                                                     
-                                                                 
             let attempt = if self.cfg.fuckloop && has_tool_result {
                 self.llm
                     .stream_without_reasoning(&req, &self.cancel, |ev| fwd_stream(ev, &mut traced))
@@ -635,7 +441,6 @@ impl Agent {
             let result = match attempt {
                 Ok(r) => r,
                 Err(e) => {
-                                                   
                     if !self.cfg.provider.auto_reload || self.cancel.load(Ordering::Relaxed) {
                         return Err(e);
                     }
@@ -658,8 +463,6 @@ impl Agent {
                     }
                 }
             };
-
-                                                              
             if trace_enabled {
                 if !result.reasoning.is_empty() {
                     trace_record_at(
@@ -676,12 +479,6 @@ impl Agent {
                     );
                 }
             }
-
-                                                     
-                                                          
-                                                    
-                                                 
-                                                     
             if !self.cfg.provider.native_tools && result.text.is_empty() {
                 let calls = extract_tools_from_reasoning(&result.reasoning);
                 if !calls.is_empty() {
@@ -729,8 +526,6 @@ impl Agent {
                         traced(AgentEvent::Notice(format!("连续打断 {interrupts} 次仍无输出（思考流卡死），重载模型后重试…")));
                         if self.cfg.provider.auto_reload && !self.cancel.load(Ordering::Relaxed) && reloads < MAX_RELOADS {
                             reloads += 1;
-                                                                  
-                                                                 
                             self.reload_wait_cooldown(&mut traced)?;
                             interrupts = 0;                                         
                             continue;
@@ -748,12 +543,6 @@ impl Agent {
                     continue;
                 }
             }
-
-                                                  
-                                                    
-                                                          
-                                              
-                                                        
             if self.cfg.provider.native_tools
                 && result.text.trim().is_empty()
                 && !result.reasoning.trim().is_empty()
@@ -773,8 +562,6 @@ impl Agent {
                     traced(AgentEvent::Notice(format!("连续打断 {interrupts} 次仍无输出（思考流卡死），重载模型后重试…")));
                     if self.cfg.provider.auto_reload && !self.cancel.load(Ordering::Relaxed) && reloads < MAX_RELOADS {
                         reloads += 1;
-                                                              
-                                                             
                         self.reload_wait_cooldown(&mut traced)?;
                         interrupts = 0;                                         
                         continue;
@@ -791,9 +578,6 @@ impl Agent {
                 ));
                 continue;
             }
-
-                                                      
-                                           
             if output_looks_broken(&result) {
                 if self.cfg.provider.auto_reload && !self.cancel.load(Ordering::Relaxed) && reloads < MAX_RELOADS {
                     reloads += 1;
@@ -805,14 +589,8 @@ impl Agent {
                 self.store.append(&Msg::new("assistant", final_text.clone()));
                 break;
             }
-
-                                      
             if self.cfg.provider.native_tools && !result.tool_calls.is_empty() {
                 interrupts = 0;
-                                                    
-                                                    
-                                                            
-                                           
                 let text = result.text.trim();
                 if text.len() >= 10 && (text.ends_with('？') || text.ends_with('?')) {
                     traced(AgentEvent::Notice(
@@ -822,9 +600,6 @@ impl Agent {
                     self.store.append(&Msg::new("assistant", final_text.clone()));
                     break;
                 }
-                                                                  
-                                                                        
-                                                       
                 let hallucinated: Vec<String> = result
                     .tool_calls
                     .iter()
@@ -845,7 +620,6 @@ impl Agent {
                     ));
                     continue;
                 }
-
                 let mut guard_reason = None;
                 for call in &result.tool_calls {
                     let parsed = crate::tool_compat::parse_args(&call.args);
@@ -861,13 +635,11 @@ impl Agent {
                     self.store.append(&Msg::new("assistant", final_text.clone()));
                     break;
                 }
-
                 let mut asst = Msg::new("assistant", result.text.clone());
                 asst.tool_calls = result.tool_calls.clone();
                 self.store.append(&asst);
                 let mut guard_reason = None;
                 for call in &result.tool_calls {
-                                                
                     let output = if self.chat_only {
                         NO_PERM_MSG.to_string()
                     } else {
@@ -892,11 +664,6 @@ impl Agent {
                 }
                 continue;
             }
-
-                                                                        
-                                                               
-                                                                      
-                                                         
             if let Some((op, args)) = parse_atem_calls(&result.text) {
                 interrupts = 0;
                 let text = result.text.trim();
@@ -934,8 +701,6 @@ impl Agent {
                 }
                 continue;
             }
-
-                            
             if let Some((op, args)) = parse_tool_block(&result.text) {
                 interrupts = 0;
                 let args_str = serde_json::to_string(&args).unwrap_or_default();
@@ -946,7 +711,6 @@ impl Agent {
                 }
                 self.store.append(&Msg::new("assistant", result.text.clone()));
                 if self.chat_only {
-                                                
                     self.store.append(&Msg::new("user", NO_PERM_MSG));
                     continue;
                 }
@@ -964,9 +728,6 @@ impl Agent {
                 }
                 continue;
             }
-
-                                                                  
-                                            
             if let Some(op) = bare_tool_op(&result.text) {
                 interrupts = 0;
                 let args = serde_json::json!({});
@@ -994,8 +755,6 @@ impl Agent {
                 }
                 continue;
             }
-
-                     
             final_text = result.text.clone();
             self.store.append(&Msg::new("assistant", final_text.clone()));
             break;
@@ -1009,9 +768,6 @@ impl Agent {
         }
         Ok(final_text)
     }
-
-                               
-                                   
     fn finalize_without_tools(
         &mut self,
         reason: &str,
@@ -1022,8 +778,6 @@ impl Agent {
         let req = ChatRequest {
             messages,
             tools: None,
-                                                                        
-                             
             max_tokens: self.llm.max_tokens_for(
                 if self.chat_mode { TokenBudget::QqFinalize } else { TokenBudget::TuiFinalize },
                 self.cfg.qq.max_tokens,
@@ -1051,8 +805,6 @@ impl Agent {
             }
         }
     }
-
-                     
     fn dispatch(&mut self, call: &ToolCall, on_event: &mut impl FnMut(AgentEvent)) -> String {
         on_event(AgentEvent::ToolRun { op: call.name.clone(), args: call.args.clone() });
         let op = call.name.clone();
@@ -1061,13 +813,6 @@ impl Agent {
         on_event(AgentEvent::ToolResult(output.clone()));
         self.prepare_tool_output(&op, &args, &output)
     }
-
-                                                
-                                                   
-                                             
-                                                   
-                                                               
-                                                
     fn reload_wait_cooldown(&self, on_event: &mut impl FnMut(AgentEvent)) -> Result<(), String> {
         let mut rounds = 0;
         loop {
@@ -1099,9 +844,6 @@ impl Agent {
             }
         }
     }
-
-                                                    
-                              
     fn reload_model(&self, on_event: &mut impl FnMut(AgentEvent)) -> Result<(), String> {
         match self.llm.reload_model() {
             Ok(()) => {
@@ -1115,29 +857,7 @@ impl Agent {
             }
         }
     }
-
-                                 
-       
-            
-                        
-                                
-       
-                 
-                                                           
-                                                      
-                                                      
-                                                       
-                                                      
-                                                                       
-                                                    
-                            
-                                                        
-                                             
-                                                     
-                                                 
-                    
     fn run_op(&mut self, op: &str, args: &Value) -> String {
-                                              
         let ask = match (&self.ask_tx, &self.answer_rx) {
             (Some(tx), Some(rx)) => Some(crate::tools::AskHandle {
                 tx,
@@ -1147,7 +867,6 @@ impl Agent {
             }),
             _ => None,
         };
-                                           
         let perm = match (&self.perm_tx, &self.perm_rx) {
             (Some(tx), Some(rx)) => Some(crate::tools::PermHandle {
                 tx,
@@ -1174,26 +893,7 @@ impl Agent {
             Err(e) => format!("错误: {e}"),
         }
     }
-
-                                    
-       
-                    
-                                                    
-                                              
-                                      
-                                                           
-                                                 
-       
-            
-                              
-                                                        
-                                                 
-       
-            
-                                           
     fn prepare_tool_output(&self, op: &str, args: &Value, output: &str) -> String {
-                                                                   
-                                              
         let semantic_op = crate::tool_compat::normalize_call(op, args).op;
         crate::tool_output::store_or_preview_for_tool(
             &self.cfg.data_dir(),
@@ -1203,11 +903,7 @@ impl Agent {
             self.cfg.tui.tool_result_max_tokens,
         )
     }
-
 }
-
-                                                 
-                            
 fn output_looks_broken(result: &crate::llm::ChatResult) -> bool {
     if !result.tool_calls.is_empty() {
         return false;
@@ -1215,11 +911,6 @@ fn output_looks_broken(result: &crate::llm::ChatResult) -> bool {
     let t = result.text.trim();
     t.is_empty() || t.contains("<unused")
 }
-
-                                                       
-                                                       
-                                                
-                                 
 fn find_tool_fence(text: &str, from: usize) -> Option<usize> {
     for (off, _) in text[from..].match_indices("```") {
         let abs = from + off;
@@ -1235,11 +926,6 @@ fn find_tool_fence(text: &str, from: usize) -> Option<usize> {
     }
     None
 }
-
-                                                
-                                        
-                                               
-                                        
 fn extract_tools_from_reasoning(text: &str) -> Vec<ToolCall> {
     const MAX_BLOCKS: usize = 8;
     let mut out = Vec::new();
@@ -1261,36 +947,21 @@ fn extract_tools_from_reasoning(text: &str) -> Vec<ToolCall> {
                 break;
             }
         }
-                                                    
         search_from = advance_char_boundary(text, content_start);
     }
     out
 }
-
-                                       
-                                               
-                                                          
-                                              
-                                                       
 fn advance_char_boundary(text: &str, from: usize) -> usize {
     match text[from..].chars().next() {
         Some(c) => from + c.len_utf8(),
         None => from,
     }
 }
-
-                                       
-                                                         
 pub fn bare_tool_op(text: &str) -> Option<&'static str> {
     let t = text.trim();
     crate::tools::KNOWN_OPS.iter().find(|op| **op == t).copied()
 }
-
-                       
-                                              
-                                                             
 pub fn parse_tool_block(text: &str) -> Option<(String, Value)> {
-                    
     let mut search_from = 0;
     while let Some(fence_start) = find_tool_fence(text, search_from) {
         let content_start = fence_start + 7;             
@@ -1302,13 +973,8 @@ pub fn parse_tool_block(text: &str) -> Option<(String, Value)> {
         if let Some(v) = try_parse_op_json(candidate, true) {
             return Some(v);
         }
-                                                    
         search_from = advance_char_boundary(text, content_start);
     }
-                                                                         
-                                                            
-                                              
-                                             
     let mut search_from = 0;
     while let Some((rel, _)) = text[search_from..].match_indices("```").next() {
         let fence_start = search_from + rel;
@@ -1321,7 +987,6 @@ pub fn parse_tool_block(text: &str) -> Option<(String, Value)> {
                     Some(end) => &text[content_start..end],
                     None => &text[content_start..],
                 };
-                                                          
                 if let Some(v) = first_json_object(candidate) {
                     return Some((op.to_string(), v));
                 }
@@ -1329,7 +994,6 @@ pub fn parse_tool_block(text: &str) -> Option<(String, Value)> {
         }
         search_from = fence_start + 3;
     }
-                                                                             
     for line in text.lines() {
         let l = line.trim_start();
         let rest = l
@@ -1342,13 +1006,10 @@ pub fn parse_tool_block(text: &str) -> Option<(String, Value)> {
             }
         }
     }
-                                                              
-                                                  
     for line in text.lines() {
         let l = line.trim_start();
         for op in crate::tools::KNOWN_OPS {
             if let Some(rest) = l.strip_prefix(op) {
-                                                                      
                 if rest.trim_start().starts_with('{') {
                     if let Some(v) = first_json_object(rest) {
                         return Some((op.to_string(), v));
@@ -1358,18 +1019,11 @@ pub fn parse_tool_block(text: &str) -> Option<(String, Value)> {
             }
         }
     }
-                                             
     if let Some(v) = try_parse_op_json(text, false) {
         return Some(v);
     }
     None
 }
-
-                                                           
-                                                                                              
-                                                               
-                                                         
-                                                   
 fn parse_atem_calls(text: &str) -> Option<(String, Value)> {
     let calls = text.find("<atem:function_calls>")?;
     let tail = &text[calls..];
@@ -1416,8 +1070,6 @@ fn parse_atem_calls(text: &str) -> Option<(String, Value)> {
     };
     Some((op, args))
 }
-
-                                              
 fn strip_atem_block(text: &str) -> String {
     match (text.find("<atem:function_calls>"), text.rfind("</atem:function_calls>")) {
         (Some(start), Some(end)) if end > start => {
@@ -1427,8 +1079,6 @@ fn strip_atem_block(text: &str) -> String {
         _ => text.to_string(),
     }
 }
-
-                                                     
 fn first_json_object(s: &str) -> Option<Value> {
     let start = s.find('{')?;
     let mut depth = 0i32;
@@ -1455,8 +1105,6 @@ fn first_json_object(s: &str) -> Option<Value> {
                     if let Ok(v) = serde_json::from_str::<Value>(json) {
                         return Some(v);
                     }
-                                                            
-                                                      
                     let repaired = repair_json_escapes(json);
                     if repaired != json {
                         return serde_json::from_str::<Value>(&repaired).ok();
@@ -1469,9 +1117,6 @@ fn first_json_object(s: &str) -> Option<Value> {
     }
     None
 }
-
-                                               
-                                                       
 fn repair_json_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -1481,151 +1126,70 @@ fn repair_json_escapes(s: &str) -> String {
             continue;
         }
         match chars.next() {
-                        
             Some(n @ ('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')) => {
                 out.push(c);
                 out.push(n);
             }
-                                
             Some(n) => out.push(n),
             None => out.push(c),
         }
     }
     out
 }
-
-                                          
 fn parse_op_json(json: &str, strict: bool) -> Option<(String, Value)> {
     let v = serde_json::from_str::<Value>(json).ok()?;
     let op = v.get("op").and_then(|o| o.as_str()).map(String::from)?;
     if strict || crate::tool_compat::is_supported_name(&op) {
-                                             
         let inner = v.get("args").cloned().unwrap_or(v);
         return Some((op, inner));
     }
     None
 }
-
-                                      
-   
-        
-                                              
-                                                  
-                                                   
-                                                     
-                                      
-                                              
-   
-                            
-                                          
-                                       
-                                           
-                   
-   
-                     
-                                                  
-                                                         
-                                              
-                                                            
-                                              
-                                         
-                                   
-                           
-   
-                        
-                                               
-                                                              
-                                              
-                                
-   
-                 
-                                                 
-                                                
-                                                
-                                           
-                                           
-                                        
-                          
 fn try_parse_op_json(s: &str, strict: bool) -> Option<(String, Value)> {
-                                                   
-                                             
-                             
     let start = s.find('{')?;
-                                                    
     let mut depth = 0i32;
     let mut in_str = false;
     let mut esc = false;
-                                                      
-                                                         
-                                                     
-                                                          
-                                          
     for (i, c) in s[start..].char_indices() {
-                                      
         if in_str {
             if esc {
-                                                
-                                                 
-                                          
                 esc = false;
             } else if c == '\\' {
-                                             
-                                               
-                                                 
                 esc = true;
             } else if c == '"' {
-                                                     
                 in_str = false;
             }
             continue;                                  
         }
-                                       
         match c {
             '"' => in_str = true,                          
             '{' => depth += 1,            
             '}' => {
                 depth -= 1;                      
                 if depth == 0 {
-                                                    
-                                                   
                     let json = &s[start..start + i + c.len_utf8()];
-                                  
                     if let Some(v) = parse_op_json(json, strict) {
                         return Some(v);
                     }
-                                                            
-                                              
                     let repaired = repair_json_escapes(json);
                     if repaired != json {
                         if let Some(v) = parse_op_json(&repaired, strict) {
                             return Some(v);
                         }
                     }
-                                                
-                                                  
-                                                 
-                                            
                     return None;
                 }
             }
             _ => {}                             
         }
     }
-                                                
-                            
     if depth > 0 {
         let tail = &s[start..];
-                                       
-                                       
-                                            
-                                             
         if !tail.contains('\n') && tail.starts_with("{\"op\":\"") {
-                                         
             let mut fixed = tail.to_string();
             for _ in 0..depth {
                 fixed.push('}');
             }
-                                           
             if let Some(v) = parse_op_json(&fixed, strict) {
                 return Some(v);
             }
@@ -1637,14 +1201,11 @@ fn try_parse_op_json(s: &str, strict: bool) -> Option<(String, Value)> {
             }
         }
     }
-                                             
     None
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn parse_fenced_tool_block() {
         let t = "先看看工具\n```tool {\"op\":\"list_tools\",\"args\":{}}\n```\n完了";
@@ -1652,32 +1213,25 @@ mod tests {
         assert_eq!(op, "list_tools");
         assert_eq!(args, serde_json::json!({}));
     }
-
     #[test]
     fn parse_json_fence_fallback() {
         let t = "```json\n{\"op\": \"list_tools\", \"args\": {}}\n```";
         let (op, _) = parse_tool_block(t).unwrap();
         assert_eq!(op, "list_tools");
     }
-
     #[test]
     fn parse_fenced_known_op_variant() {
-                                                                   
-                                                               
         let t = "```qq_send {\"chat\":\"group:728563593\",\"text\":\"在呀！老大有啥事吗？\"}```";
         let (op, args) = parse_tool_block(t).unwrap();
         assert_eq!(op, "qq_send");
         assert_eq!(args["chat"], "group:728563593");
         assert_eq!(args["text"], "在呀！老大有啥事吗？");
-                                     
         let t2 = "```python\nprint(1)\n```\n```web_search {\"query\":\"x\"}```";
         let (op2, args2) = parse_tool_block(t2).unwrap();
         assert_eq!(op2, "web_search");
         assert_eq!(args2["query"], "x");
-                    
         assert!(parse_tool_block("```rust\nlet x = 1;\n```").is_none());
     }
-
     #[test]
     fn parse_bare_json_with_registered_op() {
         let t = "我决定调用 {\"op\":\"readline\",\"args\":{\"path\":\"a\"}} 来看文件";
@@ -1685,109 +1239,79 @@ mod tests {
         assert_eq!(op, "readline");
         assert_eq!(args["path"], "a");
     }
-
     #[test]
     fn parse_unfenced_tool_prefix_variant() {
-                                                                                 
         let t = "tool {\"op\":\"is_admin\",\"args\":{\"qq\":3160168215}}";
         let (op, args) = parse_tool_block(t).unwrap();
         assert_eq!(op, "is_admin");
         assert_eq!(args["qq"].as_i64(), Some(3160168215i64));
-                     
         assert_eq!(parse_tool_block("tool{\"op\":\"stats\",\"args\":{}}").unwrap().0, "stats");
         assert_eq!(parse_tool_block("tool:{\"op\":\"stats\",\"args\":{}}").unwrap().0, "stats");
-                                      
         assert!(parse_tool_block("tool {\"op\":\"nothing_here\",\"args\":{}}").is_none());
     }
-
     #[test]
     fn parse_bare_tool_name_with_json_args() {
-                                                   
-                                                        
         let t = "is_admin {\"qq\":\"3160168215\"}";
         let (op, args) = parse_tool_block(t).unwrap();
         assert_eq!(op, "is_admin");
         assert_eq!(args["qq"], "3160168215");
-               
         let (op, args) = parse_tool_block("list_tools {\"category\":\"file\"}").unwrap();
         assert_eq!(op, "list_tools");
         assert_eq!(args["category"], "file");
-                                   
         let (op, _) = parse_tool_block("is_admin {\"qq\":1}\n你的权限是...").unwrap();
         assert_eq!(op, "is_admin");
-                                
         assert!(parse_tool_block("is_admin 工具可以判断管理员").is_none());
         assert!(parse_tool_block("qq_send 是用来发消息的工具").is_none());
-                     
         assert!(parse_tool_block("nothing_here {\"a\":1}").is_none());
     }
-
     #[test]
     fn parse_json_with_invalid_escapes() {
-                                                      
         let t = "qq_send {\"chat\":\"group:728563593\",\"text\":\"直接说哈～(´▽\\`)\"}";
         let (op, args) = parse_tool_block(t).unwrap();
         assert_eq!(op, "qq_send");
         assert_eq!(args["text"], "直接说哈～(´▽`)");
-                              
         let t2 = "{\"op\":\"qq_send\",\"args\":{\"chat\":\"group:1\",\"text\":\"it\\'s fine\"}}";
         let (_, args2) = parse_tool_block(t2).unwrap();
         assert_eq!(args2["text"], "it's fine");
-                   
         assert_eq!(repair_json_escapes(r#"a\nb\"c\\d\u4f60"#), r#"a\nb\"c\\d\u4f60"#);
-                  
         assert_eq!(repair_json_escapes(r#"a\`b\'c\d"#), "a`b'cd");
         assert_eq!(repair_json_escapes("行尾\\"), "行尾\\");
     }
-
     #[test]
     fn parse_truncated_json_repair() {
-                                                         
         let t = "{\"op\":\"qq_send\",\"args\":{\"chat\":\"group:728563593\",\"text\":\"哎呀管理员您也太规律了吧～ 太阳从西边出来啦？😄\"}";
         let (op, args) = parse_tool_block(t).unwrap();
         assert_eq!(op, "qq_send");
         assert_eq!(args["chat"], "group:728563593");
         assert_eq!(args["text"], "哎呀管理员您也太规律了吧～ 太阳从西边出来啦？😄");
-                
         let t2 = "{\"op\":\"stats\",\"args\":{\"category\":\"file\"";
         let (op2, _) = parse_tool_block(t2).unwrap();
         assert_eq!(op2, "stats");
-                                          
         let (op3, _) = parse_tool_block("先分析一下\n{\"op\":\"stats\",\"args\":{\"category\":\"file\"").unwrap();
         assert_eq!(op3, "stats");
-                     
         assert!(parse_tool_block("{\"op\":\"nothing_here\",\"args\":{\"a\":1}").is_none());
     }
-
     #[test]
     fn ignores_unregistered_op_in_prose() {
-                                         
         let t = "json 结构形如 {\"op\":\"something_unknown\",\"args\":{}}";
         assert!(parse_tool_block(t).is_none());
     }
-
     #[test]
     fn no_tool_block() {
         assert!(parse_tool_block("直接回答，没有任何工具").is_none());
     }
-
     #[test]
     fn bare_tool_op_matches_registered_only() {
-                                     
         assert_eq!(bare_tool_op("list_tools"), Some("list_tools"));
         assert_eq!(bare_tool_op("  list_tools  "), Some("list_tools"));
         assert_eq!(bare_tool_op("web_search"), Some("web_search"));
-                                  
         assert_eq!(bare_tool_op("list_tools 查看工具"), None);
         assert_eq!(bare_tool_op("something_unknown"), None);
         assert_eq!(bare_tool_op("你好"), None);
-                                                 
         assert_eq!(bare_tool_op("```tool {\"op\":\"list_tools\",\"args\":{}}\n```"), None);
     }
-
     #[test]
     fn extract_tools_from_reasoning_all_complete_blocks_in_order() {
-                                             
         let t = String::from("先计划用 web 搜索\n```tool {\"op\":\"web_search\",\"args\":{\"query\":\"x\"}}\n```\n")
             + "```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"ls ~/.config/noctalia/\"}}\n```\n"
             + "Executing.\n\nWait, I'll execute `ls ~/.config/noctalia/`.\n";
@@ -1797,26 +1321,16 @@ mod tests {
         assert_eq!(calls[1].name, "execute_command");
         assert!(calls[1].args.contains("noctalia"));
     }
-
     #[test]
     fn extract_tools_from_reasoning_ignores_unclosed_or_unregistered() {
-                                  
-                                                      
-                                                        
-                                            
         let unclosed = "```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"ls ~/.config/noctalia/\"}\nExecuting.\n\nWait, I'll execute `ls`.\n";
         assert!(extract_tools_from_reasoning(unclosed).is_empty());
-                                                       
-                                          
         let unknown = "```tool {\"op\":\"nothing_here\",\"args\":{}}\n```";
         assert_eq!(extract_tools_from_reasoning(unknown).len(), 1);
-                       
         assert!(extract_tools_from_reasoning("正常思考，无需工具").is_empty());
     }
-
     #[test]
     fn extract_tools_from_reasoning_caps_at_max() {
-                                        
         let mut t = String::new();
         for i in 0..12 {
             t.push_str(&format!(
@@ -1829,43 +1343,31 @@ mod tests {
         assert_eq!(calls[0].args, "{\"cmd\":\"echo plan-0\"}");
         assert_eq!(calls[7].args, "{\"cmd\":\"echo plan-7\"}");
     }
-
     #[test]
     fn tool_fence_scan_survives_multibyte_after_fence() {
-                                             
-                                                                  
-                                         
         let t = "```tool好的，让我先想想\n```\n```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"ls\"}}\n```\n";
         let calls = extract_tools_from_reasoning(t);
         assert_eq!(calls.len(), 1, "应跳过垃圾块找到后面的合法块");
         assert_eq!(calls[0].name, "execute_command");
-                                            
         let (op, args) = parse_tool_block(t).unwrap();
         assert_eq!(op, "execute_command");
         assert_eq!(args["cmd"], "ls");
-                                               
         let t2 = "让我执行 ```tool";
         assert!(extract_tools_from_reasoning(t2).is_empty());
         assert!(parse_tool_block(t2).is_none());
     }
-
     #[test]
     fn tool_fence_scan_handles_lowercase_byte_mismatch() {
-                                                                     
-                                                        
-                                     
         let t = "İſ 分析配置\n```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"ls\"}}\n```\n";
         let calls = extract_tools_from_reasoning(t);
         assert_eq!(calls[0].name, "execute_command");
         let (op, _) = parse_tool_block(t).unwrap();
         assert_eq!(op, "execute_command");
-                                      
         let t2 = "先看下\n```TOOL {\"op\":\"list_tools\",\"args\":{}}\n```\n";
         let calls2 = extract_tools_from_reasoning(t2);
         assert_eq!(calls2[0].name, "list_tools");
         assert_eq!(parse_tool_block(t2).unwrap().0, "list_tools");
     }
-
     #[test]
     fn parse_nested_braces_in_args() {
         let t = "```tool {\"op\":\"writefile\",\"args\":{\"path\":\"a.json\",\"content\":\"{\\\"k\\\":\\\"v\\\"}\"}}\n```";
@@ -1873,10 +1375,8 @@ mod tests {
         assert_eq!(op, "writefile");
         assert!(args["content"].as_str().unwrap().contains('{'));
     }
-
     #[test]
     fn keyword_interception_uses_tools_mapping() {
-                                                            
         assert_eq!(
             crate::tools::keyword_tool("搜索马斯克"),
             Some(("web_search", serde_json::json!({"query": "马斯克"})))
@@ -1887,23 +1387,18 @@ mod tests {
             Some(("web_fetch", serde_json::json!({"url": "https://example.com"})))
         );
     }
-
     #[test]
     fn output_looks_broken_detection() {
         use crate::llm::ChatResult;
-                                          
         assert!(output_looks_broken(&ChatResult {
             text: "<unused49>".repeat(50),
             ..Default::default()
         }));
-                        
         assert!(output_looks_broken(&ChatResult::default()));
-                    
         assert!(!output_looks_broken(&ChatResult {
             text: "你好，我是 YJLcoder。".into(),
             ..Default::default()
         }));
-                        
         assert!(!output_looks_broken(&ChatResult {
             text: String::new(),
             tool_calls: vec![crate::llm::ToolCall {
@@ -1914,10 +1409,8 @@ mod tests {
             ..Default::default()
         }));
     }
-
     #[test]
     fn parse_atem_calls_handles_mixed_and_pure() {
-                                                     
         let mixed = "2 + 3 = 5\n\n现在查看目录：\n<|eom|><|start|>assistant to=listdir<|message|><atem:function_calls>\n<atem:invoke name=\"listdir\">\n<atem:parameter name=\"path\">/home/ksk2kk/YJLcoder/src</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
         let (op, args) = parse_atem_calls(mixed).expect("应解析出 atem 工具");
         assert_eq!(op, "listdir");
@@ -1925,17 +1418,12 @@ mod tests {
         let clean = strip_atem_block(mixed);
         assert!(!clean.contains("<atem:"), "剥离后不应含 atem 标签: {clean}");
         assert!(clean.contains("2 + 3 = 5"));
-
-                                        
         let wrapped = "<atem:function_calls><atem:invoke name=\"execute_command\"><atem:parameter name=\"op\">listdir</atem:parameter><atem:parameter name=\"args\">{\"path\": \"/tmp\"}</atem:parameter></atem:invoke></atem:function_calls>";
         let (op2, args2) = parse_atem_calls(wrapped).unwrap();
         assert_eq!(op2, "listdir");
         assert_eq!(args2.get("path").and_then(|v| v.as_str()), Some("/tmp"));
-
-                          
         assert!(parse_atem_calls("普通文本回答").is_none());
     }
-
     #[test]
     fn tool_loop_guard_stops_third_identical_call() {
         let mut guard = ToolLoopGuard::default();
@@ -1945,7 +1433,6 @@ mod tests {
         let reason = guard.before_call("execute_command", &args).unwrap();
         assert!(reason.contains("重复"));
     }
-
     #[test]
     fn tool_loop_guard_allows_progress_and_stops_failures() {
         let mut guard = ToolLoopGuard::default();
@@ -1961,10 +1448,8 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn chat_only_blocks_all_tools() {
-                                                 
         let d = std::env::temp_dir().join(format!("yjlcoder_test_chat_only_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let mut cfg = Config::default();
@@ -1972,15 +1457,12 @@ mod tests {
         cfg.provider.native_tools = false;                    
         let store = SessionStore::new(d.clone());
         let mut agent = Agent::with_store(cfg, Llm::mock(), store, None, true, true, Arc::new(AtomicBool::new(false)));
-
         let mut events: Vec<String> = Vec::new();
         let final_text = agent.run_turn("搜索 马斯克", &mut |ev| match ev {
             AgentEvent::ToolRun { op, .. } => events.push(format!("toolrun:{op}")),
             AgentEvent::ToolResult(_) => events.push("toolresult".into()),
             _ => {}
         }).unwrap();
-
-                                                        
         assert!(final_text.contains("mock 模式完成"), "final: {final_text}");
         assert!(events.is_empty(), "chat_only 不应产生工具事件: {events:?}");
         let msgs = agent.store.current().messages;
@@ -1988,7 +1470,6 @@ mod tests {
         assert!(msgs.iter().any(|m| m.content.contains("无权限")), "应回灌无权限说明");
         let _ = std::fs::remove_dir_all(&d);
     }
-
     #[test]
     fn safe_shell_file_read_reaches_model_without_a_truncated_preview() {
         let d = std::env::temp_dir().join(format!(
@@ -2003,7 +1484,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, body).unwrap();
-
         let mut cfg = Config::default();
         cfg.set_test_data_dir(d.clone());
         cfg.tui.tool_result_max_tokens = 8;
@@ -2022,7 +1502,6 @@ mod tests {
         });
         let output = agent.run_op("execute_command", &args);
         let model_visible = agent.prepare_tool_output("execute_command", &args, &output);
-
         assert_eq!(model_visible, output, "readline 语义不得进入通用预览折叠");
         assert!(model_visible.contains("1\tsetting_1"));
         assert!(model_visible.contains("129\tsetting_129"));

@@ -1,26 +1,11 @@
-                              
-   
-                                           
-                        
-                                                  
-                                              
-                      
-                               
-   
-                                                                     
-                                                   
-                                           
-
 use serde_json::{Map, Value};
 use std::path::Path;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedCall {
     pub op: String,
     pub args: Value,
     pub notes: Vec<String>,
 }
-
 impl NormalizedCall {
     pub fn note(&self) -> Option<String> {
         if self.notes.is_empty() {
@@ -30,26 +15,6 @@ impl NormalizedCall {
         }
     }
 }
-
-                                                  
-   
-        
-                                           
-   
-        
-                                        
-                                       
-   
-                     
-                             
-                                            
-                                  
-                                                       
-                                             
-                                          
-                              
-                                                   
-                                                         
 pub fn parse_args(raw: &str) -> Value {
     let trimmed = raw.trim().trim_matches('`').trim();                       
     if trimmed.is_empty() {
@@ -72,24 +37,13 @@ pub fn parse_args(raw: &str) -> Value {
     }
     Value::String(trimmed.trim_matches('"').to_string())
 }
-
-                                   
 pub fn is_supported_name(name: &str) -> bool {
     let n = clean_name(name);
     crate::registry::find_tool(&n).is_some() || alias_name(&n).is_some() || is_generic_name(&n)
 }
-
-                    
-   
-                                                               
-                                                    
-                              
 pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
-                                        
     let cleaned = clean_name(raw_op);
-                                             
     let mut notes = Vec::new();
-                                          
     let mut op = match alias_name(&cleaned) {
         Some(canonical) => {
             if canonical != cleaned {
@@ -99,13 +53,8 @@ pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
         }
         None => cleaned.clone(),
     };
-
-                                              
     let mut args = object_from_value(&op, raw_args, &mut notes);
     flatten_wrappers(&mut args, &mut notes);
-
-                                                  
-                            
     if op == "execute_command" {
         alias_key(&mut args, "cmd", &["command", "shell", "script"], &mut notes);
         let target = string_at(&args, &["op", "tool", "tool_name", "function"]);
@@ -116,9 +65,6 @@ pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
             call.notes = notes;
             return call;
         }
-                                            
-                                                   
-                                             
         if let Some(list_args) = simple_ls_args(&args) {
             notes.push("安全 ls 命令→listdir".into());
             op = "listdir".into();
@@ -129,8 +75,6 @@ pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
             args = read_args;
         }
     }
-
-                                             
     if is_generic_name(&op) {
         let inferred = infer_op(&args).unwrap_or(match op.as_str() {
             "open" | "cat" => "readline",
@@ -149,35 +93,16 @@ pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
             op = inferred.to_string();
         }
     }
-
     normalize_keys(&op, &mut args, &mut notes);
-
-                                         
     if let Some(inferred) = repair_mismatched_op(&op, &args) {
         notes.push(format!("参数与工具不符 {op}→{inferred}"));
         op = inferred.to_string();
         normalize_keys(&op, &mut args, &mut notes);
     }
-
     coerce_types(&mut args, &mut notes);
     NormalizedCall { op, args: Value::Object(args), notes }
 }
-
-                             
-   
-        
-                                                    
-                                              
-   
-        
-                
-                                                       
-                                                          
-                                 
-                                                       
-                                                          
 fn clean_name(name: &str) -> String {
-                                                                  
     let lower = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
     lower
         .rsplit(['.', ':', '/'])
@@ -186,7 +111,6 @@ fn clean_name(name: &str) -> String {
         .trim_start_matches("functions_")
         .to_string()
 }
-
 fn alias_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "bash" | "shell" | "run" | "exec" | "terminal" | "run_command" => "execute_command",
@@ -208,13 +132,10 @@ fn alias_name(name: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
-
 fn is_generic_name(name: &str) -> bool {
     matches!(name, "open" | "cat" | "find" | "files" | "search" | "google" | "internet" | "research" | "deep_search")
 }
-
 fn primary_key(op: &str) -> &'static str {
-                                        
     match op {
         "execute_command" => "cmd",
         "readline" | "listdir" => "path",
@@ -226,7 +147,6 @@ fn primary_key(op: &str) -> &'static str {
         _ => "input",
     }
 }
-
 fn object_from_value(op: &str, value: &Value, notes: &mut Vec<String>) -> Map<String, Value> {
     match value {
         Value::Object(m) => m.clone(),
@@ -255,21 +175,6 @@ fn object_from_value(op: &str, value: &Value, notes: &mut Vec<String>) -> Map<St
         }
     }
 }
-
-                                                     
-                            
-   
-        
-                                        
-                            
-   
-                                                 
-                            
-                                          
-                                                         
-                            
-                                   
-                                      
 fn flatten_wrappers(args: &mut Map<String, Value>, notes: &mut Vec<String>) {
     for _ in 0..3 {
         let wrapper = ["arguments", "parameters", "params", "payload", "request", "input"]
@@ -292,8 +197,6 @@ fn flatten_wrappers(args: &mut Map<String, Value>, notes: &mut Vec<String>) {
         *args = inner;
         notes.push(format!("解开 {key} 包装"));
     }
-
-                           
     if !args.contains_key("op") && args.len() == 1 {
         if let Some(raw_inner) = args.get("args").cloned() {
             if let Some(inner) = match raw_inner {
@@ -307,20 +210,6 @@ fn flatten_wrappers(args: &mut Map<String, Value>, notes: &mut Vec<String>) {
         }
     }
 }
-
-                           
-   
-        
-                                     
-   
-        
-                       
-                                                                
-                                                    
-                     
-                                                               
-                                      
-                                   
 fn take_dispatch_args(args: &Map<String, Value>) -> Value {
     for key in ["args", "arguments", "parameters", "params", "input"] {
         if let Some(v) = args.get(key) {
@@ -336,30 +225,12 @@ fn take_dispatch_args(args: &Map<String, Value>) -> Value {
     }
     Value::Object(flat)
 }
-
 fn string_at<'a>(args: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|key| args.get(*key).and_then(Value::as_str))
 }
-
 fn has_any(args: &Map<String, Value>, keys: &[&str]) -> bool {
     keys.iter().any(|key| args.contains_key(*key))
 }
-
-                                     
-                            
-   
-        
-                         
-   
-        
-                            
-   
-                           
-                                                     
-                                                           
-                                                         
-                                      
-                                  
 fn infer_op(args: &Map<String, Value>) -> Option<&'static str> {
     if has_any(args, &["cmd", "command", "shell", "script"]) {
         return Some("execute_command");
@@ -391,7 +262,6 @@ fn infer_op(args: &Map<String, Value>) -> Option<&'static str> {
     }
     None
 }
-
 fn normalize_keys(op: &str, args: &mut Map<String, Value>, notes: &mut Vec<String>) {
     match op {
         "execute_command" => {
@@ -443,7 +313,6 @@ fn normalize_keys(op: &str, args: &mut Map<String, Value>, notes: &mut Vec<Strin
         alias_key(args, "all", &["hidden", "include_hidden", "includeHidden"], notes);
     }
 }
-
 fn alias_key(args: &mut Map<String, Value>, canonical: &str, aliases: &[&str], notes: &mut Vec<String>) {
     if args.contains_key(canonical) {
         return;
@@ -456,7 +325,6 @@ fn alias_key(args: &mut Map<String, Value>, canonical: &str, aliases: &[&str], n
         }
     }
 }
-
 fn repair_mismatched_op<'a>(op: &str, args: &'a Map<String, Value>) -> Option<&'a str> {
     match op {
         "web_search" if !args.contains_key("query") && !args.contains_key("queries") && has_any(args, &["url", "urls"]) => {
@@ -469,20 +337,6 @@ fn repair_mismatched_op<'a>(op: &str, args: &'a Map<String, Value>) -> Option<&'
         _ => None,
     }
 }
-
-                                   
-   
-        
-                            
-                   
-   
-                                                 
-                       
-                                                        
-                                                               
-                          
-                                                
-                                  
 fn coerce_types(args: &mut Map<String, Value>, notes: &mut Vec<String>) {
     for key in [
         "start", "end", "offset", "limit", "count", "max", "max_chars", "timeout",
@@ -526,16 +380,12 @@ fn coerce_types(args: &mut Map<String, Value>, notes: &mut Vec<String>) {
         }
     }
 }
-
-                                               
-                                    
 fn simple_ls_args(args: &Map<String, Value>) -> Option<Map<String, Value>> {
     let cmd = args.get("cmd")?.as_str()?.trim();
     let words = simple_shell_words(cmd)?;
     if words.first().map(String::as_str) != Some("ls") {
         return None;
     }
-
     let mut include_hidden = false;
     let mut options_done = false;
     let mut paths = Vec::new();
@@ -564,7 +414,6 @@ fn simple_ls_args(args: &Map<String, Value>) -> Option<Map<String, Value>> {
     if paths.len() > 1 {
         return None;
     }
-
     let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
     let raw_path = paths.first().map(String::as_str).unwrap_or(".");
     let path = resolve_shell_path(raw_path, cwd);
@@ -575,15 +424,10 @@ fn simple_ls_args(args: &Map<String, Value>) -> Option<Map<String, Value>> {
         ("all".into(), Value::Bool(include_hidden)),
     ]))
 }
-
-                                                   
-                                              
-                                                  
 fn simple_file_read_args(args: &Map<String, Value>) -> Option<Map<String, Value>> {
     let cmd = args.get("cmd")?.as_str()?.trim();
     let words = simple_shell_words(cmd)?;
     let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
-
     let (raw_path, start, limit) = match words.first().map(String::as_str)? {
         "cat" => {
             let rest = if words.get(1).map(String::as_str) == Some("--") {
@@ -629,7 +473,6 @@ fn simple_file_read_args(args: &Map<String, Value>) -> Option<Map<String, Value>
         }
         _ => return None,
     };
-
     if raw_path.starts_with('-') {
         return None;
     }
@@ -643,7 +486,6 @@ fn simple_file_read_args(args: &Map<String, Value>) -> Option<Map<String, Value>
     }
     Some(out)
 }
-
 fn parse_sed_print_range(pattern: &str) -> Option<(u64, u64)> {
     let body = pattern.strip_suffix('p')?;
     if let Some((start, end)) = body.split_once(',') {
@@ -658,7 +500,6 @@ fn parse_sed_print_range(pattern: &str) -> Option<(u64, u64)> {
         (line > 0).then_some((line, 1))
     }
 }
-
 fn resolve_shell_path(raw_path: &str, cwd: &str) -> String {
     if raw_path.starts_with("~/") || Path::new(raw_path).is_absolute() || cwd == "." {
         raw_path.to_string()
@@ -666,23 +507,6 @@ fn resolve_shell_path(raw_path: &str, cwd: &str) -> String {
         Path::new(cwd).join(raw_path).to_string_lossy().into_owned()
     }
 }
-
-                                       
-   
-        
-                                                      
-   
-        
-                                                
-   
-                                               
-                                            
-                           
-                                                      
-                                             
-                                   
-                                                 
-                   
 fn simple_shell_words(input: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -743,21 +567,6 @@ fn simple_shell_words(input: &str) -> Option<Vec<String>> {
     }
     Some(words)
 }
-
-                                          
-   
-        
-                           
-   
-        
-                             
-   
-                                                             
-                              
-                                     
-                                  
-                                                
-                                                     
 fn repair_json_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -777,22 +586,6 @@ fn repair_json_escapes(s: &str) -> String {
     }
     out
 }
-
-                                             
-   
-        
-                                     
-   
-        
-                                  
-   
-                        
-                                   
-                                             
-                      
-                                    
-                                             
-                                
 fn close_truncated_json(s: &str) -> Option<String> {
     let mut stack = Vec::new();
     let mut in_string = false;
@@ -827,19 +620,6 @@ fn close_truncated_json(s: &str) -> Option<String> {
     }
     Some(fixed)
 }
-
-                                           
-   
-        
-                                             
-   
-        
-                                            
-   
-                                           
-                                               
-                                         
-                          
 fn parse_key_values(s: &str) -> Option<Value> {
     let mut map = Map::new();
     for part in s.split(['\n', ',']) {
@@ -854,12 +634,10 @@ fn parse_key_values(s: &str) -> Option<Value> {
     }
     (!map.is_empty()).then_some(Value::Object(map))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
     #[test]
     fn aliases_and_unwraps_nested_json() {
         let call = normalize_call("Functions.Web-Search", &json!({"arguments":"{\"q\":\"rust async\",\"limit\":\"5\"}"}));
@@ -868,7 +646,6 @@ mod tests {
         assert_eq!(call.args["count"], 5);
         assert!(!call.notes.is_empty());
     }
-
     #[test]
     fn dispatch_and_wrong_tool_are_forced_to_intent() {
         let call = normalize_call("execute_command", &json!({"tool":"edit", "args":{"file_path":"a.rs","oldText":"x","newText":"y"}}));
@@ -878,14 +655,12 @@ mod tests {
         let wrong = normalize_call("web_search", &json!({"url":"https://example.com"}));
         assert_eq!(wrong.op, "web_fetch");
     }
-
     #[test]
     fn scalar_and_malformed_arguments_survive() {
         assert_eq!(normalize_call("bash", &Value::String("pwd".into())).args["cmd"], "pwd");
         assert_eq!(parse_args("{\"q\":\"rust\""), json!({"q":"rust"}));
         assert_eq!(parse_args("q=rust,count=3"), json!({"q":"rust","count":3}));
     }
-
     #[test]
     fn arrays_and_booleans_are_coerced() {
         let call = normalize_call("research", &json!({"queries":"one,two", "deep":"yes", "fetchTop":"2"}));
@@ -894,7 +669,6 @@ mod tests {
         assert_eq!(call.args["deep"], true);
         assert_eq!(call.args["fetch_top"], 2);
     }
-
     #[test]
     fn claude_ask_user_question_name_maps_to_local_tool() {
         let call = normalize_call(
@@ -904,7 +678,6 @@ mod tests {
         assert_eq!(call.op, "ask_user");
         assert!(call.args["questions"].is_array());
     }
-
     #[test]
     fn listdir_aliases_and_paging_fields_are_normalized() {
         let call = normalize_call(
@@ -917,7 +690,6 @@ mod tests {
         assert_eq!(call.args["limit"], 50);
         assert_eq!(call.args["all"], true);
     }
-
     #[test]
     fn safe_ls_shell_commands_are_forced_to_listdir() {
         let plain = normalize_call(
@@ -929,7 +701,6 @@ mod tests {
         assert_eq!(plain.args["offset"], 0);
         assert_eq!(plain.args["limit"], 200);
         assert_eq!(plain.args["all"], true);
-
         for complex in ["ls -R .", "ls a b", "ls | head", "ls *.rs", "ls $HOME"] {
             assert_eq!(
                 normalize_call("execute_command", &json!({"cmd": complex})).op,
@@ -938,7 +709,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn safe_shell_file_reads_are_forced_to_readline() {
         let cat = normalize_call(
@@ -948,7 +718,6 @@ mod tests {
         assert_eq!(cat.op, "readline");
         assert_eq!(cat.args["path"], "/tmp/folder with spaces/demo.toml");
         assert!(cat.args.get("start").is_none());
-
         let sed = normalize_call(
             "execute_command",
             &json!({"cmd":"sed -n '1,260p' ~/.config/noctalia/noctalia-config.toml"}),
@@ -956,7 +725,6 @@ mod tests {
         assert_eq!(sed.op, "readline");
         assert_eq!(sed.args["start"], 1);
         assert_eq!(sed.args["limit"], 260);
-
         let one = normalize_call(
             "execute_command",
             &json!({"cmd":"sed --quiet '77p' demo.txt"}),
@@ -964,7 +732,6 @@ mod tests {
         assert_eq!(one.op, "readline");
         assert_eq!(one.args["start"], 77);
         assert_eq!(one.args["limit"], 1);
-
         let head = normalize_call(
             "execute_command",
             &json!({"cmd":"head -n 80 demo.txt", "cwd":"/work"}),
@@ -973,7 +740,6 @@ mod tests {
         assert_eq!(head.args["path"], "/work/demo.txt");
         assert_eq!(head.args["start"], 1);
         assert_eq!(head.args["limit"], 80);
-
         for complex in [
             "cat a b",
             "cat *.rs",

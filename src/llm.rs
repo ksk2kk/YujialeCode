@@ -1,157 +1,59 @@
-                               
-   
-                                                              
-                                                                      
-   
-                                                                    
-                                                          
-                                              
-   
-                
-   
-                                                             
-                                                                     
-                                                                  
-                                               
-
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
 use crate::compress;
-
-                                                     
-                                                      
-                                                   
-                                          
-                                                     
-                    
 const REASONING_LOOP_MAX: usize = 12_000;
-
-                                      
-                                                      
 const POST_TOOL_REASONING_MAX: usize = 512;
-
-                                                    
-                                                  
-                                                     
-                                               
-                       
 const PLAN_LOOP_TOOL_BLOCKS: usize = 3;
-
-                                                
-                                                
-                                                  
-                                           
-                                                    
-                                          
 const TAIL_REPEAT_WINDOW: usize = 40;
 const TAIL_REPEAT_MIN: usize = 3;
-
-                             
-   
-                                                        
-                 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Msg {
-                                                                    
     pub role: String,
-                                     
     pub content: String,
-                                           
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
-                                            
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
-
 impl Msg {
-                    
-       
-                                                                    
-                                           
     pub fn new(role: &str, content: impl Into<String>) -> Self {
         Msg { role: role.into(), content: content.into(), ..Default::default() }
     }
 }
-
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
-                                       
     pub id: String,
-                                          
     pub name: String,
-                                          
     pub args: String,
 }
-
-        
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Delta(String),
-                                                  
     Reasoning(String),
-                                                      
-                                                
-                                                      
-                                                      
-                           
     Garbage { kind: &'static str, sample: String, run: usize, total: usize, limit: usize },
 }
-
-               
 #[derive(Debug, Clone, Default)]
 pub struct ChatResult {
-                                
     pub text: String,
-                                                      
     pub reasoning: String,
-                             
     pub tool_calls: Vec<ToolCall>,
 }
-
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
-                                          
     pub messages: Vec<Msg>,
-                                      
     pub tools: Option<Value>,
-                                       
     pub max_tokens: Option<usize>,
-                                                   
-                                    
     pub stream: bool,
 }
-
-                                             
-   
-                           
-                                         
-                                     
-                                     
-                                                       
-                                                 
-                        
-   
-                                 
-                                               
-                                       
-                                         
-           
 #[derive(Clone)]
 pub enum Llm {
     Remote(RemoteClient),
     Mock(MockClient),
 }
-
 impl Llm {
-                 
-       
-                                                          
-                                                               
     pub fn remote(base_url: &str, api_key: &str, model: &str, timeout_secs: u64, load_context: usize) -> Self {
         Llm::Remote(RemoteClient {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -161,55 +63,26 @@ impl Llm {
             load_context,
             thinking_budget: None,
             bypass_local_llamacpp_router: false,
-                                                       
-                                                   
             server_caps: Arc::new(Mutex::new(crate::backend::Capabilities::unknown())),
-                                           
-                                                 
             last_reload: Arc::new(Mutex::new(
                 std::time::Instant::now() - Duration::from_secs(60),
             )),
         })
     }
-
     pub fn mock() -> Self {
         Llm::Mock(MockClient { calls: Arc::new(AtomicUsize::new(0)) })
     }
-
     pub fn model_name(&self) -> String {
         match self {
             Llm::Remote(c) => c.model.lock().unwrap().clone(),
             Llm::Mock(_) => "mock".into(),
         }
     }
-
-                                                
     pub fn set_model(&self, name: String) {
         if let Llm::Remote(c) = self {
             *c.model.lock().unwrap() = name;
         }
     }
-
-                                               
-       
-            
-                                                     
-                                              
-                                                  
-                                                 
-                                                            
-                                                 
-                               
-                                                        
-                                        
-                                               
-                                         
-                        
-       
-            
-                                                
-                                                   
-                                  
     pub fn stream(
         &self,
         req: &ChatRequest,
@@ -221,21 +94,6 @@ impl Llm {
             Llm::Mock(m) => m.stream(req, cancel, &mut on_event),
         }
     }
-
-                                                             
-                                                      
-                                                     
-                              
-       
-                                   
-                                      
-                                     
-                                                   
-                                 
-                                                  
-                                  
-                                                     
-                                          
     pub fn stream_without_reasoning(
         &self,
         req: &ChatRequest,
@@ -247,93 +105,61 @@ impl Llm {
             Llm::Mock(m) => m.stream(req, cancel, &mut on_event),
         }
     }
-
-                                          
-                                                  
-                                              
     pub fn reload_model(&self) -> Result<(), String> {
         match self {
             Llm::Remote(c) => c.reload_model(),
             Llm::Mock(_) => Ok(()),
         }
     }
-
-                                                
-                                                
-                                          
     pub fn clear_kv(&self) -> Result<(), String> {
         match self {
             Llm::Remote(c) => c.clear_kv(),
             Llm::Mock(_) => Ok(()),
         }
     }
-
-                                            
-                                            
     pub fn set_timeout(&mut self, secs: u64) {
         if let Llm::Remote(c) = self {
             c.timeout_secs = secs;
         }
     }
-
     pub fn set_thinking_budget(&mut self, budget: Option<usize>) {
         if let Llm::Remote(c) = self {
             c.thinking_budget = budget;
         }
     }
-
-                                                         
-                                           
-                                                          
     pub fn set_llamacpp_router_bypass(&mut self, enabled: bool) {
         if let Llm::Remote(c) = self {
             c.bypass_local_llamacpp_router = enabled;
         }
     }
-
-                                               
     pub fn set_base_url(&mut self, url: String) {
         if let Llm::Remote(c) = self {
             c.base_url = url.trim_end_matches('/').to_string();
         }
     }
-
-                                  
     pub fn set_api_key(&mut self, key: String) {
         if let Llm::Remote(c) = self {
             c.api_key = key;
         }
     }
-
-                                                  
-                                                
-                                                 
-                                          
     pub fn probe_server(&self) {
         if let Llm::Remote(c) = self {
             *c.server_caps.lock().unwrap() =
                 crate::backend::discover(&c.base_url, &c.api_key);
         }
     }
-
-                                                   
     pub fn n_ctx(&self) -> Option<usize> {
         match self {
             Llm::Remote(c) => c.server_caps.lock().unwrap().n_ctx,
             Llm::Mock(_) => None,
         }
     }
-
-                                      
     pub fn is_llamacpp(&self) -> bool {
         match self {
             Llm::Remote(c) => c.server_caps.lock().unwrap().is_llamacpp(),
             Llm::Mock(_) => false,
         }
     }
-
-                                                                
-                                         
     pub fn max_tokens_for(&self, kind: crate::backend::TokenBudget, qq_max: usize) -> Option<usize> {
         let caps = match self {
             Llm::Remote(c) => c.server_caps.lock().unwrap().clone(),
@@ -342,45 +168,18 @@ impl Llm {
         crate::backend::derive_max_tokens(&caps, kind, qq_max)
     }
 }
-
 #[derive(Clone)]
 pub struct RemoteClient {
     pub base_url: String,
     pub api_key: String,
-                                                
     pub model: Arc<Mutex<String>>,
     pub timeout_secs: u64,
-                                                                              
     pub load_context: usize,
-                                                             
     pub thinking_budget: Option<usize>,
-                                                            
-                                                     
     pub bypass_local_llamacpp_router: bool,
-                                                       
-                                     
     pub server_caps: Arc<Mutex<crate::backend::Capabilities>>,
-                                                
-                                               
     pub last_reload: Arc<Mutex<std::time::Instant>>,
 }
-
-                                                           
-                                                
-                                                    
-                                                             
-                                               
-                                     
-                                                       
-   
-                                                   
-                    
-                                                
-                    
-                                              
-                                                 
-                                        
-                                      
 enum HttpEvent {
     Headers(u16),
     Line(String),
@@ -388,50 +187,11 @@ enum HttpEvent {
     Done,
     Error(String),
 }
-
-                                    
-   
-                                            
-                                          
-                                           
 struct CancellableHttp {
     rx: mpsc::Receiver<HttpEvent>,
     abort: Arc<AtomicBool>,
 }
-
 impl CancellableHttp {
-                              
-       
-            
-                                       
-                                             
-                      
-                                             
-                  
-                                                  
-                               
-                                           
-                                            
-                                  
-       
-                                           
-                                              
-                                            
-                                          
-                                                           
-                             
-                                                   
-                                          
-                                      
-                                                   
-                                       
-                                      
-       
-                           
-                                                                        
-                                                  
-                                          
-                                         
     fn post_json(
         url: String,
         api_key: String,
@@ -455,7 +215,6 @@ impl CancellableHttp {
                         return;
                     }
                 };
-
                 runtime.block_on(async move {
                     let client = match reqwest::Client::builder()
                         .connect_timeout(Duration::from_secs(10))
@@ -476,10 +235,6 @@ impl CancellableHttp {
                     if !api_key.is_empty() {
                         request = request.bearer_auth(api_key);
                     }
-
-                                                    
-                                                   
-                                  
                     let mut response = tokio::select! {
                         _ = wait_for_abort(&worker_abort) => return,
                         result = request.send() => match result {
@@ -494,12 +249,6 @@ impl CancellableHttp {
                     if tx.send(HttpEvent::Headers(status)).is_err() {
                         return;
                     }
-
-                                                        
-                                                       
-                                                     
-                                                    
-                                              
                     if !stream || status != 200 {
                         let body = tokio::select! {
                             _ = wait_for_abort(&worker_abort) => return,
@@ -517,17 +266,6 @@ impl CancellableHttp {
                         let _ = tx.send(HttpEvent::Done);
                         return;
                     }
-
-                                                   
-                                                  
-                                                   
-                                                        
-                                                   
-                                                   
-                                                      
-                                                       
-                                             
-                               
                     let mut pending = Vec::<u8>::new();
                     loop {
                         let chunk = tokio::select! {
@@ -561,28 +299,6 @@ impl CancellableHttp {
             .map_err(|e| format!("启动 HTTP 请求线程失败: {e}"))?;
         Ok(Self { rx, abort })
     }
-
-                                      
-       
-            
-                                                
-       
-            
-                                       
-       
-                     
-                                                
-                                         
-                                             
-                                       
-                                        
-                                                    
-                                              
-                                 
-                                                    
-                                              
-                                              
-                             
     fn next(&self, cancel: &AtomicBool) -> Result<HttpEvent, String> {
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -599,47 +315,16 @@ impl CancellableHttp {
         }
     }
 }
-
 impl Drop for CancellableHttp {
     fn drop(&mut self) {
-                                              
-                                                
-                                        
-                                    
-                                           
-                                                
-                                                                
         self.abort.store(true, Ordering::Release);
     }
 }
-
-                                          
-                                             
-                                             
-                                           
 async fn wait_for_abort(abort: &AtomicBool) {
     while !abort.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
-
-                             
-   
-        
-                                           
-                                                 
-   
-                               
-                                                
-                                       
-                                      
-                                              
-                                               
-   
-                
-                                            
-                                       
-                           
 fn send_sse_line(tx: &mpsc::Sender<HttpEvent>, mut bytes: Vec<u8>) -> Result<(), ()> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
@@ -653,20 +338,6 @@ fn send_sse_line(tx: &mpsc::Sender<HttpEvent>, mut bytes: Vec<u8>) -> Result<(),
         })?;
     tx.send(HttpEvent::Line(line)).map_err(|_| ())
 }
-
-                                      
-   
-        
-                                     
-                                            
-   
-                         
-                                        
-                                                    
-                                           
-                                   
-                                      
-         
 fn collect_http_body(http: &CancellableHttp, cancel: &AtomicBool) -> Result<String, String> {
     let mut body = Vec::new();
     loop {
@@ -685,39 +356,11 @@ fn collect_http_body(http: &CancellableHttp, cancel: &AtomicBool) -> Result<Stri
         }
     }
 }
-
-                                                          
-   
-        
-                                                                           
-   
-        
-                                                  
-                                                        
-   
-                             
-                                        
-                                 
 pub(crate) fn api_origin(base_url: &str) -> &str {
     let base = base_url.trim_end_matches('/');
     let base = base.strip_suffix("/chat/completions").unwrap_or(base);
     base.strip_suffix("/v1").unwrap_or(base)
 }
-
-                         
-   
-                          
-                                            
-                                      
-                                                  
-   
-            
-                                                     
-                                        
-                                                     
-                                         
-                                                            
-                                     
 fn is_loopback_http_origin(origin: &str) -> bool {
     let Some(authority) = origin.strip_prefix("http://").map(|s| s.split('/').next().unwrap_or(s)) else {
         return false;
@@ -729,31 +372,6 @@ fn is_loopback_http_origin(origin: &str) -> bool {
         || authority == "[::1]"
         || authority.starts_with("[::1]:")
 }
-
-                                   
-   
-        
-                                  
-                    
-                                                     
-   
-        
-                                                               
-                                      
-         
-   
-                                       
-                                                       
-                                                               
-                                                 
-                                 
-   
-                     
-                                                
-                                      
-                                        
-                                                      
-                                                      
 fn backend_chat_url_from_models(origin: &str, model: &str, response: &Value) -> Option<String> {
     if !is_loopback_http_origin(origin) {
         return None;
@@ -776,18 +394,6 @@ fn backend_chat_url_from_models(origin: &str, model: &str, response: &Value) -> 
     }
     Some(format!("http://127.0.0.1:{port}/v1/chat/completions"))
 }
-
-                            
-   
-        
-                  
-                                    
-   
-        
-                                                     
-                                            
-                                       
-                                
 fn get_local_router_models(origin: &str, api_key: &str) -> Option<Value> {
     let mut request = ureq::get(&format!("{origin}/models?reload=1"))
         .timeout(Duration::from_secs(2));
@@ -801,17 +407,6 @@ fn get_local_router_models(origin: &str, api_key: &str) -> Option<Value> {
     let body = response.into_string().ok()?;
     serde_json::from_str(&body).ok()
 }
-
-                                                             
-   
-        
-                                      
-                  
-   
-        
-                                        
-                                                
-                            
 fn local_router_model_state<'a>(response: &'a Value, model: &str) -> Option<&'a str> {
     response
         .get("data")?
@@ -822,39 +417,6 @@ fn local_router_model_state<'a>(response: &'a Value, model: &str) -> Option<&'a 
         .get("value")?
         .as_str()
 }
-
-                                           
-   
-                
-                                                 
-                                       
-                                    
-                                   
-   
-        
-                                                         
-                     
-                    
-                                       
-   
-        
-                                        
-                                        
-                                         
-                                      
-                         
-   
-          
-                                              
-                                            
-                                               
-                                                       
-                                             
-                                              
-                                              
-                                        
-                                        
-                          
 fn discover_local_llamacpp_backend(
     base_url: &str,
     api_key: &str,
@@ -865,16 +427,12 @@ fn discover_local_llamacpp_backend(
     if !is_loopback_http_origin(origin) {
         return Ok(None);
     }
-
     let Some(initial) = get_local_router_models(origin, api_key) else {
         return Ok(None);
     };
     if let Some(url) = backend_chat_url_from_models(origin, model, &initial) {
         return Ok(Some(url));
     }
-
-                                                                     
-                                           
     let Some(state) = local_router_model_state(&initial, model) else {
         return Ok(None);
     };
@@ -898,9 +456,6 @@ fn discover_local_llamacpp_backend(
     } else if state != "loading" && state != "unloading" {
         return Err(format!("本地模型 {model} 状态异常: {state}"));
     }
-
-                                                
-                                      
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     while std::time::Instant::now() < deadline {
         if cancel.load(Ordering::Relaxed) {
@@ -918,11 +473,6 @@ fn discover_local_llamacpp_backend(
     }
     Err(format!("等待本地模型 {model} 加载超时（180s）"))
 }
-
-                     
-                                          
-                                              
-                                                                 
 pub fn chat_url(base_url: &str) -> String {
     let b = base_url.trim_end_matches('/');
     if b.ends_with("/chat/completions") {
@@ -933,8 +483,6 @@ pub fn chat_url(base_url: &str) -> String {
     }
     format!("{b}/v1/chat/completions")
 }
-
-                                                       
 pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
     let origin = base_url.trim_end_matches('/');
     let origin = origin.strip_suffix("/chat/completions").unwrap_or(origin);
@@ -965,11 +513,7 @@ pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String>
     }
     Ok(ids)
 }
-
 impl RemoteClient {
-                                            
-                                                     
-                                           
     fn stream(
         &self,
         req: &ChatRequest,
@@ -978,39 +522,6 @@ impl RemoteClient {
     ) -> Result<ChatResult, String> {
         self.stream_inner(req, cancel, on_event, false)
     }
-
-                                         
-       
-            
-                                         
-                                    
-                                                        
-                                              
-                                               
-       
-                                     
-                                                   
-                                                    
-                                           
-                                     
-                                              
-       
-                                             
-                                                
-                                                        
-                                            
-                                           
-                                  
-                                                                            
-                                                  
-                                            
-                                   
-       
-                           
-                                                  
-                                                              
-                                                
-                                 
     fn stream_inner(
         &self,
         req: &ChatRequest,
@@ -1037,20 +548,14 @@ impl RemoteClient {
             payload["max_tokens"] = json!(m);
         }
         if let Some(b) = self.thinking_budget {
-                                                            
-                                                              
-                                              
             if !self.server_caps.lock().unwrap().is_llamacpp() {
                 payload["thinking"] = json!({ "type": "enabled", "budget_tokens": b });
             }
         }
         if disable_reasoning {
-                                                        
-                                                        
             payload["reasoning_effort"] = json!("none");
             payload["chat_template_kwargs"] = json!({ "enable_thinking": false });
         }
-
         let http = CancellableHttp::post_json(
             url,
             self.api_key.clone(),
@@ -1067,12 +572,10 @@ impl RemoteClient {
             let body = collect_http_body(&http, cancel)?;
             return Err(format!("HTTP {status}: {body}"));
         }
-
         if !req.stream {
             let body = collect_http_body(&http, cancel)?;
             return parse_full_response(&body, on_event);
         }
-
         let mut result = ChatResult::default();
         let mut garbage_run: usize = 0;                                   
         let mut garbage_total: usize = 0;                     
@@ -1080,11 +583,6 @@ impl RemoteClient {
         let mut reasoning_garbage_total: usize = 0;                
         let mut tool_bufs: std::collections::HashMap<usize, (String, String, String)> =
             std::collections::HashMap::new();                             
-
-                                                     
-                                              
-                                                
-                                              
         loop {
             let line = match http.next(cancel)? {
                 HttpEvent::Line(line) => line,
@@ -1109,18 +607,8 @@ impl RemoteClient {
             if let Some(err) = v.get("error") {
                 return Err(format!("API 错误: {}", err));
             }
-                                                       
-                                                
-                                                   
-                                             
             let Some(choice) = v.pointer("/choices/0") else { continue };
             let delta = &choice["delta"];
-                                            
-                                                 
-                                                 
-                                                      
-                                           
-                                                  
             if let Some(tc) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                 for call in tc {
                     let idx = call["index"].as_u64().unwrap_or(0) as usize;
@@ -1137,15 +625,6 @@ impl RemoteClient {
                 }
             }
             if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                                                       
-                                                                         
-                                                                
-                                                     
-                  
-                                                                
-                                                              
-                                                       
-                                  
                 let chars: Vec<char> = content.chars().collect();
                 let junk = content.contains("<unused")
                     || (chars.len() >= 4
@@ -1171,9 +650,6 @@ impl RemoteClient {
                 result.text.push_str(content);
                 on_event(StreamEvent::Delta(content.to_string()));
             }
-                                                                      
-                                                   
-                                                
             if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                 result.reasoning.push_str(r);
                 let chars: Vec<char> = r.chars().collect();
@@ -1195,8 +671,6 @@ impl RemoteClient {
                     reasoning_garbage_run = 0;
                 }
                 on_event(StreamEvent::Reasoning(r.to_string()));
-                                                   
-                                                    
                 let reasoning_limit = if disable_reasoning {
                     POST_TOOL_REASONING_MAX
                 } else {
@@ -1205,27 +679,14 @@ impl RemoteClient {
                 if result.reasoning.chars().count() > reasoning_limit {
                     break;
                 }
-                                                          
-                                                    
-                                                     
                 if count_complete_tool_blocks(&result.reasoning) >= PLAN_LOOP_TOOL_BLOCKS {
                     break;
                 }
-                                                        
-                                                             
-                                                  
                 if tail_repeats(&result.reasoning, TAIL_REPEAT_WINDOW, TAIL_REPEAT_MIN) {
                     break;
                 }
             }
         }
-
-                                                
-                                    
-                                            
-                                          
-                                            
-                                          
         let mut idxs: Vec<usize> = tool_bufs.keys().copied().collect();
         idxs.sort_unstable();
         for i in idxs {
@@ -1237,17 +698,6 @@ impl RemoteClient {
         }
         Ok(result)
     }
-
-                                                
-                                                                           
-                                                      
-                                                                    
-                                                                     
-                                       
-                                                    
-                                              
-                                               
-                                 
     fn reload_model(&self) -> Result<(), String> {
         let mut last = self.last_reload.lock().unwrap();
         if last.elapsed() < Duration::from_secs(60) {
@@ -1260,10 +710,6 @@ impl RemoteClient {
         drop(last);
         self.reload_impl()
     }
-
-                                                    
-                                              
-                                                
     fn clear_kv(&self) -> Result<(), String> {
         {
             let last = self.last_reload.lock().unwrap();
@@ -1277,7 +723,6 @@ impl RemoteClient {
         *self.last_reload.lock().unwrap() = std::time::Instant::now();
         self.reload_impl()
     }
-
     fn reload_impl(&self) -> Result<(), String> {
         let origin = {
             let b = self.base_url.trim_end_matches('/');
@@ -1305,11 +750,6 @@ impl RemoteClient {
             }
             Ok(())
         };
-                                                         
-                                                      
-                                                            
-                                                          
-                                               
         let llama_ok = post(
             format!("{origin}/models/unload"),
             &json!({ "model": model }),
@@ -1326,7 +766,6 @@ impl RemoteClient {
                     Duration::from_secs(180),
                 ) {
                     Ok(()) => {
-                                                                    
                         return wait_model_state(origin, &model, "loaded", 150, &auth)
                             .map_err(|e| format!("等待加载完成失败: {e}"));
                     }
@@ -1341,7 +780,6 @@ impl RemoteClient {
             Err(format!("加载请求失败: {last_err}"))
         });
         if let Err(main_err) = llama_ok {
-                                                                 
             let base = format!("{origin}/api/v1");
             let _ = post(
                 format!("{base}/models/unload"),
@@ -1362,9 +800,6 @@ impl RemoteClient {
         Ok(())
     }
 }
-
-                                                             
-                                           
 fn wait_model_state(origin: &str, model: &str, want: &str, timeout_secs: u64, auth: &Option<String>) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut last_issue = String::new();
@@ -1377,7 +812,6 @@ fn wait_model_state(origin: &str, model: &str, want: &str, timeout_secs: u64, au
         let state = match builder.call() {
             Ok(r) => {
                 if r.status() == 404 {
-                                                   
                     return Err("模型状态接口不存在（非路由器模式）".into());
                 }
                 match r.into_string() {
@@ -1402,10 +836,6 @@ fn wait_model_state(origin: &str, model: &str, want: &str, timeout_secs: u64, au
     }
     Err(format!("等待模型状态 {want} 超时（{timeout_secs}s，{last_issue}）"))
 }
-
-                                             
-                                                  
-                            
 fn tail_repeats(s: &str, window: usize, min: usize) -> bool {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() < window * min {
@@ -1414,11 +844,6 @@ fn tail_repeats(s: &str, window: usize, min: usize) -> bool {
     let tail: String = chars[chars.len() - window..].iter().collect();
     s.matches(&tail).count() >= min
 }
-
-                                               
-                                                 
-                                                   
-                          
 pub fn count_complete_tool_blocks(s: &str) -> usize {
     let mut n = 0;
     let mut search_from = 0;
@@ -1433,9 +858,6 @@ pub fn count_complete_tool_blocks(s: &str) -> usize {
     }
     n
 }
-
-                                                       
-                                                 
 fn find_tool_fence(text: &str, from: usize) -> Option<usize> {
     for (off, _) in text[from..].match_indices("```") {
         let abs = from + off;
@@ -1451,29 +873,6 @@ fn find_tool_fence(text: &str, from: usize) -> Option<usize> {
     }
     None
 }
-
-                                        
-                                                                         
-   
-        
-                                                   
-                                               
-                                        
-                                        
-   
-                    
-                                          
-                                
-                                 
-                   
-   
-               
-                                 
-                                               
-                                                   
-                                              
-                                         
-                     
 fn parse_full_response(body: &str, on_event: &mut impl FnMut(StreamEvent)) -> Result<ChatResult, String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("响应解析失败: {e}"))?;
     if let Some(err) = v.get("error") {
@@ -1501,41 +900,17 @@ fn parse_full_response(body: &str, on_event: &mut impl FnMut(StreamEvent)) -> Re
     }
     Ok(result)
 }
-
-                                                
-                                          
-                 
 #[derive(Clone)]
 pub struct MockClient {
     calls: Arc<AtomicUsize>,
 }
-
 impl MockClient {
-                                  
-       
-            
-                                          
-                                             
-                                            
-                                         
-                                             
-                                       
-                              
-       
-                  
-                                              
-                                                         
-                                     
-                                      
-                                                 
-                                       
     fn stream(
         &self,
         req: &ChatRequest,
         _cancel: &AtomicBool,
         on_event: &mut impl FnMut(StreamEvent),
     ) -> Result<ChatResult, String> {
-                      
         let summarized = req.messages.iter().any(|m| m.content.contains(compress::SUMMARIZATION_PROMPT));
         if summarized {
             let text = "用户的目标是测试 YJLcoder。已完成：配置加载、工具注册、会话持久化、上下文压缩。下一步：接入真实模型与 QQ 桥接。".to_string();
@@ -1544,7 +919,6 @@ impl MockClient {
             }
             return Ok(ChatResult { text, ..Default::default() });
         }
-
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let text = if n == 0 {
             "我需要先查看可用工具。\n```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"echo mock-ok\"}}\n```\n"
@@ -1557,39 +931,9 @@ impl MockClient {
         Ok(ChatResult { text: text.into(), ..Default::default() })
     }
 }
-
-                    
-   
-        
-                    
-   
-                   
-                                          
-                                          
-                                               
-                                   
-                     
 fn split_chunks(s: &str) -> Vec<String> {
     s.chars().collect::<Vec<_>>().chunks(3).map(|c| c.iter().collect()).collect()
 }
-
-                                     
-   
-        
-                      
-   
-        
-                                  
-   
-            
-                            
-                                                
-                                                               
-                                                  
-                        
-                                                 
-                            
-                                
 fn to_openai_msg(m: &Msg) -> Value {
     let mut v = json!({"role": m.role, "content": m.content});
     if !m.tool_calls.is_empty() {
@@ -1608,26 +952,20 @@ fn to_openai_msg(m: &Msg) -> Value {
     }
     v
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn chat_url_normalization() {
-                                                                 
         assert_eq!(chat_url("http://localhost:1234"), "http://localhost:1234/v1/chat/completions");
         assert_eq!(chat_url("https://api.deepseek.com"), "https://api.deepseek.com/v1/chat/completions");
-                       
         assert_eq!(chat_url("http://localhost:11434/v1"), "http://localhost:11434/v1/chat/completions");
         assert_eq!(chat_url("http://localhost:11434/v1/"), "http://localhost:11434/v1/chat/completions");
-                      
         assert_eq!(
             chat_url("https://host/custom/chat/completions"),
             "https://host/custom/chat/completions"
         );
     }
-
     #[test]
     fn local_llamacpp_router_backend_is_discovered_safely() {
         let models = json!({
@@ -1663,10 +1001,8 @@ mod tests {
             "未加载模型不能生成动态后端 URL"
         );
     }
-
     #[test]
     fn parse_full_response_content_and_tools() {
-                                                           
         let body = r#"{
           "choices": [{
             "message": {
@@ -1695,14 +1031,12 @@ mod tests {
         assert_eq!(r.tool_calls[0].args, r#"{"category":"file"}"#);
         assert_eq!(deltas, r.text.chars().count(), "非流式也应以增量回调交付");
     }
-
     #[test]
     fn parse_full_response_api_error() {
         let r = parse_full_response(r#"{"error":{"message":"model not found"}}"#, &mut |_| {});
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("model not found"));
     }
-
     #[test]
     fn mock_scripts_two_calls() {
         let llm = Llm::mock();
@@ -1724,7 +1058,6 @@ mod tests {
             .unwrap();
         assert!(!r2.text.contains("```tool"));
     }
-
     #[test]
     fn to_openai_msg_native() {
         let mut m = Msg::new("assistant", "");
@@ -1736,8 +1069,6 @@ mod tests {
         let v = to_openai_msg(&m);
         assert_eq!(v["tool_calls"][0]["function"]["name"], "execute_command");
     }
-
-                                               
     fn serve_sse(chunks: Vec<String>) -> u16 {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1762,17 +1093,12 @@ mod tests {
         });
         port
     }
-
     #[test]
     fn cancel_while_waiting_for_headers_closes_server_connection() {
         use std::io::{ErrorKind, Read};
         use std::net::TcpListener;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
-
-                                                     
-                                                          
-                                                    
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (closed_tx, closed_rx) = mpsc::channel();
@@ -1795,7 +1121,6 @@ mod tests {
                 }
             }
         });
-
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let request = std::thread::spawn(move || {
@@ -1817,7 +1142,6 @@ mod tests {
                 |_| {},
             )
         });
-
         std::thread::sleep(Duration::from_millis(150));
         let started = Instant::now();
         cancel.store(true, Ordering::Relaxed);
@@ -1828,11 +1152,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("取消后服务端应观察到 TCP 断连并释放 slot");
     }
-
     #[test]
     fn stream_garbage_content_reported_and_aborted() {
-                                                                    
-                                           
         let mut chunks: Vec<String> = vec![r#"{"choices":[{"delta":{"content":"你好"}}]}"#.into()];
         for _ in 0..9 {
             chunks.push(r#"{"choices":[{"delta":{"content":"<unused42>"}}]}"#.into());
@@ -1871,12 +1192,8 @@ mod tests {
             "正常 chunk 仍应送达 Delta"
         );
     }
-
     #[test]
     fn stream_reasoning_symbols_never_abort() {
-                                                             
-                                              
-                                          
         let mut chunks: Vec<String> = Vec::new();
         for _ in 0..9 {
             chunks.push(r#"{"choices":[{"delta":{"reasoning_content":"/////"}}]}"#.to_string());
@@ -1911,21 +1228,12 @@ mod tests {
         assert_eq!(*total, 1);
         assert_eq!(*limit, 0, "思考流 limit=0 = 仅记录不中止");
         assert_eq!(garb[8].2, 9, "9 连 / 的连续计数到 9 也不中止");
-                                                 
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Reasoning(s) if s == "-")), "单符号思考增量照常送达");
-                     
         assert_eq!(result.reasoning, "/////".repeat(9) + &"-".repeat(9), "思考流全文收集");
     }
-
     #[test]
     fn stream_reasoning_loop_breaks_stream() {
-                                             
-                                                            
-                                                         
-                          
         let mut chunks: Vec<String> = Vec::new();
-                                                        
-                              
         for i in 0..400 {
             let unit = format!("详细思考步骤 {i}：假设情形 A 成立，则处理方式为 B，结果 C 满足预期。\n");
             chunks.push(
@@ -1948,12 +1256,8 @@ mod tests {
         let reasoning_events = events.iter().filter(|e| matches!(e, StreamEvent::Reasoning(_))).count();
         assert!(reasoning_events < 400, "超限后剩余 chunk 不再收集，实际 {reasoning_events}");
     }
-
     #[test]
     fn stream_end_phrase_loop_breaks_stream() {
-                                                
-                                                     
-                                               
         let unit = "好的。\n...\n（结束）\n...\n回复。\n...\n";
         assert_eq!(unit.chars().count(), 25, "复刻实测循环单元");
         let mut chunks: Vec<String> = Vec::new();
@@ -1980,12 +1284,8 @@ mod tests {
         assert!(reasoning_events < 100, "剩余 chunk 不再收集，实际 {reasoning_events}");
         assert!(reasoning_events > 3, "至少收集了几个单元才判定循环，实际 {reasoning_events}");
     }
-
     #[test]
     fn stream_plan_loop_breaks_on_tool_blocks() {
-                                                      
-                                                      
-                                                     
         let blocks = [
             "```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"ls ~/.config/noctalia/\"}}\n```\n先执行这个，最简单直接。\n\n",
             "```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"find ~/.config -name '*noctalia*'\"}}\n```\n如果没结果，再搜索。\n\n",
@@ -2012,14 +1312,11 @@ mod tests {
         assert!(!result.reasoning.contains("echo should-not-be-reached"), "第 4 块不应被收集");
         let reasoning_events = events.iter().filter(|e| matches!(e, StreamEvent::Reasoning(_))).count();
         assert_eq!(reasoning_events, 3, "恰好收集 3 个块后截断，实际 {reasoning_events}");
-                                
         assert!(result.reasoning.contains("ls ~/.config/noctalia/"));
         assert!(result.reasoning.contains("grep -r brightness"));
     }
-
     #[test]
     fn count_tool_blocks_counts_closed_blocks() {
-                                        
         assert_eq!(count_complete_tool_blocks(""), 0);
         assert_eq!(count_complete_tool_blocks("普通文本没有工具"), 0);
         assert_eq!(
@@ -2041,31 +1338,23 @@ mod tests {
         );
         assert_eq!(count_complete_tool_blocks("```python print(1)\n```"), 0, "非 tool 围栏不计");
     }
-
     #[test]
     fn tail_repeats_detects_loops_only() {
-                                                    
         assert!(!tail_repeats("", 40, 3), "空文本不循环");
         assert!(!tail_repeats("短文本", 40, 3), "长度不足不检测");
         let unit = "好的。\n...\n（结束）\n...\n回复。\n...\n";
         let looped: String = unit.repeat(10);
         assert!(tail_repeats(&looped, 40, 3), "循环单元重复应命中");
-                                         
         let coherent: String = (0..200)
             .map(|i| format!("详细思考第 {i} 点：假设 A 成立则处理为 B。\n"))
             .collect();
         assert!(!tail_repeats(&coherent, 40, 3), "连贯长文不应命中");
-                                                        
-                                           
         assert!(tail_repeats(&unit.repeat(8), 40, 3), "8 个 25 字符单元应命中");
-                     
         let twice = format!("{unit}{unit}然后正常收尾结束。\n");
         assert!(!tail_repeats(&twice, 40, 3), "仅尾部自身 1 次命中不应触发");
     }
-
     #[test]
     fn stream_uniform_newlines_reported_and_aborted() {
-                                                      
         let mut chunks: Vec<String> = Vec::new();
         for _ in 0..9 {
             chunks.push(r#"{"choices":[{"delta":{"content":"\n\n\n\n"}}]}"#.to_string());
@@ -2092,10 +1381,8 @@ mod tests {
         assert_eq!(garb[0].1, "\n\n\n\n");
         assert_eq!(garb[0].2, 1);
     }
-
     #[test]
     fn stream_uniform_letters_reported() {
-                                                                 
         let mut chunks: Vec<String> = Vec::new();
         for _ in 0..9 {
             chunks.push(r#"{"choices":[{"delta":{"content":"GGGGGGGG"}}]}"#.to_string());
@@ -2111,10 +1398,8 @@ mod tests {
         );
         assert!(r.is_err(), "字母重复刷屏应中止: {r:?}");
     }
-
     #[test]
     fn stream_garbage_total_accumulates_across_interruptions() {
-                                                          
         let mut chunks: Vec<String> = Vec::new();
         for _ in 0..6 {
             chunks.push(r#"{"choices":[{"delta":{"content":"<unused42>"}}]}"#.to_string());

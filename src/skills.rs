@@ -1,53 +1,21 @@
-                                
-   
-                                                   
-                                        
-                                                   
-   
-         
-                                                                     
-                                 
-                  
-
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-
 use crate::config::Config;
-
-                                                         
 const SKILLS_REPO_RAW: &str = "https://raw.githubusercontent.com/anthropics/skills/main/skills";
-
 fn skills_dir(cfg: &Config) -> PathBuf {
     let d = cfg.skills_dir();
     let _ = fs::create_dir_all(&d);
     d
 }
-
-                               
-   
-        
-                                                     
-                                
-   
-        
-                                           
-                                               
-                                  
-                                          
-                  
 pub fn op_list_skills(cfg: &Config) -> Result<String, String> {
     let dir = skills_dir(cfg);
     let mut out = String::from("已安装技能:\n");
     let mut found = false;
     let rd = fs::read_dir(&dir).map_err(|e| format!("读取技能目录失败: {e}"))?;
-                                                    
-                              
     let mut items: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     items.sort();
     for p in items {
-                                                        
-                              
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if p.is_dir() {
             found = true;
@@ -68,17 +36,6 @@ pub fn op_list_skills(cfg: &Config) -> Result<String, String> {
     }
     Ok(out)
 }
-
-                                             
-   
-                                                     
-                                     
-                                                   
-                                                          
-                                              
-                                 
-                                             
-              
 fn skill_frontmatter_desc(sk: &Path) -> String {
     let Ok(content) = fs::read_to_string(sk) else { return String::new() };                    
     let mut in_front = false;
@@ -97,29 +54,6 @@ fn skill_frontmatter_desc(sk: &Path) -> String {
     }
     String::new()
 }
-
-                              
-   
-        
-                                                   
-                                                
-                                               
-   
-        
-                                           
-                      
-   
-                   
-                                            
-                                           
-                                             
-                                
-   
-                        
-                                     
-                                                  
-                                          
-                                 
 pub fn op_install_skill(args: &Value, cfg: &Config) -> Result<String, String> {
     let name = args
         .get("name")
@@ -140,22 +74,17 @@ pub fn op_install_skill(args: &Value, cfg: &Config) -> Result<String, String> {
     if target.exists() {
         return Ok(format!("技能 {safe_name} 已安装（{target:?}）"));
     }
-
     if name.starts_with("http://") || name.starts_with("https://") {
         let text = fetch_url(name)?;
         let _ = fs::create_dir_all(&target);
         fs::write(target.join("SKILL.md"), text).map_err(|e| format!("写入失败: {e}"))?;
         return Ok(format!("已从 URL 安装技能 {safe_name}"));
     }
-
-           
     let local = Path::new(name);
     if local.exists() {
         copy_local(local, &target)?;
         return Ok(format!("已从本地路径安装技能 {safe_name}"));
     }
-
-            
     let url = format!("{SKILLS_REPO_RAW}/{safe_name}/SKILL.md");
     let text = match fetch_url(&url) {
         Ok(t) => t,
@@ -171,7 +100,6 @@ pub fn op_install_skill(args: &Value, cfg: &Config) -> Result<String, String> {
         "已安装技能 {safe_name}（来自 anthropics/skills 官方技能库）\nrun_skill {safe_name} 加载使用"
     ))
 }
-
 fn copy_local(src: &Path, target: &Path) -> Result<(), String> {
     if src.is_dir() {
         copy_dir(src, target)?;
@@ -183,7 +111,6 @@ fn copy_local(src: &Path, target: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for e in fs::read_dir(src).map_err(|e| e.to_string())? {
@@ -198,26 +125,6 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-
-                                             
-   
-        
-                       
-   
-        
-                                             
-                 
-   
-                          
-                                        
-                                                    
-                        
-   
-                    
-                                              
-                                                   
-                                        
-                                
 fn fetch_url(url: &str) -> Result<String, String> {
     let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(30))
@@ -232,23 +139,6 @@ fn fetch_url(url: &str) -> Result<String, String> {
     }
     Ok(text)
 }
-
-                                       
-   
-        
-                                                     
-                                                   
-                          
-                   
-   
-        
-                                             
-                                                     
-           
-   
-                       
-                                     
-                                              
 pub fn op_run_skill(args: &Value, cfg: &Config) -> Result<String, String> {
     let name = args
         .get("name")
@@ -263,11 +153,9 @@ pub fn op_run_skill(args: &Value, cfg: &Config) -> Result<String, String> {
         "【技能 {name} 已加载】以下是技能说明，请严格按其执行:\n{truncated}"
     ))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn frontmatter_desc_parses() {
         let d = std::env::temp_dir().join(format!("yjlcoder_skill_desc_{}", std::process::id()));
@@ -281,13 +169,11 @@ mod tests {
         assert_eq!(desc, "一个测试技能");
         let _ = fs::remove_dir_all(&d);
     }
-
     #[test]
     fn install_from_local_dir() {
         let src = std::env::temp_dir().join(format!("yjlcoder_skill_src_{}", std::process::id()));
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("SKILL.md"), "# 本地技能\n说明内容\n").unwrap();
-                                           
         let skills_dir = std::env::temp_dir().join(format!("yjlcoder_skill_dst_{}", std::process::id()));
         let _ = fs::remove_dir_all(&skills_dir);
         let mut cfg = Config::default();

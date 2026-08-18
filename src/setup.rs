@@ -1,29 +1,3 @@
-                               
-   
-                                         
-                                                
-                                                      
-                                                    
-                   
-   
-                                                                     
-                                                          
-                                   
-   
-         
-                                                
-                                              
-                                                          
-                                              
-   
-         
-                                                                  
-                                             
-                                                   
-                                                                    
-                                               
-                         
-
 use crate::backend::{Capabilities, discover};
 use crate::config::Config;
 use serde_json::Value;
@@ -32,23 +6,17 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
-
-                                           
 pub const LOCAL_CANDIDATES: &[(&str, &str)] = &[
     ("http://127.0.0.1:8080", "llama.cpp"),
     ("http://127.0.0.1:11434", "Ollama"),
     ("http://127.0.0.1:1234", "LM Studio"),
 ];
-
-                
 pub struct LocalEndpoint {
     pub origin: String,
     pub label: String,
     pub caps: Capabilities,
 }
-
 impl LocalEndpoint {
-                                              
     fn summary(&self) -> String {
         let mut parts = vec![self.label.clone()];
         if let Some(n) = self.caps.n_ctx {
@@ -61,8 +29,6 @@ impl LocalEndpoint {
         }
         parts.join(" · ")
     }
-
-                                                       
     fn model_names(&self) -> Vec<String> {
         let mut names = self.caps.model_id.iter().cloned().collect::<Vec<_>>();
         if names.is_empty() {
@@ -71,37 +37,9 @@ impl LocalEndpoint {
         names
     }
 }
-
-                              
-   
-        
-                                               
-                                                             
-                                               
-                                              
-   
-        
-                                           
-                                                   
 pub fn probe_local_endpoints(api_key: &str) -> Vec<LocalEndpoint> {
     probe_candidates(LOCAL_CANDIDATES, api_key)
 }
-
-                                         
-   
-        
-                                                       
-   
-        
-                                           
-   
-                                                        
-                                                            
-                                     
-   
-                                               
-                                                  
-                                         
 fn health_ok(origin: &str) -> bool {
     match ureq::get(&format!("{origin}/health"))
         .timeout(Duration::from_secs(2))
@@ -111,54 +49,15 @@ fn health_ok(origin: &str) -> bool {
         Err(_) => false,
     }
 }
-
-                                 
-   
-        
-                                 
-   
-                 
-                                    
-                                                               
-                                 
-                                                       
-                                            
-   
-                                           
-                          
 pub fn needs_setup(cfg: &Config) -> bool {
     let base = cfg.provider.base_url.trim();
     base.is_empty() || (base == "https://api.deepseek.com" && cfg.provider.api_key.trim().is_empty())
 }
-
-                                             
-   
-        
-                                                       
-                                                        
-   
-                                            
-                                         
 pub fn run_wizard(cfg: &mut Config) {
     let stdin = std::io::stdin();
     run_wizard_on(cfg, &mut stdin.lock(), LOCAL_CANDIDATES);
     cfg.save();
 }
-
-                                    
-   
-            
-                                       
-                                                    
-                                                        
-                                   
-                                                
-                                        
-                                        
-                  
-                                                      
-                                              
-                                        
 fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str, &str)]) {
     println!();
     println!("==============================================");
@@ -167,29 +66,18 @@ fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str,
     println!("  提示: 模型服务的最大 token / 上下文会自动从服务端探测，");
     println!("        不需要手动配置。");
     println!("==============================================");
-
-                                
-                                        
     let endpoints = probe_candidates(candidates, &cfg.provider.api_key);
     if !endpoints.is_empty() {
         println!("\n发现本地模型服务:");
-                                                       
-                                    
         for (i, ep) in endpoints.iter().enumerate() {
             println!("  {}  {} ({})", i + 1, ep.summary(), ep.origin);
         }
-                                         
-                                                  
         let first_default = if needs_setup(cfg) { 1 } else { 0 };
         let choice = prompt_line(
             &format!("选择要使用的服务（回车默认 {}；已配置时 0 = 保持不变）", first_default),
             "",
             input,
         );
-                                              
-                                                     
-                                             
-                                           
         let idx = if choice.trim().is_empty() {
             first_default
         } else {
@@ -203,28 +91,18 @@ fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str,
         };
         if idx == 0 {
             println!("保持现有配置。");
-                                                  
-                                             
-                                                    
-                                                
-                                                  
             if !needs_setup(cfg) {
                 return;
             }
         } else {
             let ep = &endpoints[idx - 1];                                   
             let names = ep.model_names();
-                                       
-                                         
             let model = if names.len() > 1 {
                 println!("  该服务可用模型:");
                 for (j, m) in names.iter().enumerate() {
                     println!("    {}  {m}", j + 1);
                 }
                 let m_choice = prompt_line("选择模型（回车默认 1）", "", input);
-                                               
-                                                                    
-                                                   
                 match m_choice.trim().parse::<usize>() {
                     Ok(n) if n >= 1 && n <= names.len() => names[n - 1].clone(),
                     _ => names[0].clone(),
@@ -233,10 +111,7 @@ fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str,
                 names[0].clone()
             };
             apply_endpoint(cfg, ep, &model);
-                                                          
-                                               
             if ep.caps.auth_required && cfg.provider.api_key.is_empty() {
-                                                                     
                 let key = prompt_line(
                     "该服务需要 API 密钥（llama.cpp --api-key），请输入（留空则之后用 /apikey 设置）",
                     "",
@@ -250,14 +125,10 @@ fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str,
             return;                                        
         }
     }
-
-                                     
     if !needs_setup(cfg) {
         println!("配置已存在且未修改。可在 TUI 内用 /server /model /apikey 调整，或编辑 ~/.yjlcoder/config.json");
         return;
     }
-
-                                                     
     let cc = import_claude_code();
     if cc.base_url.is_some() {
         println!("\n检测到 Claude Code 配置（环境变量 / ~/.claude/settings.json / ~/.claude.json）:");
@@ -274,29 +145,8 @@ fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str,
             return;
         }
     }
-
-              
     manual_input(cfg, input);
 }
-
-                       
-   
-        
-                                             
-                                                       
-   
-        
-               
-   
-                               
-                                                     
-                                        
-                                                           
-                                                  
-                                              
-                                                     
-                                                               
-                                           
 fn probe_candidates(candidates: &[(&str, &str)], api_key: &str) -> Vec<LocalEndpoint> {
     candidates
         .iter()
@@ -309,21 +159,6 @@ fn probe_candidates(candidates: &[(&str, &str)], api_key: &str) -> Vec<LocalEndp
         })
         .collect()
 }
-
-                                 
-   
-        
-                         
-   
-        
-                                          
-                                          
-                                          
-                                            
-   
-                                           
-                                                      
-                                        
 pub fn quick_setup(cfg: &mut Config) -> String {
     let mut lines = Vec::new();
     let endpoints = probe_local_endpoints(&cfg.provider.api_key);
@@ -363,18 +198,6 @@ pub fn quick_setup(cfg: &mut Config) -> String {
     cfg.save();
     lines.join("\n")
 }
-
-                 
-   
-        
-                         
-                                         
-                                             
-   
-                                                
-                                                    
-                                            
-                   
 fn apply_endpoint(cfg: &mut Config, ep: &LocalEndpoint, model: &str) {
     cfg.provider.base_url = format!("{}/v1", ep.origin);
     cfg.provider.model = model.trim().to_string();
@@ -382,41 +205,16 @@ fn apply_endpoint(cfg: &mut Config, ep: &LocalEndpoint, model: &str) {
         cfg.provider.model.clear();
     }
 }
-
-                            
-   
-                                                           
-                                     
-                                               
-                                          
-                                     
-   
-                                                                   
-                                                    
-                                  
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ClaudeCodeConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
 }
-
-                                            
-                                                                  
-                                              
 pub fn import_claude_code() -> ClaudeCodeConfig {
     let mut out = ClaudeCodeConfig::default();
-                                                                                
-                                             
-
-                              
-                                                                 
-                                                               
-                                   
     if let Some(v) = env::var("ANTHROPIC_BASE_URL").ok() {
         if !v.trim().is_empty() {
-                                                       
-                                                          
             out.base_url = Some(anthropic_to_openai(v.trim()));
         }
     }
@@ -430,9 +228,6 @@ pub fn import_claude_code() -> ClaudeCodeConfig {
             out.model = Some(v.trim().to_string());
         }
     }
-                                                               
-                                                    
-                                                      
     if let Ok(home) = env::var("HOME") {
         let home = PathBuf::from(home);
         fill_env_block(&mut out, &read_env_block(&home.join(".claude").join("settings.json")));
@@ -440,45 +235,11 @@ pub fn import_claude_code() -> ClaudeCodeConfig {
     }
     out
 }
-
-                                                               
-   
-        
-                                   
-   
-        
-                                           
-                                              
-   
-                                                   
-                                                
-                                             
-                                
-   
-                                                              
-                                            
-                     
-                                                     
 fn read_env_block(path: &PathBuf) -> Option<Value> {
     let s = fs::read_to_string(path).ok()?;
     let v: Value = serde_json::from_str(&s).ok()?;
     v.get("env").cloned()
 }
-
-                         
-   
-        
-                                              
-                                                  
-   
-                                                                 
-                                                    
-                                                     
-   
-                                                
-                                                    
-                                                
-                                                
 fn fill_env_block(out: &mut ClaudeCodeConfig, env: &Option<Value>) {
     let Some(env) = env else { return };
     if out.base_url.is_none() {
@@ -503,24 +264,6 @@ fn fill_env_block(out: &mut ClaudeCodeConfig, env: &Option<Value>) {
         }
     }
 }
-
-                                                        
-   
-        
-                                                                   
-                                                               
-   
-        
-                                                      
-   
-               
-                                                                
-                                              
-                                                    
-                                                         
-                                                       
-                           
-                         
 pub fn anthropic_to_openai(base: &str) -> String {
     let b = base.trim_end_matches('/');
     let b = b.strip_suffix("/v1/messages").unwrap_or(b);
@@ -528,10 +271,6 @@ pub fn anthropic_to_openai(base: &str) -> String {
     let b = b.strip_suffix("/v1").unwrap_or(b);
     format!("{b}/v1")
 }
-
-                                    
-                                           
-                                       
 fn apply_cc(cfg: &mut Config, cc: &ClaudeCodeConfig) {
     if let Some(u) = &cc.base_url {
         cfg.provider.base_url = u.clone();
@@ -543,19 +282,8 @@ fn apply_cc(cfg: &mut Config, cc: &ClaudeCodeConfig) {
         cfg.provider.model = m.clone();
     }
 }
-
-                                          
-   
-        
-                         
-                                              
-   
-                                                     
-                                                   
-                                                
 fn manual_input(cfg: &mut Config, input: &mut dyn BufRead) {
     println!("\n手动配置模型服务:");
-                                         
     let default_url = if cfg.provider.base_url.trim().is_empty() {
         "http://127.0.0.1:8080/v1"
     } else {
@@ -579,26 +307,8 @@ fn manual_input(cfg: &mut Config, input: &mut dyn BufRead) {
     );
     println!("\n配置已保存。运行 yjlcoder 开始使用；--mock 可离线体验。\n");
 }
-
-                           
-   
-        
-                   
-                                            
-                              
-   
-        
-                                    
-   
-                                          
-                                       
-                          
 fn prompt_line(label: &str, default: &str, input: &mut dyn BufRead) -> String {
-                                                    
-                                               
     let suffix = if default.is_empty() { "" } else { &format!("（回车默认 {default}）") };
-                                                 
-                                                       
     print!("{label}{suffix}: ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
@@ -610,21 +320,6 @@ fn prompt_line(label: &str, default: &str, input: &mut dyn BufRead) -> String {
         t.to_string()
     }
 }
-
-               
-   
-        
-                   
-                                                  
-                                                
-                  
-   
-        
-                                                        
-                                          
-                                                
-                                                       
-                                     
 fn prompt_yes_no(label: &str, default_yes: bool, input: &mut dyn BufRead) -> bool {
     let hint = if default_yes { "Y/n" } else { "y/N" };
     print!("{label}（{hint}）: ");
@@ -638,23 +333,13 @@ fn prompt_yes_no(label: &str, default_yes: bool, input: &mut dyn BufRead) -> boo
         _ => default_yes,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-                                           
-                                
-                                            
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-                                         
-                                               
-                                            
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "yjlcoder-setup-test-{}-{name}",
@@ -664,9 +349,6 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         dir
     }
-
-                                                            
-                                         
     fn clear_anthropic_env() -> Vec<(String, Option<String>)> {
         ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"]
             .iter()
@@ -677,7 +359,6 @@ mod tests {
             })
             .collect()
     }
-
     fn restore_env(saved: &[(String, Option<String>)]) {
         for (k, v) in saved {
             match v {
@@ -686,28 +367,21 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn needs_setup_trigger_rules() {
-                                        
         let mut cfg = Config::default();
         assert!(needs_setup(&cfg));
-                       
         cfg.provider.api_key = "sk-x".into();
         assert!(!needs_setup(&cfg));
-                                       
         let mut cfg = Config::default();
         cfg.provider.base_url = "http://127.0.0.1:8080/v1".into();
         assert!(!needs_setup(&cfg));
-                          
         let mut cfg = Config::default();
         cfg.provider.base_url = "".into();
         assert!(needs_setup(&cfg));
     }
-
     #[test]
     fn anthropic_url_normalization() {
-                                                
         assert_eq!(anthropic_to_openai("http://127.0.0.1:8080"), "http://127.0.0.1:8080/v1");
         assert_eq!(anthropic_to_openai("http://127.0.0.1:8080/"), "http://127.0.0.1:8080/v1");
         assert_eq!(
@@ -722,13 +396,11 @@ mod tests {
             anthropic_to_openai("https://api.anthropic.com/v1"),
             "https://api.anthropic.com/v1"
         );
-                     
         assert_eq!(
             anthropic_to_openai("http://127.0.0.1:8080/v1"),
             "http://127.0.0.1:8080/v1"
         );
     }
-
     #[test]
     fn import_from_settings_json_and_claude_json() {
         let _guard = env_guard();
@@ -741,8 +413,6 @@ mod tests {
         )
         .unwrap();
         fs::write(home.join(".claude.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://elsewhere:9999"}}"#).unwrap();
-
-                                 
         let old_home = env::var("HOME").ok();
         let saved_env = clear_anthropic_env();
         env::set_var("HOME", &home);
@@ -753,13 +423,10 @@ mod tests {
         } else {
             env::remove_var("HOME");
         }
-
-                                                                      
         assert_eq!(cc.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
         assert_eq!(cc.api_key.as_deref(), Some("tok-settings"));
         assert_eq!(cc.model.as_deref(), Some("claude-sonnet-4-6"));
     }
-
     #[test]
     fn import_from_claude_json_when_no_settings() {
         let _guard = env_guard();
@@ -781,7 +448,6 @@ mod tests {
         assert_eq!(cc.api_key.as_deref(), Some("tok-json"));
         assert_eq!(cc.model, None);
     }
-
     #[test]
     fn import_empty_when_nothing_configured() {
         let _guard = env_guard();
@@ -799,26 +465,15 @@ mod tests {
         }
         assert_eq!(cc, ClaudeCodeConfig::default());
     }
-
-                                                 
-                                                  
-                                                  
-                                                       
-                                                
-                                 
     fn serve_mock_llamacpp() -> u16 {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-                                       
             for body in [
-                         
                 r#"{"default_generation_settings":{"n_ctx":131072,"params":{"max_tokens":-1}},"model_alias":"mock-model","chat_template_caps":{"supports_tools":true},"modalities":{"text":true}}"#,
-                             
                 r#"{"data":[{"id":"mock-model","meta":{"n_ctx":131072,"n_ctx_train":262144}}]}"#,
-                          
                 r#"{"data":[{"id":"mock-model","status":{"value":"loaded"}}]}"#,
             ] {
                 let (mut socket, _) = listener.accept().unwrap();
@@ -834,12 +489,10 @@ mod tests {
         });
         port
     }
-
     #[test]
     fn wizard_discovers_local_llamacpp_and_applies() {
         let port = serve_mock_llamacpp();
         let mut cfg = Config::default();
-                                                           
         let origin = format!("http://127.0.0.1:{port}");
         let mut input: &[u8] = b"\n\n";
         let candidates = [(origin.as_str(), "mock-llamacpp")];
@@ -847,17 +500,12 @@ mod tests {
         assert_eq!(cfg.provider.base_url, format!("{origin}/v1"));
         assert_eq!(cfg.provider.model, "mock-model");
     }
-
-                                           
-                                                          
-                                       
     fn serve_auth_llamacpp() -> u16 {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-                                                
             for (status, body) in [
                 (401u16, r#"{"error":{"message":"Invalid API Key"}}"#),
                 (200u16, r#"{"data":[{"id":"auth-model","meta":{"n_ctx":131072,"n_ctx_train":262144}}]}"#),
@@ -876,7 +524,6 @@ mod tests {
         });
         port
     }
-
     #[test]
     fn wizard_prompts_api_key_when_server_requires_auth() {
         let _guard = env_guard();
@@ -893,7 +540,6 @@ mod tests {
         assert_eq!(cfg.provider.model, "auth-model");
         assert_eq!(cfg.provider.api_key, "sk-wizard-key");
     }
-
     #[test]
     fn wizard_manual_input_when_nothing_found() {
         let _guard = env_guard();
@@ -906,7 +552,6 @@ mod tests {
         assert_eq!(cfg.provider.model, "my-model");
         assert_eq!(cfg.provider.api_key, "sk-test");
     }
-
     #[test]
     fn wizard_applies_claude_code_import() {
         let _guard = env_guard();
@@ -933,7 +578,6 @@ mod tests {
         assert_eq!(cfg.provider.api_key, "tok");
         assert_eq!(cfg.provider.model, "m1");
     }
-
     #[test]
     fn wizard_rejects_cc_import_then_manual() {
         let _guard = env_guard();

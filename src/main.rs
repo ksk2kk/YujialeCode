@@ -1,23 +1,3 @@
-                               
-   
-       
-                                                    
-                                                 
-                                              
-                                                 
-                                     
-                        
-   
-                                                       
-                                                     
-   
-             
-   
-                                               
-                                             
-                                                             
-                                             
-
 mod agent;
 mod backend;
 mod compress;
@@ -36,44 +16,32 @@ mod tool_output;
 mod tools;
 mod tui;
 mod web;
-
 use agent::AgentEvent;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-
 use agent::Agent;
 use config::Config;
 use llm::Llm;
 use session::SessionStore;
 use tools::{AskAnswer, AskRequest, PermDecision, PermRequest};
 use tui::{Action, Tui};
-
 #[derive(Debug, Default)]
 struct TurnQueue {
-                                       
     active: bool,
-                                                
     pending: VecDeque<String>,
 }
-
 #[derive(Debug, PartialEq, Eq)]
 enum TurnAdmission {
-                                
     Start(String),
-                               
     Queued(usize),
 }
-
-                                     
 enum TurnTerminal {
     Done(String),
     Error(String),
 }
-
 impl TurnQueue {
-                                        
     fn submit(&mut self, input: String) -> TurnAdmission {
         if self.active {
             self.pending.push_back(input);
@@ -83,33 +51,18 @@ impl TurnQueue {
             TurnAdmission::Start(input)
         }
     }
-
-                                      
-                                              
-                                   
     fn is_active(&self) -> bool {
         self.active
     }
-
-                                       
-                               
     fn pending_len(&self) -> usize {
         self.pending.len()
     }
-
-                                      
-                                      
-                                        
     fn pop_pending(&mut self) -> Option<String> {
         self.pending.pop_back()
     }
-
-                                                      
     fn finish_active(&mut self) {
         self.active = false;
     }
-
-                                
     fn start_next(&mut self) -> Option<String> {
         if self.active {
             return None;
@@ -119,43 +72,13 @@ impl TurnQueue {
         Some(next)
     }
 }
-
-                                                   
-   
-                                       
-                                                        
-                                         
-   
-                  
-                                                     
-                                            
-                                             
-                
-                                                               
-                                                 
-                                                  
-             
-                                                    
-                                            
-                             
-                                                  
-                                            
-                                              
-                                               
-                                              
-                                                   
 fn main() {
-                                                 
     let args: Vec<String> = std::env::args().collect();
-                                       
     let mut qq_mode = false;
     let mut qq_only = false;
     let mut mock = false;
     let mut setup_flag = false;
-                                   
     let mut model_override: Option<String> = None;
-
-                                           
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -165,14 +88,9 @@ fn main() {
             "--setup" => setup_flag = true,
             "--model" => {
                 i += 1;
-                                                             
-                                                       
-                                      
                 model_override = args.get(i).cloned();
             }
             "--version" | "-V" => {
-                                                              
-                                   
                 println!("YJLcoder {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
@@ -200,61 +118,32 @@ fn main() {
         }
         i += 1;
     }
-
     let mut cfg = Config::load();
     if let Some(m) = model_override {
-                                                      
-                                                  
         cfg.provider.model = m;
         cfg.save();
     }
-                     
-                                              
-                                            
-                                                  
-                                             
-                                                
-                                            
     if mock {
-                          
     } else if setup_flag {
-                                      
         setup::run_wizard(&mut cfg);
     } else if setup::needs_setup(&cfg) {
-                                         
         if qq_only {
             eprintln!("首次使用前请先运行配置向导: yjlcoder --setup");
             std::process::exit(1);
         }
         setup::run_wizard(&mut cfg);
     }
-
-                                                        
-                                                    
-                           
     let mut llm = if mock {
         Llm::mock()
     } else {
-                        
-                                                             
-                                      
-                                      
-                                                     
-                                                  
-                                         
         Llm::remote(&cfg.provider.base_url, &cfg.provider.api_key, &cfg.provider.model, cfg.provider.timeout_secs, cfg.provider.load_context)
     };
-                                                          
-                                               
     llm.set_llamacpp_router_bypass(!mock && cfg.llama.auto_start);
     llm.set_thinking_budget(cfg.provider.thinking_budget);
     if !mock {
-                                                          
         llm.probe_server();
     }
-
     if qq_only {
-                            
         let (llama_ok, llama_note) = ensure_llama_online(&cfg);
         if !llama_ok {
             eprintln!("[llama] {llama_note}");
@@ -269,13 +158,8 @@ fn main() {
         }
         return;
     }
-
     run_tui(cfg, llm, qq_mode);
 }
-
-                                            
-
-                                  
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "查看命令帮助"),
     ("setup", "配置向导（探测本地服务 / 导入 Claude Code 配置）"),
@@ -309,9 +193,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("clear", "清屏"),
     ("exit", "退出"),
 ];
-
-                                                          
-                                                               
 fn llama_health_ok(base_url: &str) -> bool {
     let origin = base_url.trim_end_matches('/');
     let origin = origin.strip_suffix("/v1").unwrap_or(origin);
@@ -321,11 +202,6 @@ fn llama_health_ok(base_url: &str) -> bool {
         Err(_) => false,
     }
 }
-
-                                     
-                                                         
-                                       
-              
 fn ensure_llama_online(cfg: &Config) -> (bool, String) {
     if llama_health_ok(&cfg.provider.base_url) {
         return (true, "模型服务在线".into());
@@ -350,7 +226,6 @@ fn ensure_llama_online(cfg: &Config) -> (bool, String) {
     if !started {
         return (false, format!("模型服务不可达，且自动拉起 {svc} 失败（需要免密 sudo）"));
     }
-                                  
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cfg.llama.start_wait_secs);
     while std::time::Instant::now() < deadline {
         if llama_health_ok(&cfg.provider.base_url) {
@@ -360,45 +235,8 @@ fn ensure_llama_online(cfg: &Config) -> (bool, String) {
     }
     (false, format!("已发起拉起 {svc}，但等待 {cfg} 秒后仍未就绪", cfg = cfg.llama.start_wait_secs))
 }
-
-                                       
-   
-                
-                                          
-                                         
-                                         
-                                              
-   
-                             
-                                                     
-                                                     
-                                            
-                                        
-                                                 
-                     
-                                               
-                                                            
-                                           
-                    
-                                                    
-                                                   
-                                          
-                                                
-   
-                  
-                                                   
-                                                        
-                                          
-                                   
-   
-        
-                                     
-                                                
-                                            
 fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
     let cancel = Arc::new(AtomicBool::new(false));
-
-                    
     if with_qq {
         let c = cfg.clone();
         let l = llm.clone();
@@ -410,58 +248,34 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
         });
         println!("QQ 桥接已后台启动（ws://{}{}）", cfg.qq.ws_addr, cfg.qq.ws_path);
     }
-
     let mut tui = Tui::new();
     tui.set_commands(COMMANDS);
     let guard = tui.enter();
-
-                                                       
     let (llama_ok, llama_note) = ensure_llama_online(&cfg);
     if !llama_ok {
         tui.push_warn(format!("⚠ {llama_note}"));
     }
-
     let mut store = SessionStore::new(cfg.sessions_dir());
-                                                 
     if !store.current().messages.is_empty() {
         store.new_session_timestamped();
     }
     let (key_tx, key_rx): (Sender<u8>, Receiver<u8>) = channel();
     tui::spawn_stdin_reader(key_tx);
     let (ev_tx, ev_rx): (Sender<AgentEvent>, Receiver<AgentEvent>) = channel();
-                                                            
-                              
     let (terminal_tx, terminal_rx): (Sender<TurnTerminal>, Receiver<TurnTerminal>) = channel();
-                                                    
     let (ask_tx, ask_rx): (Sender<AskRequest>, Receiver<AskRequest>) = channel();
-                                                  
-                                              
-                   
     let (perm_tx, perm_rx): (Sender<PermRequest>, Receiver<PermRequest>) = channel();
-                                                             
     let perm_auto = Arc::new(AtomicBool::new(false));
-                                         
     let perm_allowed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-
     let mut parser = tui::KeyParser::new();
-                                                 
-                                                               
-                                            
-                                              
-                                        
     let mut turns = TurnQueue::default();
     let mut quit = false;
-                                                
     let mut cur_answer_tx: Option<Sender<AskAnswer>> = None;
     let mut cur_ask_id: Option<u64> = None;
-                                          
     let mut cur_perm_tx: Option<Sender<PermDecision>> = None;
-                                
     let mut cur_perm_id: Option<u64> = None;
-
     refresh_header(&mut tui, &cfg, &llm, &store);
     while !quit {
-             
         if let Ok(b) = key_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             if let Some(key) = parser.feed(b) {
                 match tui.handle_key(key) {
@@ -493,9 +307,6 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                         }
                     }
                     Action::Command(cmd) => {
-                                                                
-                                                      
-                                                  
                         let live_cmd = matches!(cmd.split(' ').next(), Some("autodangerous"));
                         if turns.is_active() && !live_cmd {
                             tui.push_warn(
@@ -516,22 +327,17 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                         }
                     }
                     Action::RetrieveQueued => {
-                                                           
                         if let Some(text) = turns.pop_pending() {
                             tui.retrieve_queued(text);
                         }
                     }
                     Action::AskSubmit(answers) => {
-                                                         
-                                                               
                         if let (Some(atx), Some(id)) = (cur_answer_tx.as_ref(), cur_ask_id.take()) {
                             let _ = atx.send(AskAnswer { id, answers });
                         }
                         tui.finish_ask();
                     }
                     Action::PermSubmit(decision) => {
-                                                                
-                                                         
                         if let (Some(ptx), Some(id)) = (cur_perm_tx.as_ref(), cur_perm_id.take()) {
                             let _ = ptx.send(PermDecision { id, decision });
                         }
@@ -540,9 +346,6 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                     Action::Cancel => {
                         cancel.store(true, Ordering::Relaxed);
                         if tui.is_asking() {
-                                                                          
-                                                                 
-                                         
                             tui.finish_ask();
                             cur_answer_tx = None;
                             cur_ask_id = None;
@@ -557,24 +360,17 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                 }
             }
         }
-
-                                          
         while let Ok(req) = ask_rx.try_recv() {
             cur_ask_id = Some(req.id);
             tui.ask(req.questions);
         }
-
-                                                  
         while let Ok(req) = perm_rx.try_recv() {
             cur_perm_id = Some(req.id);
             tui.open_perm_prompt(req);
         }
-
-                   
         while let Ok(ev) = ev_rx.try_recv() {
             match ev {
                 AgentEvent::Delta(d) => tui.assistant_delta(&d),
-                                                                    
                 AgentEvent::Reasoning(r) => {
                     if cfg.trace.show_reasoning {
                         tui.push_reasoning(r);
@@ -583,9 +379,6 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                 AgentEvent::ToolRun { op, args } => tui.push_tool(&op, &args),
                 AgentEvent::ToolResult(r) => tui.push_tool_result(&r),
                 AgentEvent::Notice(n) => tui.push_system(n),
-                                                               
-                                                          
-                                                         
                 AgentEvent::Garbage { kind, sample, run, total, limit } => {
                     let count = if limit == 0 {
                         format!("（累计第 {total} 次，仅记录不中止）")
@@ -598,13 +391,10 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                     tui.push_error(e);
                 }
                 AgentEvent::Done(final_text) => {
-                                                    
-                                                  
                     tui.end_assistant(&final_text);
                 }
             }
         }
-
         while let Ok(terminal) = terminal_rx.try_recv() {
             match terminal {
                 TurnTerminal::Done(final_text) => tui.end_assistant(&final_text),
@@ -627,9 +417,6 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
             cur_perm_tx = None;
             cur_perm_id = None;
         }
-
-                                                   
-                                          
         if !tui.is_asking() && !tui.is_perm_prompt() {
             if let Some(input) = turns.start_next() {
                 tui.set_queued_count(turns.pending_len());
@@ -653,34 +440,14 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                 cur_perm_tx = Some(channels.decision_tx);
             }
         }
-
         refresh_header(&mut tui, &cfg, &llm, &store);
         tui.redraw();
     }
-
     cancel.store(true, Ordering::Relaxed);
     tui.exit();
     drop(guard);
     println!("bye");
 }
-
-                                            
-   
-                                             
-                                                         
-                                             
-                                      
-             
-   
-            
-                                        
-                                         
-                                             
-                                                  
-                                           
-                                                       
-                                                   
-                                                
 struct TurnContext<'a> {
     cfg: &'a Config,
     llm: &'a Llm,
@@ -693,26 +460,6 @@ struct TurnContext<'a> {
     perm_allowed: &'a Arc<Mutex<HashSet<String>>>,
     terminal_tx: &'a Sender<TurnTerminal>,
 }
-
-                                             
-   
-        
-                                               
-                                                       
-                                     
-                                            
-                                        
-                                                 
-                                    
-   
-                
-                                                       
-                                       
-                        
-                                       
-                                                     
-                                    
-                                        
 fn start_tui_turn(tui: &mut Tui, input: String, context: TurnContext<'_>) -> TurnChannels {
     context.cancel.store(false, Ordering::Relaxed);
     tui.push_user(input.clone());
@@ -731,24 +478,8 @@ fn start_tui_turn(tui: &mut Tui, input: String, context: TurnContext<'_>) -> Tur
         input,
     })
 }
-
-                                   
-                                     
-                                              
-                                
-   
-        
-                                             
-                                                  
-                                    
-                                          
 fn refresh_header(tui: &mut Tui, cfg: &Config, llm: &Llm, store: &SessionStore) {
-                                            
-                              
     let (_msgs, tokens) = session::session_stats(&store.path(store.current_id()));
-                                                   
-                                     
-                                        
     let mode = if cfg.provider.native_tools { "native" } else { "text" };
     tui.set_header(format!(
         "{} │ 会话 {} │ {}",
@@ -756,15 +487,11 @@ fn refresh_header(tui: &mut Tui, cfg: &Config, llm: &Llm, store: &SessionStore) 
         store.current_id(),
         mode
     ));
-                                         
     tui.set_ctx(
         tokens,
         backend::effective_window(cfg.provider.ctx_override, llm.n_ctx(), cfg.provider.ctx_window),
     );
 }
-
-                                             
-                                                 
 struct TurnSpawn {
     cfg: Config,
     llm: Llm,
@@ -778,72 +505,31 @@ struct TurnSpawn {
     terminal_tx: Sender<TurnTerminal>,
     input: String,
 }
-
-                                         
-                                                 
-                                          
 struct TurnChannels {
     answer_tx: Sender<AskAnswer>,
     decision_tx: Sender<PermDecision>,
 }
-
-                                          
-   
-                         
-                                                        
-                                                     
-                                                  
-                        
-                                                    
-                                                       
-                                       
-                                         
-   
-                            
-                                                    
-                                            
-                                                
-   
-                           
-                                        
-                                                
-                                                 
-                                           
 fn spawn_turn(turn: TurnSpawn) -> TurnChannels {
-                                            
     let (answer_tx, answer_rx) = channel();
     let (decision_tx, decision_rx) = channel();
     std::thread::spawn(move || {
-                                                          
-                                                
-                                                       
         let mut agent =
             Agent::with_store(turn.cfg, turn.llm, turn.store, None, false, false, turn.cancel);
-                                              
-                                    
         agent.set_ask_channels(turn.ask_tx, answer_rx);
         agent.set_perm_channels(turn.perm_tx, decision_rx, turn.perm_auto, turn.perm_allowed);
         match agent.run_turn(&turn.input, &mut |ev| {
-                                                    
-                                                
             let _ = turn.ev_tx.send(ev);
         }) {
             Ok(final_text) => {
-                                                          
                 let _ = turn.terminal_tx.send(TurnTerminal::Done(final_text));
             }
             Err(e) => {
-                                                   
-                                                         
                 let _ = turn.terminal_tx.send(TurnTerminal::Error(e));
             }
         }
     });
-                                          
     TurnChannels { answer_tx, decision_tx }
 }
-
-                                                  
 fn sync_llm_from_cfg(llm: &mut Llm, cfg: &Config) {
     llm.set_base_url(cfg.provider.base_url.clone());
     llm.set_api_key(cfg.provider.api_key.clone());
@@ -851,8 +537,6 @@ fn sync_llm_from_cfg(llm: &mut Llm, cfg: &Config) {
     llm.set_llamacpp_router_bypass(cfg.llama.auto_start);
     llm.probe_server();
 }
-
-                                       
 fn server_caps_note(llm: &Llm) -> String {
     if let Some(n) = llm.n_ctx() {
         format!("服务端: llama.cpp · 上下文 n_ctx {n} · 模型 {}", llm.model_name())
@@ -862,8 +546,6 @@ fn server_caps_note(llm: &Llm) -> String {
         format!("服务端: 非 llama.cpp（能力未知，使用配置回退值）")
     }
 }
-
-                                                                                                               
 fn handle_command(
     cmd: &str,
     tui: &mut Tui,
@@ -935,9 +617,6 @@ fn handle_command(
             tui.push_system(out);
         }
         "new" => {
-                                                                                          
-                                                         
-                                                        
             cancel.store(true, Ordering::Relaxed);
             tui.push_system("已中止当前回合生成".into());
             let id = if rest.is_empty() {
@@ -946,10 +625,6 @@ fn handle_command(
                 store.new_session(rest)
             };
             tui.push_system(format!("已新建并切换到会话: {id}"));
-                                                      
-                                                        
-                                                           
-                                          
             let llm2 = llm.clone();
             let ev_tx2 = ev_tx.clone();
             std::thread::spawn(move || {
@@ -998,7 +673,6 @@ fn handle_command(
         }
         "model" | "models" => {
             if rest.is_empty() {
-                                            
                 let (ev_tx2, cfg2) = (ev_tx.clone(), cfg.clone());
                 std::thread::spawn(move || {
                     let msg = match llm::list_models(&cfg2.provider.base_url, &cfg2.provider.api_key) {
@@ -1011,7 +685,6 @@ fn handle_command(
                     let _ = ev_tx2.send(AgentEvent::Notice(msg));
                 });
             } else {
-                                                                        
                 let name = match rest.parse::<usize>() {
                     Ok(n) if n >= 1 => match llm::list_models(&cfg.provider.base_url, &cfg.provider.api_key) {
                         Ok(ids) => match ids.get(n - 1) {
@@ -1027,7 +700,6 @@ fn handle_command(
                         }
                     },
                     _ => {
-                                                
                         let kw = rest.to_string();
                         match llm::list_models(&cfg.provider.base_url, &cfg.provider.api_key) {
                             Ok(ids) => {
@@ -1060,7 +732,6 @@ fn handle_command(
                 cfg2.save();
                 llm.set_model(name.clone());
                 tui.push_system(format!("模型已切换为 {name}，下一条消息立即生效"));
-                                                  
                 let llm2 = llm.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = llm2.reload_model() {
@@ -1070,7 +741,6 @@ fn handle_command(
             }
         }
         "setup" => {
-                                                   
             let msg = setup::quick_setup(cfg);
             tui.push_system(msg);
             sync_llm_from_cfg(llm, cfg);
@@ -1380,7 +1050,6 @@ fn handle_command(
             }
         }
         "reloadmodel" | "reload" => {
-                                                            
             let llm2 = llm.clone();
             let ev_tx2 = ev_tx.clone();
             std::thread::spawn(move || {
@@ -1425,8 +1094,6 @@ fn handle_command(
             )),
         },
         "autodangerous" => {
-                                                   
-                                                   
             let on = match rest {
                 "on" => true,
                 "off" => false,
@@ -1449,7 +1116,6 @@ fn handle_command(
             });
         }
         "trace" => {
-                                                               
             let on = match rest {
                 "on" => true,
                 "off" => false,
@@ -1493,7 +1159,6 @@ fn handle_command(
             });
         }
         "save" => {
-                                                 
             let msgs = store.current().messages;
             let md = session::export_markdown(store.current_id(), &msgs);
             let path = if rest.is_empty() {
@@ -1529,7 +1194,6 @@ fn handle_command(
         }
         "exit" | "quit" => {
             tui.push_system("bye".to_string());
-                               
             std::process::exit(0);
         }
         "" => {}
@@ -1538,55 +1202,42 @@ fn handle_command(
         }
     }
 }
-
 #[cfg(test)]
 mod turn_queue_tests {
     use super::*;
-
     #[test]
     fn running_turn_queues_messages_fifo_and_cancel_does_not_release_slot() {
         let mut queue = TurnQueue::default();
         assert_eq!(queue.submit("first".into()), TurnAdmission::Start("first".into()));
         assert_eq!(queue.submit("second".into()), TurnAdmission::Queued(1));
         assert_eq!(queue.submit("third".into()), TurnAdmission::Queued(2));
-
-                                                             
-                                  
         assert!(queue.is_active());
         assert_eq!(queue.start_next(), None);
-
         queue.finish_active();
         assert_eq!(queue.start_next().as_deref(), Some("second"));
         assert!(queue.is_active());
         assert_eq!(queue.start_next(), None);
-
         queue.finish_active();
         assert_eq!(queue.start_next().as_deref(), Some("third"));
         queue.finish_active();
         assert_eq!(queue.start_next(), None);
         assert!(!queue.is_active());
     }
-
     #[test]
     fn pop_pending_takes_latest_only() {
-                                               
         let mut queue = TurnQueue::default();
         assert_eq!(queue.submit("first".into()), TurnAdmission::Start("first".into()));
         assert_eq!(queue.submit("second".into()), TurnAdmission::Queued(1));
         assert_eq!(queue.submit("third".into()), TurnAdmission::Queued(2));
-
         assert_eq!(queue.pop_pending().as_deref(), Some("third"));
         assert_eq!(queue.pending_len(), 1, "只弹出一条");
         assert!(queue.is_active(), "正在运行的回合不受影响");
-
         assert_eq!(queue.pop_pending().as_deref(), Some("second"));
         assert_eq!(queue.pop_pending(), None, "队列空了再取返回 None");
         assert_eq!(queue.pending_len(), 0);
     }
-
     #[test]
     fn autodangerous_toggles_and_clears_whitelist() {
-                                                             
         let tmp = std::env::temp_dir().join(format!("yjlcoder-cmd-{}", std::process::id()));
         let mut store = SessionStore::new(tmp.clone());
         let mut cfg = Config::default();
@@ -1597,7 +1248,6 @@ mod turn_queue_tests {
         let perm_allowed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         perm_allowed.lock().unwrap().insert("cargo".to_string());
         let mut tui = Tui::new();
-
         let mut call = |cmd: &str| {
             handle_command(
                 cmd,
@@ -1611,19 +1261,15 @@ mod turn_queue_tests {
                 &perm_allowed,
             );
         };
-                            
         call("autodangerous");
         assert!(perm_auto.load(Ordering::Relaxed));
-                                      
         call("autodangerous");
         assert!(!perm_auto.load(Ordering::Relaxed));
         assert!(perm_allowed.lock().unwrap().is_empty(), "关闭时清空白名单");
-                      
         call("autodangerous on");
         assert!(perm_auto.load(Ordering::Relaxed));
         call("autodangerous off");
         assert!(!perm_auto.load(Ordering::Relaxed));
-                    
         call("autodangerous maybe");
         assert!(!perm_auto.load(Ordering::Relaxed), "未知参数不改状态");
         let _ = std::fs::remove_dir_all(&tmp);

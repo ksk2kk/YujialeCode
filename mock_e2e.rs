@@ -1,18 +1,11 @@
-                                                          
-
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
-
 use serde_json::json;
 use yjlcoder::agent::Agent;
 use yjlcoder::config::Config;
 use yjlcoder::llm::{Llm, Msg};
 use yjlcoder::session::SessionStore;
-
-                                               
-                                              
 static HOME_LOCK: Mutex<()> = Mutex::new(());
-
 fn tmp_home(name: &str) -> (std::path::PathBuf, MutexGuard<'static, ()>) {
     let guard = HOME_LOCK.lock().unwrap();
     let d = std::env::temp_dir().join(format!("yjlcoder_e2e_{name}_{}", std::process::id()));
@@ -21,13 +14,9 @@ fn tmp_home(name: &str) -> (std::path::PathBuf, MutexGuard<'static, ()>) {
     std::env::set_var("YJLCODER_HOME", &d);
     (d, guard)
 }
-
 fn stats(home: &std::path::Path) -> usize {
     yjlcoder::session::session_stats(&home.join("sessions/main.jsonl")).0
 }
-
-                                                        
-                                     
 fn read_full_request(stream: &mut std::net::TcpStream) -> String {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -60,7 +49,6 @@ fn read_full_request(stream: &mut std::net::TcpStream) -> String {
     }
     String::from_utf8_lossy(&buf).into_owned()
 }
-
 #[test]
 fn mock_agent_full_turn_with_tool_loop() {
     let (home, _home_guard) = tmp_home("turn");
@@ -68,7 +56,6 @@ fn mock_agent_full_turn_with_tool_loop() {
     let llm = Llm::mock();
     let cancel = Arc::new(AtomicBool::new(false));
     let store = SessionStore::new(home.join("sessions"));
-
     let mut agent = Agent::with_store(cfg.clone(), llm, store, None, false, false, cancel);
     let mut deltas = 0usize;
     let mut tools = 0usize;
@@ -79,16 +66,10 @@ fn mock_agent_full_turn_with_tool_loop() {
             _ => {}
         })
         .unwrap();
-
-                                               
     assert_eq!(tools, 1, "应执行一次工具调用");
     assert!(deltas > 0, "应有流式增量");
     assert!(reply.contains("mock 模式完成"), "最终回复: {reply}");
-
-                                                               
     assert_eq!(stats(&home), 4, "会话应有 4 条消息");
-
-                                             
     let trace_path = std::fs::read_dir(home.join("trace"))
         .unwrap()
         .filter_map(Result::ok)
@@ -105,37 +86,26 @@ fn mock_agent_full_turn_with_tool_loop() {
     assert!(lines.len() <= 6, "trace 不应逐 token 刷屏: {} 行", lines.len());
     let _ = std::fs::remove_dir_all(&home);
 }
-
 #[test]
 fn mock_auto_compact_triggers() {
     let (home, _home_guard) = tmp_home("compact");
     let mut cfg = Config::default();
-                          
     cfg.provider.ctx_window = 2000;
     cfg.tui.compress_threshold = 0.5;
     let llm = Llm::mock();
     let cancel = Arc::new(AtomicBool::new(false));
-
-                                                            
     let mut store = SessionStore::new(home.join("sessions"));
     for i in 0..20 {
         store.append(&Msg::new("user", format!("{}:{}", "x".repeat(300), i)));
         store.append(&Msg::new("assistant", "y".repeat(50)));
     }
-
     let mut agent = Agent::with_store(cfg.clone(), llm, store, None, false, false, cancel);
     let reply = agent.run_turn("继续", &mut |_| {}).unwrap();
     assert!(reply.contains("mock 模式完成"), "回复: {reply}");
-
-                                   
     let msgs = stats(&home);
     assert!(msgs < 30, "压缩后消息数应远小于 42，实际 {msgs}");
     let _ = std::fs::remove_dir_all(&home);
 }
-
-                                                 
-                                                       
-                                                    
 fn serve_repeating_native_tool() -> u16 {
     use std::io::Write;
     use std::net::TcpListener;
@@ -161,7 +131,6 @@ fn serve_repeating_native_tool() -> u16 {
                 let _ = stream.write_all(response.as_bytes());
                 break;
             }
-
             let chunk = json!({
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0,
@@ -184,7 +153,6 @@ fn serve_repeating_native_tool() -> u16 {
     });
     port
 }
-
 #[test]
 fn repeated_native_tool_is_fused_and_finalized() {
     let (home, _home_guard) = tmp_home("repeat_native");
@@ -206,17 +174,12 @@ fn repeated_native_tool_is_fused_and_finalized() {
             _ => {}
         })
         .unwrap();
-
     assert_eq!(tool_runs, 2, "第三次相同调用应在执行前熔断");
     assert!(fused, "应向界面报告熔断原因");
     assert!(reply.contains("停止重复调用"), "应生成无工具收尾: {reply}");
     assert_eq!(stats(&home), 6, "user + 两轮工具 + 最终回答");
     let _ = std::fs::remove_dir_all(&home);
 }
-
-                                                        
-                                           
-                                             
 fn serve_reasoning_loop_rescue() -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -252,11 +215,8 @@ fn serve_reasoning_loop_rescue() -> u16 {
     });
     port
 }
-
 #[test]
 fn reasoning_loop_rescued_by_extracted_tool() {
-                                                   
-                                         
     let (home, _home_guard) = tmp_home("rescue");
     let mut cfg = Config::default();
     cfg.provider.native_tools = false;                   
@@ -264,7 +224,6 @@ fn reasoning_loop_rescued_by_extracted_tool() {
     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
     let cancel = Arc::new(AtomicBool::new(false));
     let store = SessionStore::new(home.join("sessions"));
-
     let mut agent = Agent::with_store(cfg.clone(), llm, store, None, false, false, cancel);
     let mut notice = String::new();
     let mut tool_run = String::new();
@@ -277,19 +236,14 @@ fn reasoning_loop_rescued_by_extracted_tool() {
             _ => {}
         })
         .unwrap();
-
     assert_eq!(tool_run, "execute_command", "应从思考流提取并执行工具");
     assert!(notice.contains("思考流"), "应有截断提取说明: {notice}");
     assert!(notice.contains("3"), "3 个重复块应全部转发: {notice}");
     assert!(tool_result.contains("rescue-ok"), "工具结果应注入: {tool_result}");
     assert_eq!(reply, "rescue 成功", "第二轮回合应给出正常回答: {reply}");
-                                                                   
     assert_eq!(stats(&home), 8, "3 个工具块全部执行后应有 8 条消息");
     let _ = std::fs::remove_dir_all(&home);
 }
-
-                                                     
-                                        
 fn serve_post_tool_reasoning_loop() -> (u16, Arc<Mutex<Vec<String>>>) {
     use std::io::Write;
     use std::net::TcpListener;
@@ -303,8 +257,6 @@ fn serve_post_tool_reasoning_loop() -> (u16, Arc<Mutex<Vec<String>>>) {
             let request = read_full_request(&mut stream);
             captured.lock().unwrap().push(request);
             if round == 0 {
-                                                                   
-                                          
                 let mut sse = String::new();
                 for i in 0..80 {
                     let chunk = json!({
@@ -339,7 +291,6 @@ fn serve_post_tool_reasoning_loop() -> (u16, Arc<Mutex<Vec<String>>>) {
     });
     (port, requests)
 }
-
 #[test]
 fn tool_result_reasoning_loop_finalizes_immediately_without_thinking() {
     let (home, _home_guard) = tmp_home("post_tool_loop");
@@ -364,7 +315,6 @@ fn tool_result_reasoning_loop_finalizes_immediately_without_thinking() {
             },
         )
         .unwrap();
-
     assert_eq!(reply, "文件包含 alpha、beta、gamma 三行。");
     assert!(
         notices.iter().any(|n| n.contains("立即切换无思考收尾")),
@@ -375,7 +325,6 @@ fn tool_result_reasoning_loop_finalizes_immediately_without_thinking() {
         "已有工具结果后不得再注入打断消息: {notices:?}"
     );
     assert_eq!(stats(&home), 3, "不应把打断消息写进会话");
-
     let captured = requests.lock().unwrap();
     assert_eq!(captured.len(), 2, "只允许原请求 + 一次收尾请求");
     assert!(
@@ -394,7 +343,6 @@ fn tool_result_reasoning_loop_finalizes_immediately_without_thinking() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
-
 #[test]
 fn exact_read_line_is_answered_without_calling_the_model() {
     let (home, _home_guard) = tmp_home("exact_read_line");
@@ -403,7 +351,6 @@ fn exact_read_line_is_answered_without_calling_the_model() {
     let mut cfg = Config::default();
     cfg.provider.native_tools = true;
     cfg.provider.auto_reload = false;
-                                  
     let llm = Llm::remote("http://127.0.0.1:9/v1", "k", "m", 1, 1024);
     let store = SessionStore::new(home.join("sessions"));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -414,12 +361,10 @@ fn exact_read_line_is_answered_without_calling_the_model() {
             &mut |_| {},
         )
         .unwrap();
-
     assert_eq!(reply, "第 2 行的完整内容是：\nbeta");
     assert_eq!(stats(&home), 3, "user + Read 结果 + 确定性答案");
     let _ = std::fs::remove_dir_all(&home);
 }
-
 fn serve_single_raw_answer() -> (u16, Arc<Mutex<Vec<String>>>) {
     use std::io::Write;
     use std::net::TcpListener;
@@ -446,7 +391,6 @@ fn serve_single_raw_answer() -> (u16, Arc<Mutex<Vec<String>>>) {
     });
     (port, requests)
 }
-
 #[test]
 fn fuckloop_off_restores_raw_post_tool_model_flow() {
     let (home, _home_guard) = tmp_home("fuckloop_off");
@@ -467,7 +411,6 @@ fn fuckloop_off_restores_raw_post_tool_model_flow() {
             &mut |_| {},
         )
         .unwrap();
-
     assert_eq!(reply, "模型原始回答", "off 时不得使用确定性 Read 直答");
     let captured = requests.lock().unwrap();
     assert_eq!(captured.len(), 1, "off 时应把工具结果交给原始模型流程");
@@ -482,9 +425,6 @@ fn fuckloop_off_restores_raw_post_tool_model_flow() {
     assert_eq!(stats(&home), 3);
     let _ = std::fs::remove_dir_all(&home);
 }
-
-                                               
-                             
 fn serve_plan_loop_rescue() -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -496,7 +436,6 @@ fn serve_plan_loop_rescue() -> u16 {
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf);
             let chunks: Vec<String> = if round == 0 {
-                                                    
                 [
                     "```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"echo plan-1\"}}\n```\n先执行这个。\n\n",
                     "```tool {\"op\":\"execute_command\",\"args\":{\"cmd\":\"echo plan-2\"}}\n```\n如果没结果再试。\n\n",
@@ -525,11 +464,8 @@ fn serve_plan_loop_rescue() -> u16 {
     });
     port
 }
-
 #[test]
 fn plan_loop_rescued_by_extracted_tool() {
-                                                     
-                                                 
     let (home, _home_guard) = tmp_home("planloop");
     let mut cfg = Config::default();
     cfg.provider.native_tools = false;
@@ -537,7 +473,6 @@ fn plan_loop_rescued_by_extracted_tool() {
     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
     let cancel = Arc::new(AtomicBool::new(false));
     let store = SessionStore::new(home.join("sessions"));
-
     let mut agent = Agent::with_store(cfg.clone(), llm, store, None, false, false, cancel);
     let mut notice = String::new();
     let mut tool_run = String::new();
@@ -550,19 +485,14 @@ fn plan_loop_rescued_by_extracted_tool() {
             _ => {}
         })
         .unwrap();
-
     assert_eq!(tool_run, "execute_command", "应从思考流提取并执行工具");
     assert!(notice.contains("思考流"), "应有截断提取说明: {notice}");
     assert!(notice.contains("3"), "应注明暴力转发 3 个块: {notice}");
     assert!(tool_result.contains("plan-ok"), "应提取最后一个块执行: {tool_result}");
     assert_eq!(reply, "规划循环救援成功", "第二轮回合应给出正常回答: {reply}");
-                                                                   
     assert_eq!(stats(&home), 8, "3 个工具块全部执行后应有 8 条消息");
     let _ = std::fs::remove_dir_all(&home);
 }
-
-                                          
-                              
 fn serve_ask_user_flow() -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -623,24 +553,18 @@ fn serve_ask_user_flow() -> u16 {
     });
     port
 }
-
 #[test]
 fn ask_user_blocks_until_answer_then_continues() {
-                                                   
-                                  
     use std::sync::mpsc;
     use yjlcoder::tools::{AskAnswer, AskRequest};
-
     let (home, _home_guard) = tmp_home("askuser");
     let cfg = Config::default();
     let port = serve_ask_user_flow();
     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
     let cancel = Arc::new(AtomicBool::new(false));
     let store = SessionStore::new(home.join("sessions"));
-
     let (ask_tx, ask_rx) = mpsc::channel::<AskRequest>();
     let (answer_tx, answer_rx) = mpsc::channel::<AskAnswer>();
-                        
     let responder = std::thread::spawn(move || {
         let req = ask_rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -658,7 +582,6 @@ fn ask_user_blocks_until_answer_then_continues() {
             })
             .unwrap();
     });
-
     let mut agent = Agent::with_store(cfg.clone(), llm, store, None, false, false, cancel);
     agent.set_ask_channels(ask_tx, answer_rx);
     let mut tool_result = String::new();
@@ -669,7 +592,6 @@ fn ask_user_blocks_until_answer_then_continues() {
             }
         })
         .unwrap();
-
     responder.join().unwrap();
     assert!(
         tool_result.contains("\"你想去哪？\"=\"北京\"")
@@ -677,16 +599,9 @@ fn ask_user_blocks_until_answer_then_continues() {
         "结构化回答应作为问题→答案映射注入: {tool_result}"
     );
     assert_eq!(reply, "好的，明天去北京", "模型应基于用户回答继续: {reply}");
-                                                              
     assert_eq!(stats(&home), 4, "会话应有 4 条消息");
     let _ = std::fs::remove_dir_all(&home);
 }
-
-                                                         
-                                                           
-                                                                                
-   
-                                              
 type SeenRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 fn serve_reload_probe(mode: &'static str) -> (u16, SeenRequests) {
     use std::io::{Read, Write};
@@ -695,7 +610,6 @@ fn serve_reload_probe(mode: &'static str) -> (u16, SeenRequests) {
     let port = listener.local_addr().unwrap().port();
     let seen: SeenRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen2 = seen.clone();
-                                                                 
     let state: std::sync::Arc<std::sync::Mutex<String>> =
         std::sync::Arc::new(std::sync::Mutex::new("loaded".to_string()));
     let state2 = state.clone();
@@ -750,12 +664,8 @@ fn serve_reload_probe(mode: &'static str) -> (u16, SeenRequests) {
     });
     (port, seen)
 }
-
 #[test]
 fn reload_uses_llamacpp_router_protocol_with_auth() {
-                                                                  
-                                                                   
-                      
     let (port, seen) = serve_reload_probe("llama");
     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k3y", "m", 10, 1024);
     llm.reload_model().unwrap();
@@ -784,11 +694,8 @@ fn reload_uses_llamacpp_router_protocol_with_auth() {
         "所有控制请求必须带 Authorization: {seen:?}"
     );
 }
-
 #[test]
 fn reload_falls_back_to_lmstudio_protocol_when_router_missing() {
-                                                                 
-                                       
     let (port, seen) = serve_reload_probe("lmstudio");
     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k3y", "m", 10, 1024);
     llm.reload_model().unwrap();
