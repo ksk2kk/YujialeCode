@@ -1,32 +1,9 @@
-                          
-   
-                                          
-                                                     
-                                           
-   
-                                            
-                                                        
-                                                           
-                                               
-                                                         
-                  
-
-                                                     
-                                            
-                                             
 pub fn now_stamp() -> String {
-                                                        
-                                             
-                                                 
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as libc::time_t;
     unsafe {
-                                                    
-                                          
-                                          
-                                               
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&t, &mut tm);
         format!(
@@ -40,11 +17,9 @@ pub fn now_stamp() -> String {
         )
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn stamp_has_expected_shape() {
         let s = now_stamp();

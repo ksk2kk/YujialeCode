@@ -1,32 +1,13 @@
-                            
-   
-                                                            
-                                            
-                                                           
-                              
-   
-                                                         
-                                         
-                                                       
-
 pub struct ToolDef {
-                                                  
     pub name: &'static str,
-                                         
     pub desc: &'static str,
-                                    
     pub args: &'static str,
 }
-
 pub struct Category {
-                                        
     pub id: &'static str,
-                       
     pub title: &'static str,
-                                      
     pub tools: &'static [ToolDef],
 }
-
 pub const CATEGORIES: &[Category] = &[
     Category {
         id: "core",
@@ -128,42 +109,12 @@ pub const CATEGORIES: &[Category] = &[
         ],
     },
 ];
-
-                                          
-   
-        
-                                 
-   
-        
-                                              
-                                         
-                                                      
-                   
 pub fn find_category(id: &str) -> Option<&'static Category> {
     CATEGORIES.iter().find(|c| c.id == id)
 }
-
-                                      
-   
-        
-                                  
-   
-        
-                                                          
-                                        
-                                   
-                          
 pub fn find_tool(name: &str) -> Option<&'static ToolDef> {
     CATEGORIES.iter().flat_map(|c| c.tools.iter()).find(|t| t.name == name)
 }
-
-                                               
-                    
-   
-        
-                                      
-                                  
-              
 pub fn list_categories_text() -> String {
     let mut out = String::from("可用工具分类（调用 list_tools {\"category\":\"<id>\"} 查看详细说明）:\n");
     for c in CATEGORIES {
@@ -172,16 +123,6 @@ pub fn list_categories_text() -> String {
     }
     out
 }
-
-                                           
-                          
-   
-        
-                                                  
-   
-        
-                                       
-             
 pub fn list_category_text(id: &str) -> Option<String> {
     let c = find_category(id)?;
     let mut out = format!("[{}] {}:\n", c.id, c.title);
@@ -190,9 +131,6 @@ pub fn list_category_text(id: &str) -> Option<String> {
     }
     Some(out)
 }
-
-                                                
-                                                         
 pub fn native_tools_json() -> serde_json::Value {
     serde_json::json!([
         {
@@ -289,11 +227,9 @@ pub fn native_tools_json() -> serde_json::Value {
         }
     ])
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn categories_cover_all_tools() {
         let mut names = Vec::new();
@@ -309,7 +245,6 @@ mod tests {
         assert!(names.contains(&"install_skill"));
         assert!(names.contains(&"qq_send"));
     }
-
     #[test]
     fn list_outputs() {
         let index = list_categories_text();
@@ -319,7 +254,6 @@ mod tests {
         assert!(file.contains("readline"));
         assert!(list_category_text("nope").is_none());
     }
-
     #[test]
     fn native_tools_expose_read_as_a_core_tool() {
         let v = native_tools_json();
@@ -334,7 +268,6 @@ mod tests {
         assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"execute_command"));
     }
-
     #[test]
     fn find_tool_works() {
         assert!(find_tool("editline").is_some());

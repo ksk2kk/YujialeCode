@@ -1,27 +1,12 @@
-                           
-   
-                                                     
-                                                             
-   
-                                                   
-                                          
-   
-                                                         
 use serde_json::json;
 use std::time::{Duration, Instant};
-
 fn main() {
-                                       
     let is_group = std::env::args().any(|a| a == "--group");
-                                                                
     let (mut ws, _) =
         tungstenite::connect("ws://127.0.0.1:6701/onebot/v11/ws").expect("连接失败");
-           
     if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_mut() {
         let _ = s.set_nonblocking(true);
     }
-
-                                               
     let ev = if is_group {
         json!({
             "post_type": "message",
@@ -46,11 +31,8 @@ fn main() {
             "time": 0,
         })
     };
-
     ws.send(tungstenite::Message::Text(ev.to_string())).expect("发送失败");
     eprintln!("[probe] 已发送事件");
-
-                                        
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         match ws.read() {

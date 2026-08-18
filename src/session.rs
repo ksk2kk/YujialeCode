@@ -1,38 +1,18 @@
-                        
-   
-                                                     
-                                                   
-                                                     
-   
-                                              
-                                               
-
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-
 use crate::llm::Msg;
-
 #[derive(Debug, Clone)]
 pub struct Session {
-                                                         
     pub messages: Vec<Msg>,
 }
-
 #[derive(Debug, Clone)]
 pub struct SessionStore {
-                                      
     dir: PathBuf,
-                                         
     current: String,
-                          
     dirty: bool,
 }
-
 impl SessionStore {
-                                  
-       
-                                                
     pub fn new(dir: PathBuf) -> Self {
         let _ = fs::create_dir_all(&dir);
         let current = "main".to_string();
@@ -41,33 +21,15 @@ impl SessionStore {
         }
         SessionStore { dir, current, dirty: false }
     }
-
-                                            
     pub fn path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.jsonl"))
     }
-
-                                    
     pub fn current_id(&self) -> &str {
         &self.current
     }
-
-                                             
     pub fn current(&self) -> Session {
         self.load(&self.current)
     }
-
-                                              
-       
-            
-                                  
-       
-            
-                                              
-                                         
-                                                      
-                                             
-                                    
     pub fn load(&self, id: &str) -> Session {
         let mut messages = Vec::new();
         if let Ok(f) = fs::File::open(self.path(id)) {
@@ -83,21 +45,6 @@ impl SessionStore {
         }
         Session { messages }
     }
-
-                             
-       
-            
-                                             
-                                              
-                
-       
-                               
-                                                             
-                                                 
-                                                
-                 
-                                                 
-                                              
     pub fn append(&mut self, msg: &Msg) {
         let mut f = match fs::OpenOptions::new().create(true).append(true).open(self.path(&self.current)) {
             Ok(f) => f,
@@ -107,14 +54,6 @@ impl SessionStore {
         let _ = writeln!(f, "{line}");
         let _ = f.flush();
     }
-
-                  
-       
-            
-                                                     
-                                                      
-                                                                
-                          
     pub fn list(&self) -> Vec<String> {
         let mut out: Vec<String> = fs::read_dir(&self.dir)
             .map(|rd| {
@@ -129,16 +68,6 @@ impl SessionStore {
         out.sort();
         out
     }
-
-                     
-       
-            
-                       
-       
-            
-                                              
-                                                 
-                                                   
     pub fn switch(&mut self, id: &str) -> Result<(), String> {
         let safe = sanitize_id(id);
         if !self.path(&safe).exists() {
@@ -147,14 +76,6 @@ impl SessionStore {
         self.current = safe;
         Ok(())
     }
-
-                                        
-       
-            
-                                          
-       
-                                             
-                                            
     pub fn new_session(&mut self, id: &str) -> String {
         let safe = sanitize_id(id);
         if !self.path(&safe).exists() {
@@ -163,11 +84,6 @@ impl SessionStore {
         self.current = safe.clone();
         safe
     }
-
-                                            
-       
-                                                       
-                                               
     pub fn new_session_timestamped(&mut self) -> String {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -175,15 +91,6 @@ impl SessionStore {
             .as_secs();
         self.new_session(&format!("s{secs}"))
     }
-
-                
-       
-            
-                                   
-       
-            
-                                            
-                                       
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
         let safe = sanitize_id(id);
         if safe == self.current {
@@ -194,20 +101,6 @@ impl SessionStore {
             Err(e) => Err(format!("删除失败: {e}")),
         }
     }
-
-                      
-       
-            
-                                    
-       
-                                   
-                                       
-                           
-                                                 
-                                             
-                                         
-                              
-                                   
     pub fn replace_current(&mut self, messages: &[Msg]) -> Result<(), String> {
         let p = self.path(&self.current);
         let tmp = p.with_extension("jsonl.tmp");
@@ -220,19 +113,14 @@ impl SessionStore {
         fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
         Ok(())
     }
-
     pub fn set_dirty(&mut self, v: bool) {
         self.dirty = v;
     }
-
     #[allow(dead_code)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 }
-
-                                 
-                                           
 pub fn export_markdown(id: &str, messages: &[Msg]) -> String {
     let mut out = String::new();
     out.push_str(&format!("# YJLcoder 会话导出: {id}\n\n"));
@@ -260,15 +148,6 @@ pub fn export_markdown(id: &str, messages: &[Msg]) -> String {
     }
     out
 }
-
-                                               
-   
-                 
-                                                   
-                                           
-                                              
-                                       
-                  
 pub fn sanitize_id(id: &str) -> String {
     let cleaned: String = id
         .chars()
@@ -280,20 +159,7 @@ pub fn sanitize_id(id: &str) -> String {
         cleaned
     }
 }
-
-                                             
-   
-        
-                            
-   
-        
-                                               
-                                                  
-                                  
-                                                                
-                                
 pub fn session_stats(path: &Path) -> (usize, usize) {
-                        
     let mut msgs = 0usize;
     let mut tokens = 0usize;
     if let Ok(f) = fs::File::open(path) {
@@ -309,18 +175,15 @@ pub fn session_stats(path: &Path) -> (usize, usize) {
     }
     (msgs, tokens)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("yjlcoder_test_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
     }
-
     #[test]
     fn session_roundtrip() {
         let d = tmp_dir("roundtrip");
@@ -332,7 +195,6 @@ mod tests {
         assert_eq!(s.messages[1].content, "世界");
         let _ = fs::remove_dir_all(&d);
     }
-
     #[test]
     fn multi_session_switch() {
         let d = tmp_dir("multi");
@@ -347,7 +209,6 @@ mod tests {
         assert!(store.list().contains(&"proj-x".to_string()));
         let _ = fs::remove_dir_all(&d);
     }
-
     #[test]
     fn timestamped_session_unique() {
         let d = tmp_dir("ts");
@@ -357,7 +218,6 @@ mod tests {
         assert_eq!(store.current_id(), id);
         let _ = fs::remove_dir_all(&d);
     }
-
     #[test]
     fn export_markdown_contains_all_roles() {
         use crate::llm::ToolCall;
@@ -384,15 +244,12 @@ mod tests {
         assert!(md.contains("## [2] 工具结果"), "工具结果日志");
         assert!(md.contains("main.c"));
     }
-
     #[test]
     fn sanitize_rejects_path_traversal() {
-                            
         assert_eq!(sanitize_id("../etc"), "___etc");
         assert_eq!(sanitize_id("a/b"), "a_b");
         assert_eq!(sanitize_id(""), "s");
     }
-
     #[test]
     fn delete_protects_current() {
         let d = tmp_dir("del");

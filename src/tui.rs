@@ -1,28 +1,7 @@
-                        
-   
-                                                        
-   
-                                                     
-                                                   
-   
-                                                        
-                                               
-                                                  
-   
-                                                                
-                                              
-                 
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
 use crate::tools::AskQuestion;
-
-                                                            
-                                                                  
-                                                         
-                                    
 const C_GREEN: &str = "\x1b[32m";                
 const C_ASST: &str = "\x1b[37m";              
 const C_USER_TEXT: &str = "\x1b[1;97m";                               
@@ -38,52 +17,34 @@ const C_BG_CODE: &str = "\x1b[48;5;234m";
 const C_GRAY: &str = "\x1b[244m";                
 const C_SUGGEST: &str = "\x1b[209m";                                 
 const C_BG_ASK_TAB: &str = "\x1b[48;5;173;30m";                        
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChatRole {
     User,
     Assistant,
-                               
     Tool,
-                               
     ToolResult,
     System,
     Error,
-                           
     Warn,
     Summary,
-                                                  
     Reasoning,
 }
-
 #[derive(Debug, Clone)]
 pub struct ChatLine {
-                                 
     pub role: ChatRole,
-                            
     pub text: String,
-                    
     pub pending: bool,
-                                  
     pub op: Option<String>,
 }
-
 impl ChatLine {
-                                            
-                                            
     fn new(role: ChatRole, text: String) -> Self {
         ChatLine { role, text, pending: false, op: None }
     }
 }
-
-                                              
 struct RLine {
-                                             
     shade: Option<&'static str>,
-                                  
     styled: String,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
     Char(char),
@@ -98,17 +59,13 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
-                                    
     WheelUp,
     WheelDown,
-                                                    
     MouseDown { row: usize, col: usize },
     MouseDrag { row: usize, col: usize },
     MouseUp { row: usize, col: usize },
-                                                 
     PasteStart,
     PasteEnd,
-                          
     Tab,
     CtrlC,
     CtrlD,
@@ -116,67 +73,37 @@ pub enum Key {
     Esc,
     Unknown,
 }
-
-          
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-              
     Submit(String),
-                    
     Command(String),
-                                                      
     AskSubmit(BTreeMap<String, String>),
-                               
     Cancel,
-                                             
     RetrieveQueued,
-                                      
     PermSubmit(crate::tools::PermDecisionKind),
-                  
     Quit,
     Redraw,
     None,
 }
-
 #[derive(Debug, Clone)]
 struct AskUi {
-                                            
     questions: Vec<AskQuestion>,
-                    
     current: usize,
-                                                  
     answers: BTreeMap<String, String>,
-                                                  
-                                      
     focus: usize,
-                                            
     checked: BTreeSet<usize>,
-                                    
     notice: Option<String>,
 }
-
-                             
-                                                          
 struct PermUi {
-                        
     cmd: String,
-                                           
     cmd_kind: String,
-                                                        
     focus: usize,
 }
-
 struct AskPanel {
-                            
     lines: Vec<String>,
-                                          
     cursor: Option<(usize, usize, char)>,
 }
-
 type AskPanelRow = (String, Option<String>, Option<(usize, char)>);
-
-                                           
-                               
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MascotState {
     Idle,
@@ -187,7 +114,6 @@ enum MascotState {
     Angry,
     Frantic,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MascotEvent {
     Begin,
@@ -202,22 +128,7 @@ enum MascotEvent {
     Bug,
     Cancel,
 }
-
 impl MascotState {
-                                     
-       
-            
-                                      
-                         
-       
-                             
-                                                        
-                                           
-                                                
-                                    
-                                        
-                                             
-                   
     fn transition(self, event: MascotEvent) -> Self {
         match event {
             MascotEvent::Begin => MascotState::Thinking,
@@ -235,8 +146,6 @@ impl MascotState {
             MascotEvent::Cancel => MascotState::Idle,
         }
     }
-
-                               
     fn label(self) -> &'static str {
         match self {
             MascotState::Idle => "READY",
@@ -248,10 +157,6 @@ impl MascotState {
             MascotState::Frantic => "BUG!",
         }
     }
-
-                                        
-                                                
-                            
     fn color(self) -> &'static str {
         match self {
             MascotState::Idle | MascotState::Success => C_GREEN,
@@ -261,78 +166,41 @@ impl MascotState {
         }
     }
 }
-
 pub struct Tui {
-                                     
     w: usize,
     h: usize,
-                                     
     header: String,
-                            
     ctx_used: usize,
-                                    
     ctx_window: usize,
-                                         
-                                      
     queued_count: usize,
-                                      
     chat: Vec<ChatLine>,
-                                
     scroll: usize,
-                                                   
     input: String,
-                                                
     cursor: usize,
-                               
     history: Vec<String>,
-                                
     hist_pos: Option<usize>,
-                                          
     streaming: bool,
-                                  
     prompt: String,
-                                
     hint: String,
-                             
     input_scroll: usize,
-                                                
     commands: &'static [(&'static str, &'static str)],
-                                               
-                           
     asking: Option<AskUi>,
-                                            
     perm_prompt: Option<PermUi>,
-                                    
     mascot_state: MascotState,
-                                                 
     last_tool_op: Option<String>,
-                                        
     last_frame: String,
-                          
     in_paste: bool,
-                                 
     paste_prev_cr: bool,
-                                                
     sel_anchor: Option<(usize, usize)>,
     sel_cur: Option<(usize, usize)>,
-                         
     copied_notice: Option<String>,
-                                                    
-                                                          
     sel_rows: Vec<String>,
     sel_start_row: usize,
 }
-
 pub struct RawGuard {
-                                      
     orig: libc::termios,
 }
-
 impl RawGuard {
-                            
-       
-                                                           
-                                                      
     pub fn enable() -> Self {
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
         unsafe {
@@ -350,23 +218,13 @@ impl RawGuard {
         RawGuard { orig }
     }
 }
-
 impl Drop for RawGuard {
-                                                            
     fn drop(&mut self) {
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, &self.orig);
         }
     }
 }
-
-                   
-   
-                                                      
-                                       
-                                             
-                                      
-                            
 fn term_size() -> (usize, usize) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -377,17 +235,12 @@ fn term_size() -> (usize, usize) {
         }
     }
 }
-
 impl Default for Tui {
-                                                                
-                                            
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl Tui {
-                                                     
     pub fn new() -> Self {
         let (w, h) = term_size();
         Tui {
@@ -422,11 +275,7 @@ impl Tui {
             sel_start_row: 0,
         }
     }
-
-                                               
-                                         
     pub fn ask(&mut self, questions: Vec<AskQuestion>) {
-                                                            
         self.input.clear();
         self.cursor = 0;
         self.asking = Some(AskUi {
@@ -439,8 +288,6 @@ impl Tui {
         });
         self.mascot_event(MascotEvent::Ask);
     }
-
-                    
     pub fn finish_ask(&mut self) {
         self.asking = None;
         self.input.clear();
@@ -449,32 +296,20 @@ impl Tui {
             self.mascot_event(MascotEvent::Answer);
         }
     }
-
-                                          
     pub fn is_asking(&self) -> bool {
         self.asking.is_some()
     }
-
-                                       
-                                    
     pub fn open_perm_prompt(&mut self, req: crate::tools::PermRequest) {
         self.input.clear();
         self.cursor = 0;
         self.perm_prompt = Some(PermUi { cmd: req.cmd, cmd_kind: req.cmd_kind, focus: 0 });
     }
-
-                                             
     pub fn finish_perm_prompt(&mut self) {
         self.perm_prompt = None;
     }
-
-                                 
     pub fn is_perm_prompt(&self) -> bool {
         self.perm_prompt.is_some()
     }
-
-                                                        
-                                                            
     fn handle_perm_key(&mut self, key: Key) -> Action {
         match key {
             Key::Up => {
@@ -506,28 +341,10 @@ impl Tui {
             _ => Action::None,
         }
     }
-
-                                   
     pub fn set_commands(&mut self, cmds: &'static [(&'static str, &'static str)]) {
         self.commands = cmds;
     }
-
-                                                      
-                                                    
-                              
-       
-                    
-                                                       
-                                   
-                                                    
-                                                           
-                                                     
-                                                       
-                            
-       
-                                                     
     pub fn enter(&mut self) -> RawGuard {
-                                                           
         let g = RawGuard::enable();
         self.resize();
         print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000;1002;1006h\x1b[?2004h");
@@ -535,24 +352,11 @@ impl Tui {
         let _ = std::io::stdout().flush();
         g
     }
-
-                                      
-                                                            
-                                     
-                                            
-                                
     pub fn exit(&mut self) {
         print!("\x1b[?2004l\x1b[?1000;1002;1006l\x1b[?25h\x1b[?7h\x1b[?1049l");
         let _ = std::io::stdout().flush();
     }
-
-                                                 
-                                 
-                                                                    
-                                                          
-                      
     fn resize(&mut self) {
-                                                    
         let (w, h) = term_size();
         if w != self.w || h != self.h {
             self.w = w;
@@ -562,27 +366,16 @@ impl Tui {
                 .min(self.chat_line_count().saturating_sub(self.chat_height().saturating_sub(1)));
         }
     }
-
-                                         
-                                                  
     pub fn set_header(&mut self, s: String) {
         self.header = s;
     }
-
-                      
     pub fn set_ctx(&mut self, used: usize, window: usize) {
         self.ctx_used = used;
         self.ctx_window = window;
     }
-
-                                       
-                                               
     pub fn set_queued_count(&mut self, count: usize) {
         self.queued_count = count;
     }
-
-                                            
-                                         
     pub fn retrieve_queued(&mut self, text: String) {
         self.queued_count = self.queued_count.saturating_sub(1);
         self.input = text;
@@ -590,24 +383,12 @@ impl Tui {
         self.hist_pos = None;
         self.hint = "已取回最近一条排队消息，编辑后回车重新发送".into();
     }
-
-                                
-
-                                               
-                                 
-                                                    
-                    
     pub fn push_user(&mut self, text: String) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Begin);
         self.chat.push(ChatLine::new(ChatRole::User, text));
         self.scroll = 0;
     }
-
-                                      
-                                                
-                                                       
-                                 
     pub fn begin_assistant(&mut self) {
         self.seal_reasoning();
         self.streaming = true;
@@ -615,27 +396,17 @@ impl Tui {
         self.chat.push(ChatLine { role: ChatRole::Assistant, text: String::new(), pending: true, op: None });
         self.scroll = 0;
     }
-
-                                                         
-                                                    
-       
-                                                                    
-                                                
     pub fn assistant_delta(&mut self, d: &str) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Progress);
         if let Some(last) = self.chat.last_mut() {
-                                                                 
             if last.pending {
                 last.text.push_str(d);
                 return;
             }
         }
-                  
         self.chat.push(ChatLine { role: ChatRole::Assistant, text: d.to_string(), pending: true, op: None });
     }
-
-                       
     pub fn end_assistant(&mut self, full: &str) {
         self.streaming = false;
         self.mascot_event(if full.trim().is_empty() {
@@ -653,16 +424,6 @@ impl Tui {
         self.chat.push(ChatLine::new(ChatRole::Assistant, full.to_string()));
         self.scroll = 0;
     }
-
-                              
-       
-                                                          
-                                                          
-                                                         
-                                
-       
-                                                     
-                                             
     pub fn push_tool(&mut self, op: &str, args: &str) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::ToolStart);
@@ -676,20 +437,6 @@ impl Tui {
         });
         self.scroll = 0;
     }
-
-                                                    
-       
-                                                       
-                                       
-                                                     
-                                       
-                   
-                                                  
-                                        
-                                                 
-       
-                                                   
-                                  
     pub fn push_tool_result(&mut self, result: &str) {
         self.seal_reasoning();
         self.mascot_event(if tool_result_failed(result) {
@@ -699,8 +446,6 @@ impl Tui {
         });
         let op = self.last_tool_op.take();
         let text = if matches!(op.as_deref(), Some("readline" | "listdir")) {
-                                                 
-                                           
             result.to_string()
         } else {
             let snippet: String = result.chars().take(400).collect();
@@ -714,43 +459,27 @@ impl Tui {
         self.chat.push(ChatLine::new(ChatRole::ToolResult, text));
         self.scroll = 0;
     }
-
-                                                 
-                      
     pub fn push_system(&mut self, text: String) {
         self.seal_reasoning();
         self.chat.push(ChatLine::new(ChatRole::System, text));
         self.scroll = 0;
     }
-
-                                       
-                                        
     pub fn push_error(&mut self, text: String) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Bug);
         self.chat.push(ChatLine::new(ChatRole::Error, text));
         self.scroll = 0;
     }
-
-                                   
     pub fn push_warn(&mut self, text: String) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Warning);
         self.chat.push(ChatLine::new(ChatRole::Warn, text));
         self.scroll = 0;
     }
-
-                                             
-                           
     pub fn push_bug_warn(&mut self, text: String) {
         self.push_warn(text);
         self.mascot_event(MascotEvent::Bug);
     }
-
-                                                   
-                                                   
-                                               
-                      
     pub fn push_reasoning(&mut self, text: String) {
         self.mascot_event(MascotEvent::Progress);
         if let Some(last) = self.chat.last_mut() {
@@ -762,9 +491,6 @@ impl Tui {
         self.chat.push(ChatLine { role: ChatRole::Reasoning, text, pending: true, op: None });
         self.scroll = 0;
     }
-
-                                        
-                           
     fn seal_reasoning(&mut self) {
         if let Some(last) = self.chat.last_mut() {
             if last.role == ChatRole::Reasoning && last.pending {
@@ -772,31 +498,19 @@ impl Tui {
             }
         }
     }
-
-                                             
     pub fn push_summary(&mut self, text: String) {
         self.seal_reasoning();
         self.chat.push(ChatLine::new(ChatRole::Summary, text));
         self.scroll = 0;
     }
-
-                                          
-                                           
     pub fn clear_chat(&mut self) {
         self.chat.clear();
         self.scroll = 0;
         self.mascot_event(MascotEvent::Cancel);
     }
-
-                                                  
-                       
     pub fn is_streaming(&self) -> bool {
         self.streaming
     }
-
-                                                  
-                                      
-                                                       
     pub fn cancel_streaming(&mut self) {
         self.streaming = false;
         self.mascot_event(MascotEvent::Cancel);
@@ -806,29 +520,9 @@ impl Tui {
             }
         }
     }
-
-                                     
-                                            
-                                  
     fn mascot_event(&mut self, event: MascotEvent) {
         self.mascot_state = self.mascot_state.transition(event);
     }
-
-                               
-
-                     
-                                                           
-                                       
-                                                                    
-                                              
-                                              
-                      
-                                                              
-                                   
-                                  
-       
-                                                        
-                                
     pub fn submit(&mut self) -> Option<Action> {
         if self.asking.is_some() {
             return Some(self.submit_ask());
@@ -849,13 +543,6 @@ impl Tui {
             Some(Action::Submit(text))
         }
     }
-
-                            
-       
-                                        
-                                                              
-                                                   
-                                              
     fn submit_ask(&mut self) -> Action {
         let Some((focus, option_count, multi_select)) = self.asking.as_ref().and_then(|asking| {
             let question = asking.questions.get(asking.current)?;
@@ -863,21 +550,15 @@ impl Tui {
         }) else {
             return Action::None;
         };
-
         let other_index = option_count;
         if multi_select {
-                                                            
             if focus == other_index + 1 {
                 return self.submit_multi_ask();
             }
-                                                        
             if focus == other_index && self.input.trim().is_empty() {
                 self.set_ask_notice("请先在 Other 中输入内容");
                 return Action::None;
             }
-                                            
-                                                              
-                                                 
             if let Some(asking) = self.asking.as_mut() {
                 if !asking.checked.remove(&focus) {
                     asking.checked.insert(focus);
@@ -886,9 +567,6 @@ impl Tui {
             }
             return Action::None;
         }
-
-                                                    
-                                                      
         let answer = if focus < option_count {
             self.asking
                 .as_ref()
@@ -909,13 +587,6 @@ impl Tui {
             None => Action::None,
         }
     }
-
-                                          
-                                                 
-                                                  
-                                                 
-                                          
-            
     fn submit_multi_ask(&mut self) -> Action {
         let Some(asking) = self.asking.as_ref() else { return Action::None };
         let Some(question) = asking.questions.get(asking.current) else { return Action::None };
@@ -934,23 +605,6 @@ impl Tui {
         }
         self.commit_ask_answer(answers.join(", "))
     }
-
-                                            
-       
-                                                            
-       
-                                                        
-                                         
-                                              
-       
-                                                           
-                                                  
-                                                        
-                                          
-                                   
-       
-                                                               
-                                             
     fn commit_ask_answer(&mut self, answer: String) -> Action {
         self.input.clear();
         self.cursor = 0;
@@ -967,7 +621,6 @@ impl Tui {
             (header, asking.current >= asking.questions.len())
         };
         self.push_user(format!("[{header}] {answer}"));
-
         if completed {
             let answers = self.asking.as_ref().map(|asking| asking.answers.clone()).unwrap_or_default();
             Action::AskSubmit(answers)
@@ -976,18 +629,11 @@ impl Tui {
             Action::None
         }
     }
-
-                                               
-                                        
     fn set_ask_notice(&mut self, notice: &str) {
         if let Some(asking) = self.asking.as_mut() {
             asking.notice = Some(notice.to_string());
         }
     }
-
-                                              
-                                      
-                            
     fn ask_focus_is_other(&self) -> bool {
         self.asking.as_ref().is_some_and(|asking| {
             asking
@@ -996,12 +642,6 @@ impl Tui {
                 .is_some_and(|question| asking.focus == question.options.len())
         })
     }
-
-                                               
-                                                     
-                                                              
-                                                     
-                     
     fn move_ask_focus(&mut self, delta: i32) {
         let Some(asking) = self.asking.as_mut() else { return };
         let Some(question) = asking.questions.get(asking.current) else { return };
@@ -1013,26 +653,6 @@ impl Tui {
         };
         asking.notice = None;
     }
-
-                                              
-                       
-       
-                                               
-                                    
-                                                          
-                                          
-                                                 
-                                                           
-                                                   
-                                                     
-                                          
-                                                        
-                                                
-                                                 
-                                                       
-                                            
-                                                      
-                    
     fn handle_ask_key(&mut self, key: Key) -> Action {
         match key {
             Key::Enter => self.submit_ask(),
@@ -1079,7 +699,6 @@ impl Tui {
                 Action::None
             }
             Key::Char(c) if self.ask_focus_is_other() => {
-                                                       
                 let c = if c == '\n' { ' ' } else { c };
                 self.input.insert(self.cursor_byte(), c);
                 self.cursor += 1;
@@ -1087,7 +706,6 @@ impl Tui {
                 Action::None
             }
             Key::Char(' ') => {
-                                                             
                 let is_multi = self.asking.as_ref().and_then(|asking| {
                     asking.questions.get(asking.current).map(|question| question.multi_select)
                 }).unwrap_or(false);
@@ -1098,7 +716,6 @@ impl Tui {
                 }
             }
             Key::Char(c) if c.is_ascii_digit() && c != '0' => {
-                                                            
                 let index = c.to_digit(10).unwrap_or(0) as usize - 1;
                 let Some(option_count) = self.asking.as_ref().and_then(|asking| {
                     let question = asking.questions.get(asking.current)?;
@@ -1133,12 +750,6 @@ impl Tui {
             _ => Action::None,
         }
     }
-
-                                  
-                                         
-                                             
-                                                        
-                                                 
     fn sync_other_selection(&mut self) {
         let has_text = !self.input.trim().is_empty();
         if let Some(asking) = self.asking.as_mut() {
@@ -1154,17 +765,6 @@ impl Tui {
             asking.notice = None;
         }
     }
-
-                    
-       
-                                                                
-                                                   
-                                          
-                                        
-       
-                                                              
-                                                
-                                                          
     fn cursor_byte(&self) -> usize {
         self.input
             .char_indices()
@@ -1172,28 +772,6 @@ impl Tui {
             .map(|(i, _)| i)
             .unwrap_or(self.input.len())
     }
-
-                                                   
-       
-              
-                                                            
-                                                      
-                                                        
-       
-                
-                                               
-                            
-                                           
-                                
-       
-                       
-                                               
-                                                 
-                                                                
-                     
-       
-                                           
-                             
     fn extract_selection(&self) -> String {
         let (Some(a), Some(c)) = (self.sel_anchor, self.sel_cur) else {
             return String::new();
@@ -1232,22 +810,6 @@ impl Tui {
         }
         out.join("\n")
     }
-
-                                                       
-                                     
-       
-                     
-                                                      
-                                            
-                                             
-                                         
-       
-                        
-                                             
-                                                            
-                                                          
-                                       
-                    
     fn apply_selection_highlight(&self, styled: &str, row_abs: usize) -> String {
         let (Some(a), Some(c)) = (self.sel_anchor, self.sel_cur) else {
             return styled.to_string();
@@ -1299,11 +861,6 @@ impl Tui {
         }
         out
     }
-
-                                                      
-                                                   
-                                                      
-                                        
     fn copy_to_clipboard(text: &str) -> bool {
         if cfg!(test) {
             return false;
@@ -1330,8 +887,6 @@ impl Tui {
             if !ok {
                 return false;
             }
-                                                     
-                                               
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 match child.try_wait() {
@@ -1360,19 +915,6 @@ impl Tui {
         }
         false
     }
-
-                                   
-                                                       
-       
-                           
-                                       
-                                              
-                                               
-                      
-                                           
-                                 
-                                            
-                                               
     pub fn handle_key(&mut self, key: Key) -> Action {
         if self.perm_prompt.is_some() {
             return self.handle_perm_key(key);
@@ -1383,7 +925,6 @@ impl Tui {
         match key {
             Key::Enter => {
                 if self.in_paste {
-                                                       
                     self.paste_prev_cr = true;
                     self.input.insert(self.cursor_byte(), '\n');
                     self.cursor += 1;
@@ -1420,7 +961,6 @@ impl Tui {
                 }
                 Action::None
             }
-                                          
             Key::Home => {
                 self.cursor = self.cursor_line_info().map(|(_, _, s, _)| s).unwrap_or(0);
                 Action::None
@@ -1432,8 +972,6 @@ impl Tui {
                     .unwrap_or(self.input.chars().count());
                 Action::None
             }
-                                                      
-                                         
             Key::Up => {
                 if self.input_line_count() > 1 {
                     self.cursor_move(-1);
@@ -1464,7 +1002,6 @@ impl Tui {
                 self.scroll = self.scroll.saturating_sub(self.chat_height().saturating_sub(1));
                 Action::None
             }
-                                       
             Key::WheelUp => {
                 self.scroll += 3;
                 Action::None
@@ -1473,7 +1010,6 @@ impl Tui {
                 self.scroll = self.scroll.saturating_sub(3);
                 Action::None
             }
-                                               
             Key::MouseDown { row, col } => {
                 self.sel_anchor = Some((row, col));
                 self.sel_cur = Some((row, col));
@@ -1504,7 +1040,6 @@ impl Tui {
                 }
                 Action::Redraw
             }
-                                                                 
             Key::PasteStart => {
                 self.in_paste = true;
                 self.paste_prev_cr = false;
@@ -1515,7 +1050,6 @@ impl Tui {
                 self.paste_prev_cr = false;
                 Action::None
             }
-                                                   
             Key::Char('\n') if self.in_paste && self.paste_prev_cr => {
                 self.paste_prev_cr = false;
                 Action::None
@@ -1544,19 +1078,6 @@ impl Tui {
             Key::Unknown => Action::None,
         }
     }
-
-                                     
-                                 
-       
-              
-                                                  
-                                                  
-                                         
-                                                       
-       
-                                            
-                                                 
-                                    
     fn hist_move(&mut self, d: i32) -> Action {
         if self.history.is_empty() {
             return Action::None;
@@ -1591,39 +1112,18 @@ impl Tui {
         }
         Action::None
     }
-
-                                                  
-
-                                                          
-                                          
     fn prompt_w(&self) -> usize {
         self.prompt.width()
     }
-
-                            
-                                                           
-                                            
-                    
     fn input_width(&self) -> usize {
         self.w.saturating_sub(self.prompt_w() + 1).max(10)
     }
-
-                           
-                                                  
-                                     
     fn max_input_lines(&self) -> usize {
         (self.h / 3).clamp(3, 8)
     }
-
-                                                 
-                                     
-                    
     fn input_line_count(&self) -> usize {
         wrap_input_ranges(&self.input, self.input_width()).len()
     }
-
-                                             
-                                   
     fn visible_input_lines(&self) -> usize {
         if self.asking.is_some() {
             0
@@ -1631,12 +1131,6 @@ impl Tui {
             self.input_line_count().min(self.max_input_lines())
         }
     }
-
-                                              
-       
-                                                    
-                                              
-                                   
     fn popup_height(&self) -> usize {
         if self.asking.is_some() {
             return 0;
@@ -1645,38 +1139,17 @@ impl Tui {
         if lines.is_empty() {
             return 0;
         }
-                                   
         lines.len().min(
             self.h
                 .saturating_sub(self.fixed_header_height() + 4 + self.visible_input_lines()),
         )
     }
-
-                         
-                                        
-       
-                
-                                                      
-                                            
-                                          
-                    
-       
-                     
-                                                
-                         
-       
-              
-                                                
-                                             
-                                
     fn cursor_line_info(&self) -> Option<(usize, usize, usize, usize)> {
         let lines = wrap_input_ranges(&self.input, self.input_width());
         if lines.is_empty() {
             return None;
         }
         let c = self.cursor.min(self.input.chars().count());
-                                                       
-                                         
         for (i, (text, s, e)) in lines.iter().enumerate() {
             if c >= *s && c < *e {
                 let col: usize = text
@@ -1687,7 +1160,6 @@ impl Tui {
                 return Some((i, col, *s, *e));
             }
         }
-                         
         let (text, s, e) = &lines[lines.len() - 1];
         let col: usize = text
             .chars()
@@ -1695,8 +1167,6 @@ impl Tui {
             .sum();
         Some((lines.len() - 1, col, *s, *e))
     }
-
-                                      
     fn cursor_move(&mut self, d: i32) {
         let lines = wrap_input_ranges(&self.input, self.input_width());
         if lines.len() <= 1 {
@@ -1720,15 +1190,6 @@ impl Tui {
         }
         self.cursor = ci;
     }
-
-                                                   
-       
-                                             
-                                         
-       
-                                                     
-                                                        
-                                  
     fn complete_command(&mut self) {
         let Some(rest) = self.input.trim_start().strip_prefix('/') else { return };
         let filter = rest.trim_start();
@@ -1743,19 +1204,6 @@ impl Tui {
             self.cursor = self.input.chars().count();
         }
     }
-
-                                        
-       
-              
-                                                   
-                                 
-                                                
-       
-                
-                                        
-                                           
-       
-                                       
     fn command_popup(&self) -> (Vec<String>, usize) {
         if self.asking.is_some() {
             return (Vec::new(), 0);
@@ -1771,10 +1219,8 @@ impl Tui {
         let w = self.w;
         let mut lines = Vec::with_capacity(hits.len());
         for (name, desc) in &hits {
-                                             
             let max_desc = w.saturating_sub(6 + name.width());
             let desc = truncate_width(desc, max_desc);
-                                            
             let (matched, tail) = if filter.is_empty() {
                 (*name, "")
             } else {
@@ -1791,13 +1237,6 @@ impl Tui {
         }
         (lines, hits.len())
     }
-
-                               
-
-                                                
-                                       
-                                                
-                                       
     fn ask_panel_height(&self) -> usize {
         if self.asking.is_none() {
             return 0;
@@ -1806,22 +1245,6 @@ impl Tui {
             .lines
             .len()
     }
-
-                                                                  
-                                                         
-                                
-       
-            
-                                                  
-       
-            
-                                                        
-                                                         
-                                              
-       
-                
-                                                  
-                                     
     fn build_ask_panel(&self, max_lines: usize) -> AskPanel {
         let Some(asking) = self.asking.as_ref() else {
             return AskPanel { lines: Vec::new(), cursor: None };
@@ -1832,25 +1255,17 @@ impl Tui {
         if max_lines == 0 {
             return AskPanel { lines: Vec::new(), cursor: None };
         }
-
         let width = self.w.max(10);
         let option_count = question.options.len();
-                                              
         let other_index = option_count;
-                                                   
-                                             
         let max_index_width = (option_count + 1).to_string().len();
         let mut rows: Vec<AskPanelRow> = Vec::new();
-
         for (index, option) in question.options.iter().enumerate() {
             let focused = asking.focus == index;
             let checked = question.multi_select && asking.checked.contains(&index);
             let pointer = if focused { "❯" } else { " " };
-                                                      
             let number = format!("{}.", index + 1);
             let number = format!("{number:<width$}", width = max_index_width + 2);
-                                                      
-                                    
             let check = if question.multi_select {
                 if checked { "[✓] " } else { "[ ] " }
             } else {
@@ -1858,7 +1273,6 @@ impl Tui {
             };
             let prefix_width = 2 + number.width() + check.width();
             let label = truncate_width(&option.label, width.saturating_sub(prefix_width));
-                                 
             let color = if checked { C_GREEN } else if focused { C_SUGGEST } else { C_ASST };
             let row = format!(
                 "{color}{pointer}{C_RESET} {C_DIM}{number}{C_RESET}{color}{check}{label}{C_RESET}"
@@ -1873,9 +1287,6 @@ impl Tui {
             };
             rows.push((row, description, None));
         }
-
-                                               
-                              
         let other_focused = asking.focus == other_index;
         let other_checked = question.multi_select && asking.checked.contains(&other_index);
         let pointer = if other_focused { "❯" } else { " " };
@@ -1887,17 +1298,12 @@ impl Tui {
             ""
         };
         let prefix_width = 2 + number.width() + check.width();
-                                                          
-                                                 
-                    
         let custom = if self.input.is_empty() {
             "Type something.".to_string()
         } else {
             self.input.clone()
         };
         let custom = truncate_width(&custom, width.saturating_sub(prefix_width));
-                                            
-                                      
         let color = if other_checked {
             C_GREEN
         } else if other_focused {
@@ -1910,9 +1316,6 @@ impl Tui {
         let other_row = format!(
             "{color}{pointer}{C_RESET} {C_DIM}{number}{C_RESET}{color}{check}{custom}{C_RESET}"
         );
-                                                     
-                                             
-                                         
         let other_cursor = if other_focused {
             let before: String = self.input.chars().take(self.cursor).collect();
             let col = prefix_width + before.width() + 1;
@@ -1926,7 +1329,6 @@ impl Tui {
             None
         };
         rows.push((other_row, None, other_cursor));
-
         if question.multi_select {
             let submit_index = other_index + 1;
             let focused = asking.focus == submit_index;
@@ -1939,14 +1341,9 @@ impl Tui {
                 None,
             ));
         }
-
-                                                           
-                                                            
-                                   
         let tab_count = asking.questions.len().max(1);
         let tab_width = width.saturating_sub(4).checked_div(tab_count).unwrap_or(width).max(5);
         let mut nav = String::new();
-                                              
         if asking.questions.len() > 1 || question.multi_select {
             if asking.current == 0 {
                 nav.push_str(&format!("{C_DIM}← {C_RESET}"));
@@ -1959,7 +1356,6 @@ impl Tui {
             let mark = if answered { "☒" } else { "☐" };
             let header = truncate_width(&item.header, tab_width.saturating_sub(4));
             if index == asking.current {
-                                                    
                 nav.push_str(&format!("{C_BG_ASK_TAB} {mark} {header} {C_RESET}"));
             } else {
                 nav.push_str(&format!(" {mark} {header} "));
@@ -1972,14 +1368,6 @@ impl Tui {
                 nav.push_str(" →");
             }
         }
-
-                                                  
-                                                                        
-                                                              
-                                                             
-                                                         
-                                                          
-                                 
         let compact_height = 6 + rows.len();                                         
         let description_count = rows.iter().filter(|(_, desc, _)| desc.is_some()).count();
         let expanded = compact_height + description_count <= max_lines;
@@ -1987,14 +1375,11 @@ impl Tui {
         let (row_start, row_end, include_blank) = if all_rows_fit {
             (0, rows.len(), true)
         } else {
-                                                                     
             let visible_count = max_lines.saturating_sub(5).max(1).min(rows.len());
             let max_start = rows.len().saturating_sub(visible_count);
             let start = asking.focus.saturating_sub(visible_count / 2).min(max_start);
             (start, start + visible_count, false)
         };
-
-                                                                         
         let mut lines = Vec::new();
         let mut cursor = None;
         lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
@@ -2014,20 +1399,15 @@ impl Tui {
         {
             let panel_row = lines.len();
             lines.push(row.clone());
-                                                      
-                                                                  
-                          
             if row_index == row_start && row_start > 0 {
                 lines[panel_row].push_str(&format!(" {C_DIM}↑{C_RESET}"));
             }
             if row_index + 1 == row_end && row_end < rows.len() {
                 lines[panel_row].push_str(&format!(" {C_DIM}↓{C_RESET}"));
             }
-                                                                     
             if let Some((col, ch)) = row_cursor {
                 cursor = Some((panel_row, *col, *ch));
             }
-                                          
             if expanded {
                 if let Some(description) = description {
                     lines.push(description.clone());
@@ -2045,16 +1425,12 @@ impl Tui {
             None => format!("{C_DIM}{help}{C_RESET}"),
         };
         lines.push(footer);
-
         if lines.len() > max_lines {
             lines.truncate(max_lines);
             cursor = cursor.filter(|(row, _, _)| *row < max_lines);
         }
         AskPanel { lines, cursor }
     }
-
-                                                 
-                              
     fn perm_panel_height(&self) -> usize {
         if self.perm_prompt.is_none() {
             return 0;
@@ -2063,10 +1439,6 @@ impl Tui {
             .lines
             .len()
     }
-
-                                                        
-                                             
-                                          
     fn build_perm_panel(&self, max_lines: usize) -> AskPanel {
         let Some(ui) = self.perm_prompt.as_ref() else {
             return AskPanel { lines: Vec::new(), cursor: None };
@@ -2074,15 +1446,12 @@ impl Tui {
         if max_lines == 0 {
             return AskPanel { lines: Vec::new(), cursor: None };
         }
-
         let width = self.w.max(10);
         let mut lines = Vec::new();
         lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
         lines.push(format!(
             "{C_WARN}⚠ {C_BOLD}模型想执行命令{C_RESET}{C_DIM}（未开启 /autodangerous，需您批准）{C_RESET}"
         ));
-
-                                             
         let cmd_prefix = format!("{C_ASST}❯ {C_RESET}");
         let cmd_width = width.saturating_sub(cmd_prefix.width());
         for (i, (seg, _, _)) in wrap_input_ranges(&ui.cmd, cmd_width).iter().enumerate() {
@@ -2093,8 +1462,6 @@ impl Tui {
             }
         }
         lines.push(String::new());
-
-                                               
         let kind = if ui.cmd_kind.is_empty() {
             "任意".to_string()
         } else {
@@ -2117,34 +1484,21 @@ impl Tui {
                 truncate_width(label, width.saturating_sub(8))
             ));
         }
-
         lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
         lines.push(format!(
             "{C_DIM}↑↓ 选择 · 回车确认 · Esc 拒绝 · 数字 1/2/3/4 直达{C_RESET}"
         ));
-
         if lines.len() > max_lines {
             lines.truncate(max_lines);
         }
         AskPanel { lines, cursor: None }
     }
-
-                                     
-       
-             
-                                               
-                             
-                                                
-                          
-                                                   
-                     
     fn chat_height(&self) -> usize {
         if self.asking.is_some() || self.perm_prompt.is_some() {
             return self.h.saturating_sub(
                 self.fixed_header_height() + self.ask_panel_height() + self.perm_panel_height(),
             );
         }
-                                        
         self.h.saturating_sub(
             self.fixed_header_height()
                 + 3
@@ -2152,13 +1506,6 @@ impl Tui {
                 + self.popup_height(),
         )
     }
-
-                                                           
-                                             
-                                                    
-                  
-                                           
-                                                   
     fn role_prefix(role: ChatRole) -> &'static str {
         match role {
             ChatRole::Error => "✗ ",
@@ -2168,9 +1515,6 @@ impl Tui {
             _ => "",
         }
     }
-
-                                         
-                                                     
     fn role_base(role: ChatRole) -> &'static str {
         match role {
             ChatRole::System => C_DIM,
@@ -2181,8 +1525,6 @@ impl Tui {
             _ => C_ASST,
         }
     }
-
-                                                          
     fn strip_tool_blocks(s: &str) -> String {
         let mut out = String::new();
         let mut rest = s;
@@ -2204,8 +1546,6 @@ impl Tui {
         }
         out
     }
-
-                                                               
     fn render_lines(&self) -> Vec<RLine> {
         let cw = self.w.saturating_sub(5).max(10);
         let mut lines: Vec<RLine> = Vec::new();
@@ -2213,8 +1553,6 @@ impl Tui {
         for (ci, line) in self.chat.iter().enumerate() {
             let text = Self::strip_tool_blocks(&line.text);
             if text.trim().is_empty() {
-                                                             
-                                                   
                 if line.role == ChatRole::Assistant && line.pending && ci == last_idx {
                     lines.push(RLine { shade: None, styled: format!("{C_ASST}● ") });
                 }
@@ -2222,13 +1560,11 @@ impl Tui {
             }
             match line.role {
                 ChatRole::User => {
-                                                                   
                     for wl in wrap(&text, cw) {
                         lines.push(RLine { shade: Some(C_BG_USER), styled: format!("{C_USER_TEXT}{wl}") });
                     }
                 }
                 ChatRole::Tool => {
-                                                                       
                     let wrapped = wrap(&text, cw);
                     for (i, wl) in wrapped.iter().enumerate() {
                         let styled = if i == 0 {
@@ -2246,14 +1582,11 @@ impl Tui {
                     }
                 }
                 ChatRole::Assistant => {
-                                          
                     self.render_md_lines(&text, cw, &mut lines);
                 }
-                                                                  
                 _ => {
                     let base = Self::role_base(line.role);
                     let prefix = Self::role_prefix(line.role);
-                                                           
                     let text = if line.role == ChatRole::Reasoning && text.chars().count() > 800 {
                         let skip = text.chars().count() - 800;
                         let tail: String = text.chars().skip(skip).collect();
@@ -2275,13 +1608,6 @@ impl Tui {
         }
         lines
     }
-
-                          
-                                            
-                                                     
-                                                    
-                                             
-                                           
     fn fixed_header_height(&self) -> usize {
         if self.h < 14 {
             1
@@ -2291,17 +1617,12 @@ impl Tui {
             11
         }
     }
-
-                                        
-                                       
     fn welcome_lines(&self) -> Vec<RLine> {
         let width = self.w.max(10);
         let state = self.mascot_state;
         let color = state.color();
         let label = state.label();
         let face = mascot_compact(state);
-
-                                         
         if self.fixed_header_height() == 1 {
             let text = truncate_width(
                 &format!("YJLcoder v{} · {face} {label} · {}", env!("CARGO_PKG_VERSION"), self.header),
@@ -2309,7 +1630,6 @@ impl Tui {
             );
             return vec![RLine { shade: None, styled: format!("{color}{text}{C_RESET}") }];
         }
-
         let title = format!(
             "─── YJLcoder v{} · {label} ",
             env!("CARGO_PKG_VERSION")
@@ -2321,7 +1641,6 @@ impl Tui {
             title,
             "─".repeat(width.saturating_sub(title_w + 2))
         );
-
         if self.fixed_header_height() == 7 {
             let inner = width.saturating_sub(2);
             let rows = [
@@ -2350,9 +1669,7 @@ impl Tui {
             });
             return out;
         }
-
         let inner = width - 2;
-                                                       
         let left_w = (inner * 41 / 100).clamp(30, 42);
         let right_w = inner.saturating_sub(left_w + 1);
         let cwd = display_cwd();
@@ -2405,22 +1722,16 @@ impl Tui {
         });
         out
     }
-
-                                                      
     fn render_md_lines(&self, text: &str, cw: usize, out: &mut Vec<RLine>) {
         let mut first = true;
         for (is_code, part) in crate::md::block_parts(text) {
             if is_code {
-                                     
                 for wl in wrap(&part, cw) {
                     out.push(RLine { shade: Some(C_BG_CODE), styled: format!("{C_ASST}{wl}") });
                 }
                 first = false;
                 continue;
             }
-                                                              
-                                                      
-                                     
             for pline in part.split_terminator('\n') {
                 if pline.trim().is_empty() {
                     out.push(RLine { shade: None, styled: String::new() });
@@ -2429,10 +1740,8 @@ impl Tui {
                 let (head_style, head_prefix, rest) = crate::md::block_prefix(pline);
                 let mut segs = crate::md::inline(rest);
                 if let Some(st) = head_style {
-                              
                     segs = vec![crate::md::Seg::new(st, rest.to_string())];
                 } else if !head_prefix.is_empty() {
-                                    
                     segs.insert(0, crate::md::Seg::new(crate::md::Style::Dim, head_prefix.to_string()));
                 }
                 for wsegs in crate::md::wrap_segs(&segs, cw) {
@@ -2447,15 +1756,9 @@ impl Tui {
             }
         }
     }
-
-                                    
-                                              
-                                   
     fn chat_line_count(&self) -> usize {
         self.render_lines().len()
     }
-
-                                          
     fn build_frame(&mut self) -> String {
         let mut out = String::with_capacity(self.w * self.h * 2);
         out.push_str("\x1b[H\x1b[0m");
@@ -2469,8 +1772,6 @@ impl Tui {
         } else {
             format!("{C_GREEN}●{C_RESET}")
         };
-
-                                  
         let vis_in = self.visible_input_lines();
         let (mut popup, popup_total) = self.command_popup();
         let popup_h = popup.len().min(self.popup_height());
@@ -2484,15 +1785,11 @@ impl Tui {
                 );
             }
         }
-
-                                      
         let welcome = self.welcome_lines();
         let welcome_h = welcome.len();
         for rline in &welcome {
             out.push_str(&format!("\x1b[K{}\x1b[0m\r\n", rline.styled));
         }
-
-                                                             
         let ask_panel = self.build_ask_panel(self.h.saturating_sub(welcome_h));
         let ask_h = ask_panel.lines.len();
         let perm_panel = self.build_perm_panel(self.h.saturating_sub(welcome_h));
@@ -2504,9 +1801,6 @@ impl Tui {
         };
         let chat_h = self.h.saturating_sub(welcome_h + ask_h + perm_h + normal_bottom_h);
         let mut lines = self.render_lines();
-                             
-                                              
-                                                                              
         if self.streaming {
             if let Some(last) = lines.iter_mut().rev().find(|r| !r.styled.is_empty()) {
                 if last.shade.is_none() && !last.styled.ends_with('▊') {
@@ -2514,13 +1808,11 @@ impl Tui {
                 }
             }
         }
-                                                     
         let queue_status = if self.queued_count > 0 {
             format!(" · 排队 {}", self.queued_count)
         } else {
             String::new()
         };
-                                             
         let notice = match &self.copied_notice {
             Some(n) => format!(" · {n}"),
             None => String::new(),
@@ -2538,26 +1830,19 @@ impl Tui {
                 status_text.trim_start_matches('●').trim_start()
             ),
         };
-
-                                                  
-                                          
         let content_h = chat_h.saturating_sub(1);
         let total = lines.len();
         let max_scroll = total.saturating_sub(content_h);
         self.scroll = self.scroll.min(max_scroll);
         let start = total.saturating_sub(content_h.saturating_add(self.scroll));
         let visible: Vec<&RLine> = lines.iter().skip(start).take(content_h).collect();
-                                                              
-                                                           
         self.sel_start_row = welcome_h + 1;
         self.sel_rows.clear();
         for (i, rline) in visible.iter().enumerate() {
             let row_abs = welcome_h + 1 + i;
-                                                 
             let styled = self.apply_selection_highlight(&rline.styled, row_abs);
             self.sel_rows.push(strip_ansi(&styled));
             match rline.shade {
-                                                          
                 Some(bg) => out.push_str(&format!("\x1b[K{bg}{styled}\x1b[K\x1b[0m\r\n")),
                 None => out.push_str(&format!("\x1b[K{styled}\x1b[0m\r\n")),
             }
@@ -2568,9 +1853,6 @@ impl Tui {
         if chat_h > 0 {
             out.push_str(&format!("\x1b[K{}\x1b[0m\r\n", status_line.styled));
         }
-
-                                                        
-                                              
         if self.asking.is_some() {
             for (index, line) in ask_panel.lines.iter().enumerate() {
                 out.push_str(&format!("\x1b[K{line}\x1b[0m"));
@@ -2584,8 +1866,6 @@ impl Tui {
             }
             return out;
         }
-
-                                        
         if self.perm_prompt.is_some() {
             for (index, line) in perm_panel.lines.iter().enumerate() {
                 out.push_str(&format!("\x1b[K{line}\x1b[0m"));
@@ -2595,9 +1875,6 @@ impl Tui {
             }
             return out;
         }
-
-                                                     
-                                                          
         let in_lines = wrap_input_ranges(&self.input, self.input_width());
         let total_in = in_lines.len();
         let max_in = self.max_input_lines();
@@ -2616,7 +1893,6 @@ impl Tui {
         } else {
             0
         };
-
         let prompt = &self.prompt;
         let prompt_w = self.prompt_w();
         out.push_str(&format!("\x1b[K{C_GRAY}{}{C_RESET}\r\n", "─".repeat(self.w)));
@@ -2634,40 +1910,21 @@ impl Tui {
             out.push_str(&format!("\x1b[K{prefix}{content}{C_RESET}\r\n"));
         }
         out.push_str(&format!("\x1b[K{C_GRAY}{}{C_RESET}", "─".repeat(self.w)));
-
-                       
         for line in &popup {
             out.push_str(&format!("\r\n\x1b[K{line}"));
         }
-
-              
         let hint = truncate_width(&self.hint, self.w);
         out.push_str(&format!("\r\n\x1b[K{C_DIM}{hint}{C_RESET}"));
-
-                                          
-                                                 
         let col = (prompt_w + 1 + cur_col).min(self.w.saturating_sub(1));
         let row = welcome_h + 2 + chat_h + (cur_line - self.input_scroll);
-                                                  
-                                                
         let cursor_char = if self.input.is_empty() {
             'T'
         } else {
             self.input.chars().nth(self.cursor).filter(|ch| *ch != '\n').unwrap_or(' ')
         };
         out.push_str(&format!("\x1b[{row};{col}H{C_CURSOR}{cursor_char}\x1b[0m"));
-
         out
     }
-
-                                            
-       
-                                                      
-                                                
-                                         
-       
-                                                      
-                                        
     pub fn redraw(&mut self) {
         self.resize();
         let frame = self.build_frame();
@@ -2679,24 +1936,6 @@ impl Tui {
         self.last_frame = frame;
     }
 }
-
-                                                
-   
-        
-                                                          
-                                         
-   
-             
-                                                                 
-                                                              
-                                                                   
-                                                           
-                                                           
-                                                             
-                                                
-   
-                                                       
-                            
 fn tool_display(op: &str, args: &str) -> (String, String, String) {
     let parsed = crate::tool_compat::parse_args(args);
     let normalized = crate::tool_compat::normalize_call(op, &parsed);
@@ -2748,18 +1987,6 @@ fn tool_display(op: &str, args: &str) -> (String, String, String) {
     let detail: String = detail.chars().take(160).collect();
     (canonical, display.to_string(), detail)
 }
-
-                            
-                                   
-   
-           
-                                       
-                                                  
-   
-                                                                 
-                                          
-                                             
-                                                    
 fn tool_result_failed(result: &str) -> bool {
     if result.starts_with("错误:") || result.starts_with("Error") {
         return true;
@@ -2770,8 +1997,6 @@ fn tool_result_failed(result: &str) -> bool {
             .is_some_and(|code| code != 0)
     })
 }
-
-                                   
 fn mascot_art(state: MascotState) -> [String; 6] {
     let (antenna, eyes, mouth, bubble) = match state {
         MascotState::Idle => ("   ╭╮", "• •", "ᴗ", ""),
@@ -2791,10 +2016,6 @@ fn mascot_art(state: MascotState) -> [String; 6] {
         "  ╵   ╵".into(),
     ]
 }
-
-                                           
-                                                      
-                               
 fn mascot_compact(state: MascotState) -> String {
     let (_, eyes, mouth, bubble) = match state {
         MascotState::Idle => ("", "• •", "ᴗ", ""),
@@ -2805,13 +2026,8 @@ fn mascot_compact(state: MascotState) -> String {
         MascotState::Angry => ("", "◣ ◢", "⌢", "!"),
         MascotState::Frantic => ("", "⊙ ⊙", "□", "!!"),
     };
-                                                    
     format!("({eyes} {mouth}) {bubble}").trim_end().to_string()
 }
-
-                                 
-                                                                
-                                     
 fn display_cwd() -> String {
     let cwd = std::env::current_dir()
         .map(|path| path.display().to_string())
@@ -2826,62 +2042,27 @@ fn display_cwd() -> String {
     }
     cwd
 }
-
-                                                
-                                            
-                         
 fn welcome_model(header: &str) -> String {
     let model = header.split(" │ ").next().unwrap_or(header);
     format!("{model} · Local")
 }
-
-                             
-                                             
-                                 
 fn pad_width(text: &str, width: usize) -> String {
     let text = truncate_width(text, width);
     let padding = width.saturating_sub(text.width());
     format!("{text}{}", " ".repeat(padding))
 }
-
-                                          
-                                                 
-                      
 fn center_width(text: &str, width: usize) -> String {
     let text = truncate_width(text, width);
     let padding = width.saturating_sub(text.width());
     let left = padding / 2;
     format!("{}{}{}", " ".repeat(left), text, " ".repeat(padding - left))
 }
-
-                          
-                                                    
-                               
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     wrap_input_ranges(text, width)
         .into_iter()
         .map(|(s, _, _)| s)
         .collect()
 }
-
-                                          
-   
-                     
-                                           
-                                         
-                                        
-                                         
-   
-            
-                                          
-                                 
-                                           
-                                       
-   
-                                              
-                                   
-                                         
-                     
 fn wrap_input_ranges(text: &str, width: usize) -> Vec<(String, usize, usize)> {
     if width == 0 {
         let n = text.chars().count();
@@ -2894,7 +2075,6 @@ fn wrap_input_ranges(text: &str, width: usize) -> Vec<(String, usize, usize)> {
     let total = text.chars().count();
     for (i, ch) in text.chars().enumerate() {
         if ch == '\n' {
-                                                       
             out.push((std::mem::take(&mut cur), start, i + 1));
             w = 0;
             start = i + 1;
@@ -2912,15 +2092,6 @@ fn wrap_input_ranges(text: &str, width: usize) -> Vec<(String, usize, usize)> {
     out.push((cur, start, total));
     out
 }
-
-                                            
-                             
-   
-       
-                                                 
-                                                 
-                            
-                                          
 fn truncate_width(s: &str, max_w: usize) -> String {
     if s.width() <= max_w {
         return s.to_string();
@@ -2938,40 +2109,20 @@ fn truncate_width(s: &str, max_w: usize) -> String {
     out.push('…');
     out
 }
-
-                                    
 pub struct KeyParser {
     buf: Vec<u8>,
 }
-
 impl Default for KeyParser {
-                                                                    
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl KeyParser {
-                                               
-                                          
-                                     
     pub fn new() -> Self {
         KeyParser { buf: Vec::with_capacity(8) }
     }
-
-                            
-                                                      
-       
-                   
-                                                     
-                                                 
-                                                     
-                                     
-                                                      
-                                     
     pub fn feed(&mut self, b: u8) -> Option<Key> {
         self.buf.push(b);
-                      
         if b >= 0x80 {
             if let Ok(s) = std::str::from_utf8(&self.buf) {
                 let ch = s.chars().next().unwrap_or('\u{fffd}');
@@ -2984,7 +2135,6 @@ impl KeyParser {
             }
             return None;          
         }
-               
         if self.buf[0] == 0x1b {
             if self.buf.len() == 1 {
                 return None;           
@@ -2997,11 +2147,7 @@ impl KeyParser {
                 }
                 let seq: String = self.buf[1..].iter().map(|&c| c as char).collect();
                 self.buf.clear();
-                                                                             
-                                                               
-                                                  
                 if let Some(rest) = seq.strip_prefix("[<") {
-                                                                  
                     let (body, pressed) = rest
                         .strip_suffix('M')
                         .map(|b| (b, true))
@@ -3030,8 +2176,6 @@ impl KeyParser {
                     "[5~" => Key::PageUp,
                     "[6~" => Key::PageDown,
                     "[3~" => Key::Delete,
-                                                                  
-                                                 
                     "[200~" => Key::PasteStart,
                     "[201~" => Key::PasteEnd,
                     _ => Key::Unknown,
@@ -3042,7 +2186,6 @@ impl KeyParser {
         }
         self.buf.clear();
         Some(match b {
-                                                           
             0x0d => Key::Enter,
             0x0a => Key::Char('\n'),
             0x09 => Key::Tab,
@@ -3062,25 +2205,6 @@ impl KeyParser {
         })
     }
 }
-
-                                         
-   
-               
-                                                    
-                                         
-                                       
-                                   
-   
-        
-                                       
-                                    
-                          
-   
-          
-                                               
-                            
-                                         
-                                        
 pub fn spawn_stdin_reader(tx: std::sync::mpsc::Sender<u8>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -3100,15 +2224,6 @@ pub fn spawn_stdin_reader(tx: std::sync::mpsc::Sender<u8>) {
         }
     });
 }
-
-                                      
-                             
-   
-                                           
-                                                   
-                                           
-                                    
-                 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
@@ -3125,38 +2240,30 @@ fn strip_ansi(s: &str) -> String {
     }
     out
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn wrap_cjk_and_ascii() {
         let lines = wrap("你好hello世界", 6);
-                         
         assert_eq!(lines, vec!["你好he", "llo世", "界"]);
     }
-
     #[test]
     fn wrap_respects_newlines() {
         let lines = wrap("a\nbb", 10);
         assert_eq!(lines, vec!["a", "bb"]);
     }
-
     #[test]
     fn key_parser_basic() {
         let mut p = KeyParser::new();
         assert!(matches!(p.feed(b'a'), Some(Key::Char('a'))));
-                                          
         assert!(matches!(p.feed(0x0d), Some(Key::Enter)));
         assert!(matches!(p.feed(0x0a), Some(Key::Char('\n'))));
         assert!(matches!(p.feed(0x09), Some(Key::Tab)));
         assert!(matches!(p.feed(0x7f), Some(Key::Backspace)));
     }
-
     #[test]
     fn pasted_newline_inserts_not_submits() {
-                                            
         let mut t = Tui::new();
         for c in "第一行".chars() {
             let _ = t.handle_key(Key::Char(c));
@@ -3166,19 +2273,15 @@ mod tests {
             let _ = t.handle_key(Key::Char(c));
         }
         assert_eq!(t.input, "第一行\n第二行");
-                                    
         assert!(t.input_line_count() >= 2);
         t.cursor = 5;         
         let _ = t.handle_key(Key::Up);
         assert!(t.hist_pos.is_none(), "多行输入 ↑ 不应回填历史");
         assert_eq!(t.cursor, 1, "↑ 保持列位置向上移动: {}", t.cursor);
-                     
         assert!(matches!(t.handle_key(Key::Enter), Action::Submit(s) if s == "第一行\n第二行"));
     }
-
     #[test]
     fn paste_bracketed_crlf_dedup_and_no_submit() {
-                                                 
         let mut t = Tui::new();
         let _ = t.handle_key(Key::PasteStart);
         for c in "第一行".chars() {
@@ -3198,14 +2301,10 @@ mod tests {
             "CRLF 成对去重后每个换行只留一次: {:?}",
             t.input
         );
-                                  
         assert!(matches!(t.handle_key(Key::Enter), Action::Submit(s) if s == "第一行\n第二行\n"));
     }
-
     #[test]
     fn paste_nine_lines_single_submit() {
-                                   
-                                                     
         let mut t = Tui::new();
         let _ = t.handle_key(Key::PasteStart);
         for i in 0..9 {
@@ -3219,33 +2318,26 @@ mod tests {
         let _ = t.handle_key(Key::PasteEnd);
         let expected = (0..9).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
         assert_eq!(t.input, expected);
-                     
         assert!(matches!(t.handle_key(Key::Enter), Action::Submit(s) if s == expected));
     }
-
     #[test]
     fn up_arrow_retrieves_one_queued_message() {
-                                             
         let mut t = Tui::new();
         t.set_queued_count(3);
         t.input.push_str("正在编辑的新内容");
         t.cursor = t.input.chars().count();
         assert_eq!(t.handle_key(Key::Up), Action::RetrieveQueued);
-                                                        
         t.retrieve_queued("第三条".into());
         assert_eq!(t.input, "第三条");
         assert_eq!(t.cursor, "第三条".chars().count());
         assert_eq!(t.queued_count, 2, "只取回一条，剩余继续排队");
-                            
         let mut t2 = Tui::new();
         t2.history.push("历史".into());
         assert_eq!(t2.handle_key(Key::Up), Action::None);
         assert!(t2.hist_pos.is_some(), "无排队时 ↑ 应回填历史");
     }
-
     #[test]
     fn mouse_drag_select_extracts_text() {
-                                             
         let mut t = Tui::new();
         t.w = 60;
         t.h = 20;
@@ -3254,26 +2346,21 @@ mod tests {
         let frame = t.build_frame();               
         assert!(!t.sel_rows.is_empty(), "build_frame 应收集可见行纯文本");
         assert!(strip_ansi(&frame).contains("第一行内容"));
-                                                     
         let start_row = t.sel_start_row + 2;
         let _ = t.handle_key(Key::MouseDown { row: start_row, col: 2 });
         let _ = t.handle_key(Key::MouseDrag { row: start_row, col: 6 });
-                                     
         let text = t.extract_selection();
         let _ = t.handle_key(Key::MouseUp { row: start_row, col: 6 });
         assert!(t.sel_anchor.is_none(), "松开后选中状态清除");
         assert!(!text.is_empty(), "应提取到文本: {:?}", text);
-                                                      
         assert_eq!(
             t.copied_notice.as_deref(),
             Some("未找到剪贴板工具（wl-copy/xsel/xclip）"),
             "测试环境复制应走失败分支"
         );
     }
-
     #[test]
     fn perm_panel_keys_focus_and_submit() {
-                                        
         let mut t = Tui::new();
         let open = |t: &mut Tui| {
             t.open_perm_prompt(crate::tools::PermRequest {
@@ -3284,16 +2371,12 @@ mod tests {
         };
         open(&mut t);
         assert!(t.is_perm_prompt());
-                       
         assert!(matches!(
             t.handle_key(Key::Enter),
             Action::PermSubmit(crate::tools::PermDecisionKind::Yes)
         ));
-                                                          
         t.finish_perm_prompt();
         assert!(!t.is_perm_prompt());
-
-                               
         open(&mut t);
         let _ = t.handle_key(Key::Down);
         let _ = t.handle_key(Key::Down);
@@ -3301,7 +2384,6 @@ mod tests {
             t.handle_key(Key::Enter),
             Action::PermSubmit(crate::tools::PermDecisionKind::No)
         ));
-                                
         t.finish_perm_prompt();
         open(&mut t);
         let _ = t.handle_key(Key::Down);
@@ -3311,7 +2393,6 @@ mod tests {
             t.handle_key(Key::Enter),
             Action::PermSubmit(crate::tools::PermDecisionKind::AlwaysAllow)
         ));
-                   
         t.finish_perm_prompt();
         open(&mut t);
         let _ = t.handle_key(Key::Tab);
@@ -3319,7 +2400,6 @@ mod tests {
             t.handle_key(Key::Enter),
             Action::PermSubmit(crate::tools::PermDecisionKind::AlwaysAllow)
         ));
-                            
         t.finish_perm_prompt();
         open(&mut t);
         assert!(matches!(
@@ -3344,7 +2424,6 @@ mod tests {
             t.handle_key(Key::Char('3')),
             Action::PermSubmit(crate::tools::PermDecisionKind::No)
         ));
-                                                                
         t.finish_perm_prompt();
         open(&mut t);
         assert!(matches!(
@@ -3367,17 +2446,14 @@ mod tests {
             t.handle_key(Key::Enter),
             Action::PermSubmit(crate::tools::PermDecisionKind::AutoEnable)
         ));
-                                   
         t.finish_perm_prompt();
         open(&mut t);
         let _ = t.handle_key(Key::Char('x'));
         assert_eq!(t.input, "", "批准模式下输入被拦截");
         assert_eq!(t.handle_key(Key::Char('y')), Action::None);
     }
-
     #[test]
     fn perm_panel_renders_command_and_options() {
-                                         
         let mut t = Tui::new();
         t.w = 40;
         t.h = 24;
@@ -3395,7 +2471,6 @@ mod tests {
         assert!(plain.contains("No，拒绝执行"), "选项 3: {plain}");
         assert!(plain.contains("开启 autodangerous（不再询问）"), "选项 4: {plain}");
         assert!(plain.contains("↑↓ 选择 · 回车确认 · Esc 拒绝"), "快捷键提示: {plain}");
-                                  
         let yes_line = panel
             .lines
             .iter()
@@ -3409,10 +2484,8 @@ mod tests {
             .unwrap();
         assert!(!no_line.contains('❯'), "未聚焦行不应有指针: {no_line}");
     }
-
     #[test]
     fn perm_panel_frame_overlays_input() {
-                                                      
         let mut t = Tui::new();
         t.w = 60;
         t.h = 20;
@@ -3428,7 +2501,6 @@ mod tests {
         assert!(!frame.contains("Try \"ask about this project\""), "输入框占位不应出现");
         assert!(!frame.contains("⏸ 本地模式"), "全局 hint 不应出现（被面板替换）");
     }
-
     #[test]
     fn key_parser_escape_sequences() {
         let mut p = KeyParser::new();
@@ -3441,7 +2513,6 @@ mod tests {
         assert!(p.feed(b'5').is_none());
         assert!(matches!(p.feed(b'~'), Some(Key::PageUp)));
     }
-
     #[test]
     fn key_parser_utf8() {
         let mut p = KeyParser::new();
@@ -3449,37 +2520,30 @@ mod tests {
         assert!(p.feed(0xb8).is_none());
         assert!(matches!(p.feed(0xad), Some(Key::Char('中'))));
     }
-
     #[test]
     fn cjk_edit_no_panic() {
-                                                       
         let mut t = Tui::new();
         assert_eq!(t.handle_key(Key::Char('你')), Action::None);
         assert_eq!(t.handle_key(Key::Char('好')), Action::None);                         
         assert_eq!(t.handle_key(Key::Backspace), Action::None);
         assert_eq!(t.input, "你");
-                    
         assert_eq!(t.handle_key(Key::Char('a')), Action::None);                 
         assert_eq!(t.handle_key(Key::Left), Action::None);            
         assert_eq!(t.handle_key(Key::Char('b')), Action::None);         
         assert_eq!(t.input, "你ba");
         assert_eq!(t.handle_key(Key::Delete), Action::None);                  
         assert_eq!(t.input, "你b");
-                           
         assert_eq!(t.handle_key(Key::CtrlC), Action::None);
         assert_eq!(t.input, "");
     }
-
     #[test]
     fn truncate_width_marks() {
         let t = truncate_width("1234567890", 5);
         assert!(t.ends_with('…'));
         assert!(t.width() <= 5);
     }
-
     #[test]
     fn frame_visual_elements() {
-                                       
         let mut t = Tui::new();
         t.w = 80;
         t.h = 26;
@@ -3498,33 +2562,24 @@ mod tests {
         t.begin_assistant();
         t.assistant_delta("正在扫描");
         let frame = t.build_frame();
-
-                                     
         assert!(strip_ansi(&frame).contains("YJLcoder v"), "对话开始后欢迎卡仍固定");
         assert!(strip_ansi(&frame).contains("THINK"), "生成中切换思考状态");
         assert!(strip_ansi(&frame).contains("◔ ◔"), "思考时眼睛改变");
-                                      
         assert!(frame.contains("\x1b[K"), "整帧重画应逐行清屏");
         assert!(frame.contains("◐"), "生成中状态灯");
         assert!(strip_ansi(&frame).contains("ctx 50%"), "上下文状态");
-                                    
         assert!(frame.contains("\x1b[48;5;237m"), "用户消息背景块");
         let plain = strip_ansi(&frame);
         assert!(plain.contains("你好"), "用户消息可见");
         assert!(!plain.contains("❯ 你好"), "用户消息无 ❯ 前缀");
-                                         
         assert!(plain.contains("● portscan("), "工具调用行");
         assert!(frame.contains("\x1b[1mportscan\x1b[0m"), "工具名粗体");
         assert!(plain.contains("⎿  22 开放") && plain.contains("80 关闭"), "工具结果续行");
-                         
         assert!(plain.contains("● 正在扫描"), "助手前缀行");
         assert!(!plain.contains("[你]"), "无角色徽章");
-                                             
         assert!(plain.contains("❯ "), "输入提示符");
         assert!(plain.matches(&"─".repeat(80)).count() >= 2, "输入区上下边界");
         assert!(plain.contains('╭') && plain.contains('╰'), "圆角只属于固定欢迎卡");
-
-                            
         t.end_assistant("正在扫描完成");
         let frame2 = t.build_frame();
         assert!(frame2.contains('●'), "空闲状态灯");
@@ -3533,11 +2588,9 @@ mod tests {
         assert!(strip_ansi(&frame2).contains("DONE"), "任务完成切换成功微笑");
         assert!(strip_ansi(&frame2).contains("⌒ ⌒"), "成功时眯眼微笑");
     }
-
     #[test]
     fn mascot_state_machine_covers_ask_tool_error_bug_and_success() {
         use crate::tools::AskOption;
-
         let mut t = Tui::new();
         assert_eq!(t.mascot_state, MascotState::Idle);
         t.begin_assistant();
@@ -3547,11 +2600,9 @@ mod tests {
         t.push_tool_result("错误: 文件不存在");
         assert_eq!(t.mascot_state, MascotState::Angry);
         assert!(mascot_art(t.mascot_state).join("\n").contains("◣ ◢"));
-
         t.push_bug_warn("垃圾 token 检测：<unused>".into());
         assert_eq!(t.mascot_state, MascotState::Frantic);
         assert!(mascot_art(t.mascot_state).join("\n").contains("⊙ ⊙"));
-
         t.cancel_streaming();
         assert_eq!(t.mascot_state, MascotState::Idle);
         t.ask(vec![AskQuestion {
@@ -3571,7 +2622,6 @@ mod tests {
         t.end_assistant("完成");
         assert_eq!(t.mascot_state, MascotState::Success);
     }
-
     #[test]
     fn fixed_welcome_header_is_identical_while_chat_scrolls() {
         let mut t = Tui::new();
@@ -3584,7 +2634,6 @@ mod tests {
         let header_h = t.fixed_header_height();
         let bottom = strip_ansi(&t.build_frame());
         let bottom_header: Vec<&str> = bottom.lines().take(header_h).collect();
-
         let _ = t.handle_key(Key::PageUp);
         assert!(t.scroll > 0);
         let scrolled = strip_ansi(&t.build_frame());
@@ -3594,11 +2643,9 @@ mod tests {
         assert!(scrolled_header.iter().any(|line| line.contains("YJLcoder v")));
         assert!(!scrolled_header.iter().any(|line| line.contains("对话行")));
     }
-
     #[test]
     fn structured_ask_user_walks_questions_and_returns_answer_map() {
         use crate::tools::AskOption;
-
         let mut t = Tui::new();
         t.w = 90;
         t.h = 30;
@@ -3639,7 +2686,6 @@ mod tests {
         assert!(first.contains("3. Type something."), "Other 本身就是输入行");
         assert!(!first.contains("Try \"ask about this project\""), "Ask overlay 必须隐藏普通输入框");
         assert!(first.contains("Enter to select · ↑/↓ to navigate · Esc to cancel"));
-
         assert_eq!(t.handle_key(Key::Down), Action::None);
         assert_eq!(t.handle_key(Key::Enter), Action::None, "第一题后进入第二题");
         let second = strip_ansi(&t.build_frame());
@@ -3647,7 +2693,6 @@ mod tests {
         assert!(second.contains("☐ 能力"));
         assert!(second.contains("❯ 1. [ ] 日志"));
         assert!(second.contains("Submit"));
-
         assert_eq!(t.handle_key(Key::Enter), Action::None);        
         assert_eq!(t.handle_key(Key::Down), Action::None);      
         assert_eq!(t.handle_key(Key::Down), Action::None);      
@@ -3665,11 +2710,9 @@ mod tests {
         assert_eq!(answers["使用哪种认证方式？"], "JWT");
         assert_eq!(answers["启用哪些能力？"], "日志, 告警, 自定义");
     }
-
     #[test]
     fn structured_ask_ignores_typing_on_options_and_accepts_inline_other() {
         use crate::tools::AskOption;
-
         let mut t = Tui::new();
         t.ask(vec![AskQuestion {
             question: "怎么处理？".into(),
@@ -3683,7 +2726,6 @@ mod tests {
         let _ = t.handle_key(Key::Char('9'));
         assert!(t.is_asking());
         assert_eq!(t.input, "", "焦点不在 Other 时不能把字符写进普通输入框");
-
         let _ = t.handle_key(Key::Down);
         let _ = t.handle_key(Key::Down);
         for c in "稍后再决定".chars() {
@@ -3697,11 +2739,9 @@ mod tests {
         };
         assert_eq!(answers["怎么处理？"], "稍后再决定");
     }
-
     #[test]
     fn structured_ask_escape_cancels_and_tiny_terminal_keeps_header() {
         use crate::tools::AskOption;
-
         let mut t = Tui::new();
         t.w = 60;
         t.h = 14;
@@ -3721,37 +2761,28 @@ mod tests {
         assert!(plain.contains("❯ 1. A"), "选项窗口至少显示当前项");
         assert_eq!(t.handle_key(Key::Esc), Action::Cancel);
     }
-
     #[test]
     fn strip_tool_blocks_removes_blocks() {
         let stripped = Tui::strip_tool_blocks("先看看\n```tool {\"op\":\"x\"}\n```\n然后");
         assert_eq!(stripped, "先看看\n\n然后");
-                      
         let s2 = Tui::strip_tool_blocks("前```tool {\"op\":\"x\"}");
         assert_eq!(s2, "前");
-                    
         let s3 = Tui::strip_tool_blocks("```json\n{\"a\":1}\n```");
         assert_eq!(s3, "```json\n{\"a\":1}\n```");
-               
         assert_eq!(Tui::strip_tool_blocks("你好"), "你好");
     }
-
     #[test]
     fn thinking_phase_cursor_not_on_user_block() {
-                                                   
         let mut t = Tui::new();
         t.w = 80;
         t.h = 24;
         t.push_user("你好".into());
         t.begin_assistant();                              
         let frame = t.build_frame();
-                            
         let user_line = frame.lines().find(|l| l.contains("\x1b[48;5;237m")).unwrap();
         assert!(!user_line.contains('▊'), "光标不能落在用户消息块上: {user_line:?}");
-                        
         let plain = strip_ansi(&frame);
         assert!(plain.contains("● "), "应有助手占位行: {plain:?}");
-                              
         t.assistant_delta("正在处理");
         let frame2 = t.build_frame();
         let plain2 = strip_ansi(&frame2);
@@ -3759,7 +2790,6 @@ mod tests {
         let user_line2 = frame2.lines().find(|l| l.contains("\x1b[48;5;237m")).unwrap();
         assert!(!user_line2.contains('▊'));
     }
-
     #[test]
     fn queued_count_does_not_split_streaming_assistant_line() {
         let mut t = Tui::new();
@@ -3769,101 +2799,80 @@ mod tests {
         t.assistant_delta("前半");
         t.set_queued_count(2);
         t.assistant_delta("后半");
-
         let pending: Vec<_> = t.chat.iter().filter(|line| line.pending).collect();
         assert_eq!(pending.len(), 1, "排队提示不能插进聊天记录并切断流式消息");
         assert_eq!(pending[0].text, "前半后半");
         assert!(strip_ansi(&t.build_frame()).contains("排队 2"));
     }
-
     #[test]
     fn input_wrap_ranges_tracks_char_ranges() {
-                                  
         let lines = wrap_input_ranges("你好hello世界", 6);
         assert_eq!(lines.len(), 3);
         assert_eq!((lines[0].0.as_str(), lines[0].1, lines[0].2), ("你好he", 0, 4));
         assert_eq!((lines[1].0.as_str(), lines[1].1, lines[1].2), ("llo世", 4, 8));
         assert_eq!((lines[2].0.as_str(), lines[2].1, lines[2].2), ("界", 8, 9));
-                                             
         let lines = wrap_input_ranges("a\n\nb", 10);
         assert_eq!(lines.len(), 3);
         assert_eq!((lines[0].0.as_str(), lines[0].1, lines[0].2), ("a", 0, 2));
         assert_eq!((lines[1].0.as_str(), lines[1].1, lines[1].2), ("", 2, 3));
         assert_eq!((lines[2].0.as_str(), lines[2].1, lines[2].2), ("b", 3, 4));
     }
-
     #[test]
     fn cursor_line_info_locates_multiline_cursor() {
-                                                       
-                                                                 
         let mut t = Tui::new();
         t.w = 21;
         t.input = "abcdefghij一二三四五六".into();
-                   
         t.cursor = 3;
         let (line, col, s, e) = t.cursor_line_info().unwrap();
         assert_eq!((line, col, s, e), (0, 3, 0, 14));
-                                   
         t.cursor = 14;
         let (line, col, s, e) = t.cursor_line_info().unwrap();
         assert_eq!((line, col, s, e), (1, 0, 14, 16));
-                                       
         t.cursor = 15;
         let (line, col, s, e) = t.cursor_line_info().unwrap();
         assert_eq!((line, col, s, e), (1, 2, 14, 16));
-                         
         t.cursor = 16;
         let (line, col, _, _) = t.cursor_line_info().unwrap();
         assert_eq!((line, col), (1, 4));
     }
-
     #[test]
     fn cursor_move_up_down_preserves_column() {
         let mut t = Tui::new();
         t.w = 21;
         t.input = "abcdefghij一二三四五六".into();                  
-                                                
         t.cursor = 16;
         t.cursor_move(-1);
         assert_eq!(t.cursor, 4, "保持列位置");
         let (line, col, _, _) = t.cursor_line_info().unwrap();
         assert_eq!((line, col), (0, 4));
-                    
         t.cursor_move(-1);
         assert_eq!(t.cursor, 4);
-                       
         t.cursor_move(1);
         let (line, col, _, _) = t.cursor_line_info().unwrap();
         assert_eq!((line, col), (1, 4));
-                                                
         t.cursor = 13;
         t.cursor_move(1);
         assert_eq!(t.cursor, 16, "短行应停在行尾");
-                                             
         t.cursor = 14;
         let (line, col, _, _) = t.cursor_line_info().unwrap();
         assert_eq!((line, col), (1, 0));
         t.cursor_move(1);
         assert_eq!(t.cursor, 14);
-                                
         t.input = "单行".into();
         t.cursor = 2;
         t.cursor_move(-1);
         assert_eq!(t.cursor, 2);
     }
-
     #[test]
     fn home_end_jump_to_line_bounds() {
         let mut t = Tui::new();
         t.w = 21;
         t.input = "abcdefghij一二三四五六".into();
-                                            
         t.cursor = 15;
         let _ = t.handle_key(Key::Home);
         assert_eq!(t.cursor, 14);
         let _ = t.handle_key(Key::End);
         assert_eq!(t.cursor, 16);
-                               
         t.input = "abc".into();
         t.cursor = 1;
         let _ = t.handle_key(Key::Home);
@@ -3871,7 +2880,6 @@ mod tests {
         let _ = t.handle_key(Key::End);
         assert_eq!(t.cursor, 3);
     }
-
     #[test]
     fn tab_completes_unique_command() {
         let mut t = Tui::new();
@@ -3881,7 +2889,6 @@ mod tests {
         }
         let _ = t.handle_key(Key::Tab);
         assert_eq!(t.input, "/help ");
-                 
         let mut t = Tui::new();
         t.set_commands(&[("help", "a"), ("ls", "b")]);
         for c in "/".chars() {
@@ -3889,7 +2896,6 @@ mod tests {
         }
         let _ = t.handle_key(Key::Tab);
         assert_eq!(t.input, "/");
-                    
         let mut t = Tui::new();
         t.set_commands(&[("help", "a")]);
         for c in "h".chars() {
@@ -3898,26 +2904,21 @@ mod tests {
         let _ = t.handle_key(Key::Tab);
         assert_eq!(t.input, "h");
     }
-
     #[test]
     fn command_popup_filters_and_styles() {
         let mut t = Tui::new();
         t.w = 60;
         t.set_commands(&[("help", "查看命令帮助"), ("ls", "列出会话"), ("tool_times", "设置轮数")]);
-                      
         let (lines, total) = t.command_popup();
         assert!(lines.is_empty() && total == 0);
-                    
         for c in "/".chars() {
             let _ = t.handle_key(Key::Char(c));
         }
         let (lines, total) = t.command_popup();
         assert_eq!(total, 3);
         assert_eq!(lines.len(), 3);
-                                         
         assert!(lines[0].contains(&format!("{C_BOLD}/help{C_RESET}")), "行0: {}", lines[0]);
         assert!(lines[0].contains("查看命令帮助"));
-                                        
         for c in "to".chars() {
             let _ = t.handle_key(Key::Char(c));
         }
@@ -3925,17 +2926,14 @@ mod tests {
         assert_eq!(total, 1);
         assert!(lines[0].contains(&format!("{C_BOLD}/to{C_RESET}")), "行: {}", lines[0]);
         assert!(lines[0].contains("\x1b[1m/to\x1b[0m"), "命中段粗体: {}", lines[0]);
-                  
         for c in "xyz".chars() {
             let _ = t.handle_key(Key::Char(c));
         }
         let (lines, _) = t.command_popup();
         assert!(lines.is_empty());
     }
-
     #[test]
     fn multiline_input_frame_wraps_and_cursor() {
-                                      
         let mut t = Tui::new();
         t.w = 40;
         t.h = 20;
@@ -3946,7 +2944,6 @@ mod tests {
         }
         let frame = t.build_frame();
         let plain = strip_ansi(&frame);
-                                                 
         let border = "─".repeat(40);
         assert!(plain.matches(&border).count() >= 2, "上下边界");
         let mut sections = plain.split(&border);
@@ -3954,18 +2951,14 @@ mod tests {
         let box_region = sections.next().unwrap_or("");
         let input_lines: Vec<&str> = box_region.lines().filter(|line| line.contains('一')).collect();
         assert!(input_lines.len() >= 2, "输入应折成多行: {plain:?}");
-                       
         assert!(plain.contains("你好"), "聊天区应保留: {plain:?}");
-                                        
         assert!(frame.contains(&format!("{C_CURSOR} {C_RESET}")), "块光标存在");
         let idx = frame.rfind(C_CURSOR).unwrap();
-                                                      
         let esc = frame[..idx].rsplit('\x1b').next().unwrap();                   
         let pos = esc.trim_start_matches('[').trim_end_matches('H');                 
         let row: usize = pos.split(';').next().unwrap().parse().unwrap_or(0);
         assert!(row == 18, "光标应在输入框末行: row={row}");
     }
-
     #[test]
     fn slash_popup_shown_in_frame() {
         let mut t = Tui::new();
@@ -3978,21 +2971,17 @@ mod tests {
         assert!(plain.contains("/help"), "菜单应显示命令: {plain:?}");
         assert!(plain.contains("/tool_times"), "菜单应显示命令: {plain:?}");
         assert!(plain.contains("查看命令帮助"), "菜单应显示说明");
-                               
         let border = "─".repeat(60);
         let after_border = plain.split(&border).nth(2).unwrap_or("");
         assert!(after_border.contains("/help"), "菜单应紧跟输入框: {after_border:?}");
-                            
         t.input = String::new();
         t.cursor = 0;
         let frame2 = t.build_frame();
         let plain2 = strip_ansi(&frame2);
         assert!(!plain2.contains("/tool_times"), "无 / 输入时菜单消失: {plain2:?}");
     }
-
     #[test]
     fn pending_tool_block_line_not_shown() {
-                                                
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4004,11 +2993,9 @@ mod tests {
         let frame = t.build_frame();
         let plain = strip_ansi(&frame);
         let dots = plain.matches('●').count();
-                                                  
         assert_eq!(dots, 1, "不应有多余的空 ● 行: {plain:?}");
         assert!(plain.contains("● web_search"), "工具行正常显示");
     }
-
     #[test]
     fn key_parser_sgr_mouse_wheel() {
         let mut p = KeyParser::new();
@@ -4020,11 +3007,9 @@ mod tests {
         }
         panic!("未解析出滚轮上事件");
     }
-
     #[test]
     fn key_parser_sgr_mouse_down_drag_release() {
         let mut p = KeyParser::new();
-                                              
         for b in "\x1b[<0;10;5M".bytes() {
             if let Some(k) = p.feed(b) {
                 assert_eq!(k, Key::MouseDown { row: 10, col: 5 });
@@ -4032,7 +3017,6 @@ mod tests {
             }
         }
         let mut p = KeyParser::new();
-                                          
         for b in "\x1b[<32;3;20M".bytes() {
             if let Some(k) = p.feed(b) {
                 assert_eq!(k, Key::MouseDrag { row: 3, col: 20 });
@@ -4040,7 +3024,6 @@ mod tests {
             }
         }
         let mut p = KeyParser::new();
-                            
         for b in "\x1b[<0;10;5m".bytes() {
             if let Some(k) = p.feed(b) {
                 assert_eq!(k, Key::MouseUp { row: 10, col: 5 });
@@ -4049,11 +3032,9 @@ mod tests {
         }
         panic!("未解析出鼠标按下/拖拽/松开事件");
     }
-
     #[test]
     fn key_parser_bracketed_paste() {
         let mut p = KeyParser::new();
-                                               
         let mut got = Vec::new();
         for b in "\x1b[200~abc\x1b[201~".bytes() {
             if let Some(k) = p.feed(b) {
@@ -4066,10 +3047,8 @@ mod tests {
         assert_eq!(got[3], Key::Char('c'));
         assert_eq!(got[4], Key::PasteEnd);
     }
-
     #[test]
     fn wheel_scrolls_viewport_not_history() {
-                                            
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4086,10 +3065,8 @@ mod tests {
         assert_eq!(a, Action::None);
         assert_eq!(t.scroll, 0, "滚轮下应回到底部");
     }
-
     #[test]
     fn tool_block_not_shown_in_frame() {
-                                                        
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4101,10 +3078,8 @@ mod tests {
         assert!(!frame.contains("```tool"), "工具块不应裸奔显示");
         assert!(strip_ansi(&frame).contains("你好"), "用户消息正常显示");
     }
-
     #[test]
     fn user_block_and_tool_line_styles() {
-                                          
         let mut t = Tui::new();
         t.w = 60;
         t.h = 13;
@@ -4116,7 +3091,6 @@ mod tests {
         assert!(frame.contains("\x1b[48;5;237m\x1b[1;97m你好"), "用户消息灰底+粗体亮白字");
         assert!(plain.contains("● portscan({\"host\":\"127.0.0.1\"})"), "工具行 ● + (参数)");
         assert!(frame.contains("\x1b[1mportscan\x1b[0m"), "工具名粗体");
-                                      
         t.push_system("系统提示".into());
         t.push_error("出错了".into());
         t.push_summary("已压缩".into());
@@ -4126,7 +3100,6 @@ mod tests {
         assert!(plain2.contains("✗ 出错了"), "错误行可见");
         assert!(plain2.contains("◆ 已压缩"), "摘要行可见");
     }
-
     #[test]
     fn read_tool_ui_shows_the_complete_page_sent_to_the_model() {
         let mut t = Tui::new();
@@ -4145,7 +3118,6 @@ mod tests {
         assert!(plain.contains("fn three() {}"));
         assert!(!plain.contains("Read 3 lines"), "不能用摘要隐藏文件正文");
     }
-
     #[test]
     fn shell_ls_ui_shows_the_complete_directory_page() {
         let mut t = Tui::new();
@@ -4167,7 +3139,6 @@ mod tests {
         assert!(!plain.contains("Listed 2 of 3 items"), "不能用摘要隐藏目录页");
         assert!(!plain.contains("…共"), "listdir 不再使用 400 字符折叠预览");
     }
-
     #[test]
     fn frame_streaming_light_and_cursor() {
         let mut t = Tui::new();
@@ -4178,13 +3149,11 @@ mod tests {
         let frame = t.build_frame();
         assert!(frame.contains("◐"), "生成中状态灯");
         assert!(frame.contains('▊'), "流式块光标");
-
         t.end_assistant("hi");
         let frame2 = t.build_frame();
         assert!(!frame2.contains('▊'), "结束后无流式光标");
         assert!(frame2.contains('●'), "恢复空闲灯");
     }
-
     #[test]
     fn input_edit_ops() {
         let mut t = Tui::new();
@@ -4198,7 +3167,6 @@ mod tests {
         assert!(matches!(t.handle_key(Key::Enter), Action::Submit(s) if s == "hi"));
         assert!(t.input.is_empty());
     }
-
     #[test]
     fn slash_command_detection() {
         let mut t = Tui::new();
@@ -4207,7 +3175,6 @@ mod tests {
         }
         assert!(matches!(t.handle_key(Key::Enter), Action::Command(c) if c == "help"));
     }
-
     #[test]
     fn history_navigation() {
         let mut t = Tui::new();
@@ -4226,10 +3193,8 @@ mod tests {
         let _ = t.handle_key(Key::Down);
         assert_eq!(t.input, "b");
     }
-
     #[test]
     fn md_inline_rendered_in_frame() {
-                                                 
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4247,10 +3212,8 @@ mod tests {
         assert!(frame.contains("\x1b[3m斜体\x1b[0m"), "斜体 ANSI: {frame:?}");
         assert!(frame.contains("\x1b[48;5;234mcode\x1b[0m"), "行内代码底色: {frame:?}");
     }
-
     #[test]
     fn md_code_block_shaded_in_frame() {
-                           
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4264,10 +3227,8 @@ mod tests {
         assert!(!plain.contains("```"), "围栏不应显示: {plain:?}");
         assert!(frame.contains("\x1b[48;5;234m\x1b[37mfn main() {}"), "代码块整行灰底: {frame:?}");
     }
-
     #[test]
     fn md_header_bold_in_frame() {
-                        
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4281,10 +3242,8 @@ mod tests {
         assert!(!plain.contains("#"), "井号不应显示: {plain:?}");
         assert!(frame.contains("\x1b[1m安装说明\x1b[0m"), "标题粗体: {frame:?}");
     }
-
     #[test]
     fn md_quote_prefix_in_frame() {
-                     
         let mut t = Tui::new();
         t.w = 60;
         t.h = 10;
@@ -4297,10 +3256,8 @@ mod tests {
         assert!(plain.contains("│ 引用一段"), "引用行: {plain:?}");
         assert!(!plain.contains("> 引用"), "引用标记应替换为 │: {plain:?}");
     }
-
     #[test]
     fn md_link_in_frame() {
-                         
         let mut t = Tui::new();
         t.w = 80;
         t.h = 10;
@@ -4312,10 +3269,8 @@ mod tests {
         let plain = strip_ansi(&frame);
         assert!(plain.contains("官方文档 (https://example.com)"), "链接行: {plain:?}");
     }
-
     #[test]
     fn reasoning_streams_merge_and_seal() {
-                                                   
         let mut t = Tui::new();
         t.w = 80;
         t.h = 24;
@@ -4325,20 +3280,16 @@ mod tests {
         assert_eq!(t.chat.len(), 1, "思考流 chunk 合并进同一行");
         assert!(t.chat[0].pending, "思考流进行中未封口");
         assert_eq!(t.chat[0].text, "桌面\n环境是", "chunk 顺序拼接");
-                          
         t.begin_assistant();
         assert!(!t.chat[0].pending, "正文开始后思考流封口");
         t.assistant_delta("正文");
         assert_eq!(t.chat.len(), 2, "正文是独立的助手行");
-                              
         t.push_reasoning("新一轮思考".into());
         assert_eq!(t.chat.len(), 3, "新思考流另起一行");
         assert_eq!(t.chat[2].text, "新一轮思考");
     }
-
     #[test]
     fn reasoning_long_line_collapsed_in_frame() {
-                                                               
         let mut t = Tui::new();
         t.w = 80;
         t.h = 24;
