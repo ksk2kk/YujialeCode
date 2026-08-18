@@ -1,0 +1,28 @@
+# YJLcoder QQ 扫码弹窗助手 —— systemd 用户服务，开机自启
+#
+# 安装（root 权限的 linger 一次性执行）：
+#   cp deploy/yjlcoder-qr-watcher.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now yjlcoder-qr-watcher.service
+#
+# 行为：NapCat 未登录（二维码循环）时自动打开浏览器扫码页（NapCat WebUI），
+# 登录成功后弹通知并退出。登录态保持时不开浏览器。
+#
+# 查看日志：
+#   journalctl --user -u yjlcoder-qr-watcher -f
+
+[Unit]
+Description=YJLcoder QQ QR login watcher (auto-open browser for scan)
+After=yjlcoder-qq.service
+Wants=yjlcoder-qq.service
+
+[Service]
+# watcher 不 fork；脚本退出即代表本轮监听完成。
+Type=simple
+ExecStart=/home/ksk2kk/YJLcoder/deploy/yjlcoder-qr-watcher.sh
+# 登录成功的 exit 0 不重启；只有故障才在 10 秒后重试。
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

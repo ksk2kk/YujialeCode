@@ -1,0 +1,8 @@
+/target
+
+# NapCat 敏感配置（QQ 号 / 登录令牌 / 二维码）
+/deploy/napcat/docker-compose.yml
+/deploy/napcat/qrcode*.png
+/deploy/napcat/config/*_3503963415.json
+/deploy/napcat/config/passkey.json
+/deploy/napcat/config/webui.json
