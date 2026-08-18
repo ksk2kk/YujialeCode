@@ -1,0 +1,33 @@
+# YJLcoder QQ 桥接守护（无 TUI）—— systemd 用户服务，开机自启
+#
+# 安装（root 权限的 linger 一次性执行）：
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/yjlcoder-qq.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now yjlcoder-qq.service
+#   sudo loginctl enable-linger $USER   # 开机自启，无需登录
+#
+# 查看日志：
+#   journalctl --user -u yjlcoder-qq -f
+
+[Unit]
+Description=YJLcoder QQ bridge (OneBot v11, headless daemon)
+After=network-online.target
+Wants=network-online.target
+# 慢启动保护：60s 内连续重启超 5 次则暂停 60s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# simple：ExecStart 进程本身就是服务主体，不等待 fork 或 ready 通知。
+Type=simple
+# systemd 直接启动无 TUI 的 QQ 模式；进程生命周期就是 service 生命周期。
+ExecStart=/home/ksk2kk/.cargo/bin/yjlcoder --qq-only
+# 任何正常/异常退出都重启；主动停服务时 systemd 不把 stop 视为重启条件。
+Restart=always
+# 给端口释放、网络恢复和模型进程留下 3 秒缓冲。
+RestartSec=3
+
+[Install]
+# 用户级默认 target 启动时拉起本服务；enable 会创建对应依赖链接。
+WantedBy=default.target
