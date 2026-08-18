@@ -1,6 +1,12 @@
 # YujialeCode
 
+[English](README.en.md) | [中文](README.md)
+
 专门为本地模型玩家开发的 code agent。纯 Rust 实现，极致简约的系统提示词设计，30 tokens 的速度下也能流畅使用。完美兼容 Claude 风格 skill。
+
+## 致谢
+
+本项目以我的朋友 [Yujiale](https://github.com/dawalishi821) 的名字命名——YujialeCode 中的 "Yujiale" 正是他的名字。祝 Yujiale 生日快乐！
 
 极简纯 Rust 本地模型 CLI Agent：零运行时依赖、手搓 TUI、低系统提示词设计。面向 DeepSeek / Ollama / LM Studio / vLLM 等任意 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊极速响应。
 
