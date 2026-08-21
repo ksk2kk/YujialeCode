@@ -1,7 +1,10 @@
 pub mod agent;
 pub mod backend;
+pub mod clipboard_copy;
 pub mod compress;
 pub mod config;
+pub mod dynamic_tools;
+pub mod goal;
 pub mod llm;
 pub mod md;
 pub mod prompt;

@@ -1,7 +1,10 @@
 mod agent;
 mod backend;
+mod clipboard_copy;
 mod compress;
 mod config;
+mod dynamic_tools;
+mod goal;
 mod llm;
 mod md;
 mod prompt;
@@ -38,7 +41,7 @@ enum TurnAdmission {
     Queued(usize),
 }
 enum TurnTerminal {
-    Done(String),
+    Done { text: String, usage: crate::llm::Usage, timings: crate::llm::Timings },
     Error(String),
 }
 impl TurnQueue {
@@ -170,6 +173,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("budget", "查看/设置思考预算"),
     ("maxtokens", "查看/设置单轮生成上限"),
     ("config", "查看当前全部配置总览"),
+    ("goal", "持续执行目标（状态/暂停/恢复/清除）"),
+    ("copy", "复制最近一条助手完整回复（Ctrl+O）"),
     ("new", "新建会话"),
     ("ls", "列出会话"),
     ("use", "切换会话"),
@@ -274,12 +279,18 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
     let mut cur_ask_id: Option<u64> = None;
     let mut cur_perm_tx: Option<Sender<PermDecision>> = None;
     let mut cur_perm_id: Option<u64> = None;
+    let mut pending_goal_retry: Option<(std::time::Instant, usize, String)> = None;
     refresh_header(&mut tui, &cfg, &llm, &store);
     while !quit {
-        if let Ok(b) = key_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            if let Some(key) = parser.feed(b) {
+        let key = match key_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(b) => parser.feed(b),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => parser.flush_pending_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        if let Some(key) = key {
                 match tui.handle_key(key) {
                     Action::Submit(text) => {
+                        pending_goal_retry = None;
                         match turns.submit(text) {
                             TurnAdmission::Queued(position) => {
                                 tui.set_queued_count(position);
@@ -307,23 +318,59 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                         }
                     }
                     Action::Command(cmd) => {
-                        let live_cmd = matches!(cmd.split(' ').next(), Some("autodangerous"));
+                        let live_cmd = matches!(cmd.split(' ').next(), Some("autodangerous" | "copy"))
+                            || goal_control_is_safe_while_running(&cmd);
                         if turns.is_active() && !live_cmd {
                             tui.push_warn(
-                                "当前回合仍在运行，斜杠命令未执行；请等待完成或按 Ctrl+C 中断".into(),
+                                "当前回合仍在运行，斜杠命令未执行；请等待完成或按 Esc/Ctrl+C 中断".into(),
                             );
                         } else {
-                            handle_command(
-                                &cmd,
-                                &mut tui,
-                                &mut store,
-                                &mut cfg,
-                                &mut llm,
-                                &ev_tx,
-                                &cancel,
-                                &perm_auto,
-                                &perm_allowed,
-                            );
+                            let (command_name, command_args) = cmd
+                                .split_once(' ')
+                                .map(|(name, args)| (name, args.trim()))
+                                .unwrap_or((cmd.as_str(), ""));
+                            if command_name == "goal" {
+                                pending_goal_retry = None;
+                                let outcome = goal::handle_slash(&cfg, store.current_id(), command_args);
+                                tui.push_system(outcome.notice);
+                                if let Some(prompt) = outcome.prompt {
+                                    match turns.submit(prompt) {
+                                        TurnAdmission::Start(prompt) => {
+                                            let channels = start_tui_goal_turn(
+                                                &mut tui,
+                                                prompt,
+                                                TurnContext {
+                                                    cfg: &cfg,
+                                                    llm: &llm,
+                                                    store: &store,
+                                                    ev_tx: &ev_tx,
+                                                    cancel: &cancel,
+                                                    ask_tx: &ask_tx,
+                                                    perm_tx: &perm_tx,
+                                                    perm_auto: &perm_auto,
+                                                    perm_allowed: &perm_allowed,
+                                                    terminal_tx: &terminal_tx,
+                                                },
+                                            );
+                                            cur_answer_tx = Some(channels.answer_tx);
+                                            cur_perm_tx = Some(channels.decision_tx);
+                                        }
+                                        TurnAdmission::Queued(position) => tui.set_queued_count(position),
+                                    }
+                                }
+                            } else {
+                                handle_command(
+                                    &cmd,
+                                    &mut tui,
+                                    &mut store,
+                                    &mut cfg,
+                                    &mut llm,
+                                    &ev_tx,
+                                    &cancel,
+                                    &perm_auto,
+                                    &perm_allowed,
+                                );
+                            }
                         }
                     }
                     Action::RetrieveQueued => {
@@ -358,7 +405,6 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                     Action::Redraw => {}
                     Action::None => {}
                 }
-            }
         }
         while let Ok(req) = ask_rx.try_recv() {
             cur_ask_id = Some(req.id);
@@ -395,14 +441,66 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                 }
             }
         }
+        let mut normal_turn_completed = false;
         while let Ok(terminal) = terminal_rx.try_recv() {
             match terminal {
-                TurnTerminal::Done(final_text) => tui.end_assistant(&final_text),
+                TurnTerminal::Done { text, usage, timings } => {
+                    tui.end_assistant_with_metrics(&text, usage, timings);
+                    pending_goal_retry = None;
+                    normal_turn_completed = true;
+                    if let Some(state) = goal::record_turn_usage(
+                        &cfg,
+                        store.current_id(),
+                        usage.prompt_tokens.saturating_add(usage.completion_tokens),
+                    ) {
+                        if state.status == goal::GoalStatus::BudgetLimited {
+                            tui.push_warn(format!(
+                                "目标 token 预算已用完（{}），已停止自动续跑",
+                                state.tokens_used
+                            ));
+                        }
+                    }
+                }
                 TurnTerminal::Error(error) => {
                     if tui.is_streaming() {
                         tui.end_assistant("");
                     }
-                    tui.push_error(error);
+                    tui.push_error(error.clone());
+                    if error.trim() == "已取消" {
+                        let outcome = goal::handle_slash(&cfg, store.current_id(), "pause");
+                        if outcome.notice == "目标已暂停" {
+                            pending_goal_retry = None;
+                            tui.push_warn("当前 Goal 已随用户中断暂停；用 /goal resume 继续".into());
+                        }
+                    } else {
+                        match goal::record_runtime_failure(&cfg, store.current_id(), &error) {
+                            Ok(Some(goal::RuntimeFailureAction::Retry {
+                                attempt,
+                                delay_secs,
+                                turn,
+                                prompt,
+                            })) => {
+                                pending_goal_retry = Some((
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(delay_secs),
+                                    turn,
+                                    prompt,
+                                ));
+                                tui.push_warn(format!(
+                                    "Goal 第 {attempt}/{} 次运行错误；{delay_secs} 秒后从中断点自动重试",
+                                    goal::RUNTIME_FAILURE_LIMIT
+                                ));
+                            }
+                            Ok(Some(goal::RuntimeFailureAction::Paused { attempts })) => {
+                                pending_goal_retry = None;
+                                tui.push_warn(format!(
+                                    "Goal 连续 {attempts} 次运行错误，已安全暂停；服务恢复后用 /goal resume 继续"
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => tui.push_error(format!("Goal 错误状态保存失败: {e}")),
+                        }
+                    }
                 }
             }
             turns.finish_active();
@@ -438,6 +536,73 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                 );
                 cur_answer_tx = Some(channels.answer_tx);
                 cur_perm_tx = Some(channels.decision_tx);
+            } else if pending_goal_retry
+                .as_ref()
+                .is_some_and(|(due, _, _)| std::time::Instant::now() >= *due)
+            {
+                let (_, turn, prompt) = pending_goal_retry.take().unwrap();
+                if goal::load(&cfg, store.current_id())
+                    .is_some_and(|state| state.status == goal::GoalStatus::Active)
+                {
+                    if let TurnAdmission::Start(prompt) = turns.submit(prompt) {
+                        tui.push_system(format!("◎ /goal 运行错误恢复 · 第 {turn} 轮"));
+                        let channels = start_tui_goal_turn(
+                            &mut tui,
+                            prompt,
+                            TurnContext {
+                                cfg: &cfg,
+                                llm: &llm,
+                                store: &store,
+                                ev_tx: &ev_tx,
+                                cancel: &cancel,
+                                ask_tx: &ask_tx,
+                                perm_tx: &perm_tx,
+                                perm_auto: &perm_auto,
+                                perm_allowed: &perm_allowed,
+                                terminal_tx: &terminal_tx,
+                            },
+                        );
+                        cur_answer_tx = Some(channels.answer_tx);
+                        cur_perm_tx = Some(channels.decision_tx);
+                    }
+                }
+            } else if normal_turn_completed {
+                match goal::next_continuation(&cfg, store.current_id()) {
+                    Ok(Some((turn, prompt))) => {
+                        if let TurnAdmission::Start(prompt) = turns.submit(prompt) {
+                            tui.push_system(format!("◎ /goal 自动续跑 · 第 {turn} 轮"));
+                            let channels = start_tui_goal_turn(
+                                &mut tui,
+                                prompt,
+                                TurnContext {
+                                    cfg: &cfg,
+                                    llm: &llm,
+                                    store: &store,
+                                    ev_tx: &ev_tx,
+                                    cancel: &cancel,
+                                    ask_tx: &ask_tx,
+                                    perm_tx: &perm_tx,
+                                    perm_auto: &perm_auto,
+                                    perm_allowed: &perm_allowed,
+                                    terminal_tx: &terminal_tx,
+                                },
+                            );
+                            cur_answer_tx = Some(channels.answer_tx);
+                            cur_perm_tx = Some(channels.decision_tx);
+                        }
+                    }
+                    Ok(None) => {
+                        if goal::load(&cfg, store.current_id())
+                            .is_some_and(|state| state.status == goal::GoalStatus::MaxTurns)
+                        {
+                            tui.push_warn(format!(
+                                "目标已达到 {} 轮安全上限；用 /goal continue 明确继续",
+                                goal::MAX_GOAL_TURNS
+                            ));
+                        }
+                    }
+                    Err(e) => tui.push_error(format!("目标续跑状态保存失败: {e}")),
+                }
             }
         }
         refresh_header(&mut tui, &cfg, &llm, &store);
@@ -477,6 +642,34 @@ fn start_tui_turn(tui: &mut Tui, input: String, context: TurnContext<'_>) -> Tur
         terminal_tx: context.terminal_tx.clone(),
         input,
     })
+}
+fn start_tui_goal_turn(tui: &mut Tui, input: String, context: TurnContext<'_>) -> TurnChannels {
+    context.cancel.store(false, Ordering::Relaxed);
+    tui.begin_assistant();
+    spawn_turn(TurnSpawn {
+        cfg: context.cfg.clone(),
+        llm: context.llm.clone(),
+        store: context.store.clone(),
+        ev_tx: context.ev_tx.clone(),
+        cancel: context.cancel.clone(),
+        ask_tx: context.ask_tx.clone(),
+        perm_tx: context.perm_tx.clone(),
+        perm_auto: context.perm_auto.clone(),
+        perm_allowed: context.perm_allowed.clone(),
+        terminal_tx: context.terminal_tx.clone(),
+        input,
+    })
+}
+fn goal_control_is_safe_while_running(cmd: &str) -> bool {
+    let (name, args) = cmd
+        .split_once(' ')
+        .map(|(name, args)| (name, args.trim().to_ascii_lowercase()))
+        .unwrap_or((cmd, String::new()));
+    name == "goal"
+        && matches!(
+            args.as_str(),
+            "" | "status" | "pause" | "clear" | "stop" | "off" | "reset" | "none" | "cancel" | "complete"
+        )
 }
 fn refresh_header(tui: &mut Tui, cfg: &Config, llm: &Llm, store: &SessionStore) {
     let (_msgs, tokens) = session::session_stats(&store.path(store.current_id()));
@@ -521,7 +714,13 @@ fn spawn_turn(turn: TurnSpawn) -> TurnChannels {
             let _ = turn.ev_tx.send(ev);
         }) {
             Ok(final_text) => {
-                let _ = turn.terminal_tx.send(TurnTerminal::Done(final_text));
+                let usage = agent.last_usage;
+                let timings = agent.last_timings;
+                let _ = turn.terminal_tx.send(TurnTerminal::Done {
+                    text: final_text,
+                    usage,
+                    timings,
+                });
             }
             Err(e) => {
                 let _ = turn.terminal_tx.send(TurnTerminal::Error(e));
@@ -571,6 +770,8 @@ fn handle_command(
                  /rm <id>      删除会话（不能删当前）\n\
                  /compress     手动压缩上下文\n\
                  /stats        上下文统计\n\
+                 /goal <目标>  持续执行直到完成（status/pause/resume/continue/clear）\n\
+                 /copy         复制最近一条助手完整回复（Ctrl+O；不受屏幕折行影响）\n\
                  /tool_times <N> 工具调用轮数上限（默认 24，1-200）\n\
                  /timeout <秒> 请求/流式读取超时（默认 120，10-3600）\n\
                  /commandcountdown <秒> 命令默认超时（默认 600，1-3600；超时后已产出输出会交回模型）\n\
@@ -606,6 +807,9 @@ fn handle_command(
                  其余输入即对话。输入「搜索 xxx / 查一下 xxx / 抓取 URL / 读取 文件」会直接触发对应工具，\n\
                  无需模型介入。启动时若上次会话有历史会自动开新会话，/use 可切回旧会话".into(),
             );
+        }
+        "copy" => {
+            let _ = tui.copy_last_assistant();
         }
         "ls" => {
             let mut out = String::from("会话列表:\n");

@@ -40,6 +40,43 @@ pub struct ChatResult {
     pub text: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
+    pub timings: Option<Timings>,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    #[serde(default)]
+    pub completion_tokens: usize,
+    #[serde(default, alias = "prompt_cache_hit_tokens", alias = "cache_read_input_tokens")]
+    pub cache_read_tokens: usize,
+    #[serde(default, alias = "prompt_cache_miss_tokens", alias = "cache_creation_input_tokens")]
+    pub cache_miss_tokens: usize,
+    #[serde(default, skip_deserializing)]
+    pub cache_prefix_hits: usize,
+    #[serde(default, skip_deserializing)]
+    pub cache_prefix_misses: usize,
+    #[serde(default, skip_deserializing)]
+    pub cache_prefix_messages: usize,
+}
+impl Usage {
+    pub fn server_cache_percent(self) -> Option<f64> {
+        if self.cache_read_tokens == 0 {
+            return None;
+        }
+        let denominator = if self.cache_miss_tokens > 0 {
+            self.cache_read_tokens.saturating_add(self.cache_miss_tokens)
+        } else {
+            self.prompt_tokens.max(self.cache_read_tokens)
+        };
+        (denominator > 0).then(|| self.cache_read_tokens as f64 * 100.0 / denominator as f64)
+    }
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize)]
+pub struct Timings {
+    pub predicted_n: f64,
+    pub predicted_ms: f64,
 }
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -67,6 +104,7 @@ impl Llm {
             last_reload: Arc::new(Mutex::new(
                 std::time::Instant::now() - Duration::from_secs(60),
             )),
+            cache_tracker: Arc::new(Mutex::new(RequestCacheTracker::default())),
         })
     }
     pub fn mock() -> Self {
@@ -168,6 +206,46 @@ impl Llm {
         crate::backend::derive_max_tokens(&caps, kind, qq_max)
     }
 }
+#[derive(Debug, Clone, Default)]
+struct RequestCacheSnapshot {
+    model: String,
+    tools: Option<Value>,
+    messages: Vec<Value>,
+}
+#[derive(Debug, Clone, Copy, Default)]
+struct CacheObservation {
+    has_previous: bool,
+    stable_prefix: bool,
+    prefix_messages: usize,
+}
+#[derive(Debug, Default)]
+struct RequestCacheTracker {
+    previous: Option<RequestCacheSnapshot>,
+}
+impl RequestCacheTracker {
+    fn observe(&mut self, model: &str, tools: &Option<Value>, messages: &[Value]) -> CacheObservation {
+        let observation = match &self.previous {
+            Some(previous) => {
+                let stable = previous.model == model
+                    && previous.tools == *tools
+                    && messages.len() >= previous.messages.len()
+                    && previous.messages.iter().zip(messages).all(|(old, new)| old == new);
+                CacheObservation {
+                    has_previous: true,
+                    stable_prefix: stable,
+                    prefix_messages: if stable { previous.messages.len() } else { 0 },
+                }
+            }
+            None => CacheObservation::default(),
+        };
+        self.previous = Some(RequestCacheSnapshot {
+            model: model.to_string(),
+            tools: tools.clone(),
+            messages: messages.to_vec(),
+        });
+        observation
+    }
+}
 #[derive(Clone)]
 pub struct RemoteClient {
     pub base_url: String,
@@ -179,6 +257,7 @@ pub struct RemoteClient {
     pub bypass_local_llamacpp_router: bool,
     pub server_caps: Arc<Mutex<crate::backend::Capabilities>>,
     pub last_reload: Arc<Mutex<std::time::Instant>>,
+    cache_tracker: Arc<Mutex<RequestCacheTracker>>,
 }
 enum HttpEvent {
     Headers(u16),
@@ -536,9 +615,15 @@ impl RemoteClient {
         } else {
             chat_url(&self.base_url)
         };
+        let openai_messages: Vec<Value> = req.messages.iter().map(to_openai_msg).collect();
+        let cache_observation = self
+            .cache_tracker
+            .lock()
+            .map(|mut tracker| tracker.observe(&model, &req.tools, &openai_messages))
+            .unwrap_or_default();
         let mut payload = json!({
             "model": model,
-            "messages": req.messages.iter().map(to_openai_msg).collect::<Vec<_>>(),
+            "messages": openai_messages,
             "stream": req.stream,
         });
         if let Some(t) = &req.tools {
@@ -574,7 +659,9 @@ impl RemoteClient {
         }
         if !req.stream {
             let body = collect_http_body(&http, cancel)?;
-            return parse_full_response(&body, on_event);
+            let mut result = parse_full_response(&body, on_event)?;
+            attach_cache_observation(&mut result, cache_observation);
+            return Ok(result);
         }
         let mut result = ChatResult::default();
         let mut garbage_run: usize = 0;                                   
@@ -606,6 +693,12 @@ impl RemoteClient {
             };
             if let Some(err) = v.get("error") {
                 return Err(format!("API 错误: {}", err));
+            }
+            if let Some(usage) = v.get("usage") {
+                result.usage = Some(parse_usage(usage));
+            }
+            if let Some(timings) = v.get("timings") {
+                result.timings = serde_json::from_value::<Timings>(timings.clone()).ok();
             }
             let Some(choice) = v.pointer("/choices/0") else { continue };
             let delta = &choice["delta"];
@@ -696,6 +789,7 @@ impl RemoteClient {
             }
             result.tool_calls.push(ToolCall { id, name, args });
         }
+        attach_cache_observation(&mut result, cache_observation);
         Ok(result)
     }
     fn reload_model(&self) -> Result<(), String> {
@@ -873,6 +967,37 @@ fn find_tool_fence(text: &str, from: usize) -> Option<usize> {
     }
     None
 }
+fn parse_usage(value: &Value) -> Usage {
+    let mut usage = serde_json::from_value::<Usage>(value.clone()).unwrap_or_default();
+    if usage.cache_read_tokens == 0 {
+        usage.cache_read_tokens = value
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+    }
+    if usage.cache_miss_tokens == 0
+        && usage.prompt_tokens >= usage.cache_read_tokens
+        && value.pointer("/prompt_tokens_details/cached_tokens").is_some()
+    {
+        usage.cache_miss_tokens = usage.prompt_tokens - usage.cache_read_tokens;
+    }
+    usage
+}
+fn attach_cache_observation(result: &mut ChatResult, observation: CacheObservation) {
+    if !observation.has_previous && result.usage.is_none() {
+        return;
+    }
+    let mut usage = result.usage.unwrap_or_default();
+    if observation.has_previous {
+        if observation.stable_prefix {
+            usage.cache_prefix_hits = 1;
+            usage.cache_prefix_messages = observation.prefix_messages;
+        } else {
+            usage.cache_prefix_misses = 1;
+        }
+    }
+    result.usage = Some(usage);
+}
 fn parse_full_response(body: &str, on_event: &mut impl FnMut(StreamEvent)) -> Result<ChatResult, String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("响应解析失败: {e}"))?;
     if let Some(err) = v.get("error") {
@@ -882,6 +1007,12 @@ fn parse_full_response(body: &str, on_event: &mut impl FnMut(StreamEvent)) -> Re
         return Err(format!("响应缺少 message: {}", &body[..body.len().min(200)]));
     };
     let mut result = ChatResult::default();
+    if let Some(usage) = v.get("usage") {
+        result.usage = Some(parse_usage(usage));
+    }
+    if let Some(timings) = v.get("timings") {
+        result.timings = serde_json::from_value::<Timings>(timings.clone()).ok();
+    }
     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
         result.text = content.to_string();
         for chunk in split_chunks(content) {
@@ -965,6 +1096,42 @@ mod tests {
             chat_url("https://host/custom/chat/completions"),
             "https://host/custom/chat/completions"
         );
+    }
+    #[test]
+    fn usage_parses_deepseek_and_openai_cache_shapes() {
+        let deepseek = parse_usage(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 800,
+            "prompt_cache_miss_tokens": 200
+        }));
+        assert_eq!(deepseek.cache_read_tokens, 800);
+        assert_eq!(deepseek.cache_miss_tokens, 200);
+        assert_eq!(deepseek.server_cache_percent(), Some(80.0));
+        let openai = parse_usage(&json!({
+            "prompt_tokens": 500,
+            "completion_tokens": 10,
+            "prompt_tokens_details":{"cached_tokens":450}
+        }));
+        assert_eq!(openai.cache_read_tokens, 450);
+        assert_eq!(openai.cache_miss_tokens, 50);
+        assert_eq!(openai.server_cache_percent(), Some(90.0));
+    }
+    #[test]
+    fn request_cache_tracker_requires_exact_append_only_prefix() {
+        let tools = Some(json!([{"name":"execute_command"},{"name":"list_tools"}]));
+        let mut tracker = RequestCacheTracker::default();
+        let first = vec![json!({"role":"system","content":"stable"}), json!({"role":"user","content":"a"})];
+        assert!(!tracker.observe("m", &tools, &first).has_previous);
+        let mut extended = first.clone();
+        extended.push(json!({"role":"assistant","content":"b"}));
+        let hit = tracker.observe("m", &tools, &extended);
+        assert!(hit.stable_prefix);
+        assert_eq!(hit.prefix_messages, 2);
+        let changed = vec![json!({"role":"system","content":"changed"})];
+        let miss = tracker.observe("m", &tools, &changed);
+        assert!(miss.has_previous);
+        assert!(!miss.stable_prefix);
     }
     #[test]
     fn local_llamacpp_router_backend_is_discovered_safely() {

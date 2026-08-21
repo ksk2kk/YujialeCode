@@ -70,6 +70,7 @@ pub enum Key {
     CtrlC,
     CtrlD,
     CtrlL,
+    CtrlO,
     Esc,
     Unknown,
 }
@@ -196,6 +197,7 @@ pub struct Tui {
     copied_notice: Option<String>,
     sel_rows: Vec<String>,
     sel_start_row: usize,
+    clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
 }
 pub struct RawGuard {
     orig: libc::termios,
@@ -273,6 +275,7 @@ impl Tui {
             copied_notice: None,
             sel_rows: Vec::new(),
             sel_start_row: 0,
+            clipboard_lease: None,
         }
     }
     pub fn ask(&mut self, questions: Vec<AskQuestion>) {
@@ -347,13 +350,13 @@ impl Tui {
     pub fn enter(&mut self) -> RawGuard {
         let g = RawGuard::enable();
         self.resize();
-        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000;1002;1006h\x1b[?2004h");
+        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h");
         self.last_frame.clear();
         let _ = std::io::stdout().flush();
         g
     }
     pub fn exit(&mut self) {
-        print!("\x1b[?2004l\x1b[?1000;1002;1006l\x1b[?25h\x1b[?7h\x1b[?1049l");
+        print!("\x1b[?2004l\x1b[?25h\x1b[?7h\x1b[?1049l");
         let _ = std::io::stdout().flush();
     }
     fn resize(&mut self) {
@@ -423,6 +426,43 @@ impl Tui {
         }
         self.chat.push(ChatLine::new(ChatRole::Assistant, full.to_string()));
         self.scroll = 0;
+    }
+    pub fn end_assistant_with_metrics(
+        &mut self,
+        full: &str,
+        usage: crate::llm::Usage,
+        timings: crate::llm::Timings,
+    ) {
+        self.end_assistant(full);
+        if full.trim().is_empty() {
+            return;
+        }
+        let speed = if timings.predicted_n > 0.0 && timings.predicted_ms > 0.0 {
+            format!(
+                " · {:.1} tok/s",
+                timings.predicted_n / (timings.predicted_ms / 1000.0)
+            )
+        } else {
+            String::new()
+        };
+        let cache = if let Some(percent) = usage.server_cache_percent() {
+            format!(" · 缓存命中 {} tok/{percent:.1}%", usage.cache_read_tokens)
+        } else if usage.cache_prefix_hits > 0 {
+            format!(
+                " · 缓存前缀稳定 {}/{} 次（最长 {} 条消息）",
+                usage.cache_prefix_hits,
+                usage.cache_prefix_hits + usage.cache_prefix_misses,
+                usage.cache_prefix_messages
+            )
+        } else {
+            String::new()
+        };
+        if usage.prompt_tokens > 0 || usage.completion_tokens > 0 || !speed.is_empty() || !cache.is_empty() {
+            self.push_summary(format!(
+                "▸ 输入 {} token · 输出 {} token{speed}{cache}",
+                usage.prompt_tokens, usage.completion_tokens
+            ));
+        }
     }
     pub fn push_tool(&mut self, op: &str, args: &str) {
         self.seal_reasoning();
@@ -772,6 +812,7 @@ impl Tui {
             .map(|(i, _)| i)
             .unwrap_or(self.input.len())
     }
+    #[allow(dead_code)]
     fn extract_selection(&self) -> String {
         let (Some(a), Some(c)) = (self.sel_anchor, self.sel_cur) else {
             return String::new();
@@ -861,6 +902,7 @@ impl Tui {
         }
         out
     }
+    #[allow(dead_code)]
     fn copy_to_clipboard(text: &str) -> bool {
         if cfg!(test) {
             return false;
@@ -914,6 +956,27 @@ impl Tui {
             return feed(cmd);
         }
         false
+    }
+    pub fn copy_last_assistant(&mut self) -> Result<usize, String> {
+        let text = self
+            .chat
+            .iter()
+            .rev()
+            .find(|line| line.role == ChatRole::Assistant && !line.text.trim().is_empty())
+            .map(|line| line.text.clone())
+            .ok_or_else(|| "当前还没有可复制的助手回复".to_string())?;
+        match crate::clipboard_copy::copy_to_clipboard(&text) {
+            Ok(lease) => {
+                self.clipboard_lease = lease;
+                let chars = text.chars().count();
+                self.copied_notice = Some(format!("已复制最近回复 · {chars} 字符"));
+                Ok(chars)
+            }
+            Err(error) => {
+                self.copied_notice = Some(format!("复制失败: {error}"));
+                Err(error)
+            }
+        }
     }
     pub fn handle_key(&mut self, key: Key) -> Action {
         if self.perm_prompt.is_some() {
@@ -1010,36 +1073,7 @@ impl Tui {
                 self.scroll = self.scroll.saturating_sub(3);
                 Action::None
             }
-            Key::MouseDown { row, col } => {
-                self.sel_anchor = Some((row, col));
-                self.sel_cur = Some((row, col));
-                self.copied_notice = None;
-                Action::None
-            }
-            Key::MouseDrag { row, col } => {
-                if self.sel_anchor.is_some() {
-                    self.sel_cur = Some((row, col));
-                    Action::Redraw
-                } else {
-                    Action::None
-                }
-            }
-            Key::MouseUp { row, col } => {
-                if self.sel_anchor.is_some() {
-                    self.sel_cur = Some((row, col));
-                    let text = self.extract_selection();
-                    self.sel_anchor = None;
-                    self.sel_cur = None;
-                    if !text.trim().is_empty() {
-                        if Self::copy_to_clipboard(&text) {
-                            self.copied_notice = Some(format!("已复制 {} 字符", text.trim().chars().count()));
-                        } else {
-                            self.copied_notice = Some("未找到剪贴板工具（wl-copy/xsel/xclip）".into());
-                        }
-                    }
-                }
-                Action::Redraw
-            }
+            Key::MouseDown { .. } | Key::MouseDrag { .. } | Key::MouseUp { .. } => Action::None,
             Key::PasteStart => {
                 self.in_paste = true;
                 self.paste_prev_cr = false;
@@ -1070,10 +1104,18 @@ impl Tui {
             }
             Key::CtrlD => Action::Quit,
             Key::CtrlL => Action::Redraw,
+            Key::CtrlO => {
+                let _ = self.copy_last_assistant();
+                Action::Redraw
+            }
             Key::Esc => {
-                self.input.clear();
-                self.cursor = 0;
-                Action::None
+                if self.streaming {
+                    Action::Cancel
+                } else {
+                    self.input.clear();
+                    self.cursor = 0;
+                    Action::None
+                }
             }
             Key::Unknown => Action::None,
         }
@@ -1925,13 +1967,66 @@ impl Tui {
         out.push_str(&format!("\x1b[{row};{col}H{C_CURSOR}{cursor_char}\x1b[0m"));
         out
     }
+    fn cursor_tail_start(frame: &str) -> Option<usize> {
+        let bytes = frame.as_bytes();
+        let mut index = 0usize;
+        let mut found = None;
+        while index + 2 < bytes.len() {
+            if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+                index += 1;
+                continue;
+            }
+            let mut end = index + 2;
+            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                break;
+            }
+            if bytes[end] == b'H' {
+                let params = &frame[index + 2..end];
+                if params.contains(';')
+                    && params.bytes().all(|byte| byte.is_ascii_digit() || byte == b';')
+                {
+                    found = Some(index);
+                }
+            }
+            index = end + 1;
+        }
+        found
+    }
+    fn differential_frame(previous: &str, current: &str) -> String {
+        if previous.is_empty() {
+            return current.to_string();
+        }
+        let old_tail_at = Self::cursor_tail_start(previous).unwrap_or(previous.len());
+        let new_tail_at = Self::cursor_tail_start(current).unwrap_or(current.len());
+        let old_rows: Vec<&str> = previous[..old_tail_at].split("\r\n").collect();
+        let new_rows: Vec<&str> = current[..new_tail_at].split("\r\n").collect();
+        let mut update = String::new();
+        for row_index in 0..old_rows.len().max(new_rows.len()) {
+            let old = old_rows.get(row_index).copied().unwrap_or("");
+            let new = new_rows.get(row_index).copied().unwrap_or("");
+            if old != new {
+                update.push_str(&format!("\x1b[{};1H", row_index + 1));
+                if new.is_empty() {
+                    update.push_str("\x1b[K");
+                } else {
+                    update.push_str(new);
+                }
+            }
+        }
+        update.push_str(&current[new_tail_at..]);
+        update
+    }
     pub fn redraw(&mut self) {
         self.resize();
         let frame = self.build_frame();
         if frame == self.last_frame {
             return;
         }
-        print!("{frame}");
+        let update = Self::differential_frame(&self.last_frame, &frame);
+        print!("\x1b[?2026h{update}\x1b[?2026l");
         let _ = std::io::stdout().flush();
         self.last_frame = frame;
     }
@@ -2121,6 +2216,14 @@ impl KeyParser {
     pub fn new() -> Self {
         KeyParser { buf: Vec::with_capacity(8) }
     }
+    pub fn flush_pending_escape(&mut self) -> Option<Key> {
+        if self.buf.as_slice() == [0x1b] {
+            self.buf.clear();
+            Some(Key::Esc)
+        } else {
+            None
+        }
+    }
     pub fn feed(&mut self, b: u8) -> Option<Key> {
         self.buf.push(b);
         if b >= 0x80 {
@@ -2193,6 +2296,7 @@ impl KeyParser {
             0x03 => Key::CtrlC,
             0x04 => Key::CtrlD,
             0x0c => Key::CtrlL,
+            0x0f => Key::CtrlO,
             0x1b => Key::Esc,
             b => {
                 let c = b as char;
@@ -2260,7 +2364,11 @@ mod tests {
         assert!(matches!(p.feed(0x0d), Some(Key::Enter)));
         assert!(matches!(p.feed(0x0a), Some(Key::Char('\n'))));
         assert!(matches!(p.feed(0x09), Some(Key::Tab)));
+        assert!(matches!(p.feed(0x0f), Some(Key::CtrlO)));
         assert!(matches!(p.feed(0x7f), Some(Key::Backspace)));
+        assert!(p.feed(0x1b).is_none());
+        assert!(matches!(p.flush_pending_escape(), Some(Key::Esc)));
+        assert!(p.flush_pending_escape().is_none());
     }
     #[test]
     fn pasted_newline_inserts_not_submits() {
@@ -2337,27 +2445,22 @@ mod tests {
         assert!(t2.hist_pos.is_some(), "无排队时 ↑ 应回填历史");
     }
     #[test]
-    fn mouse_drag_select_extracts_text() {
+    fn mouse_drag_is_owned_by_terminal_not_tui() {
         let mut t = Tui::new();
-        t.w = 60;
-        t.h = 20;
-        t.push_user("第一行内容".into());
-        t.push_user("第二行内容".into());
-        let frame = t.build_frame();               
-        assert!(!t.sel_rows.is_empty(), "build_frame 应收集可见行纯文本");
-        assert!(strip_ansi(&frame).contains("第一行内容"));
-        let start_row = t.sel_start_row + 2;
-        let _ = t.handle_key(Key::MouseDown { row: start_row, col: 2 });
-        let _ = t.handle_key(Key::MouseDrag { row: start_row, col: 6 });
-        let text = t.extract_selection();
-        let _ = t.handle_key(Key::MouseUp { row: start_row, col: 6 });
-        assert!(t.sel_anchor.is_none(), "松开后选中状态清除");
-        assert!(!text.is_empty(), "应提取到文本: {:?}", text);
-        assert_eq!(
-            t.copied_notice.as_deref(),
-            Some("未找到剪贴板工具（wl-copy/xsel/xclip）"),
-            "测试环境复制应走失败分支"
-        );
+        assert_eq!(t.handle_key(Key::MouseDown { row: 20, col: 4 }), Action::None);
+        assert_eq!(t.handle_key(Key::MouseDrag { row: 21, col: 8 }), Action::None);
+        assert_eq!(t.handle_key(Key::MouseUp { row: 21, col: 8 }), Action::None);
+        assert!(t.sel_anchor.is_none());
+        assert!(t.sel_cur.is_none());
+    }
+    #[test]
+    fn differential_frame_only_rewrites_changed_rows() {
+        let old = "\x1b[Hone\r\ntwo\r\n\x1b[3;4H";
+        let new = "\x1b[Hone\r\nchanged\r\n\x1b[3;4H";
+        let update = Tui::differential_frame(old, new);
+        assert!(update.contains("\x1b[2;1Hchanged"));
+        assert!(!update.contains("\x1b[1;1H"));
+        assert!(update.ends_with("\x1b[3;4H"));
     }
     #[test]
     fn perm_panel_keys_focus_and_submit() {

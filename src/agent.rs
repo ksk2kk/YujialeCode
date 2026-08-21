@@ -243,6 +243,8 @@ pub struct Agent {
     perm_auto: Arc<AtomicBool>,
     perm_allowed: Arc<Mutex<HashSet<String>>>,
     perm_seq: Arc<AtomicU64>,
+    pub last_usage: crate::llm::Usage,
+    pub last_timings: crate::llm::Timings,
 }
 impl Agent {
     pub fn with_store(
@@ -270,6 +272,8 @@ impl Agent {
             perm_auto: Arc::new(AtomicBool::new(false)),
             perm_allowed: Arc::new(Mutex::new(HashSet::new())),
             perm_seq: Arc::new(AtomicU64::new(0)),
+            last_usage: crate::llm::Usage::default(),
+            last_timings: crate::llm::Timings::default(),
         }
     }
     pub fn set_ask_channels(&mut self, tx: Sender<AskRequest>, rx: Receiver<AskAnswer>) {
@@ -353,6 +357,8 @@ impl Agent {
     }
     pub fn run_turn(&mut self, user_input: &str, on_event: &mut impl FnMut(AgentEvent)) -> Result<String, String> {
         self.cancel.store(false, Ordering::Relaxed);
+        self.last_usage = crate::llm::Usage::default();
+        self.last_timings = crate::llm::Timings::default();
         let trace_enabled = self.cfg.trace.enabled;
         let session_id = self.store.current_id().to_string();
         let trace_session = session_id.clone();
@@ -463,6 +469,7 @@ impl Agent {
                     }
                 }
             };
+            self.acc_usage(&result);
             if trace_enabled {
                 if !result.reasoning.is_empty() {
                     trace_record_at(
@@ -768,6 +775,24 @@ impl Agent {
         }
         Ok(final_text)
     }
+    fn acc_usage(&mut self, result: &crate::llm::ChatResult) {
+        if let Some(usage) = result.usage {
+            self.last_usage.prompt_tokens += usage.prompt_tokens;
+            self.last_usage.completion_tokens += usage.completion_tokens;
+            self.last_usage.cache_read_tokens += usage.cache_read_tokens;
+            self.last_usage.cache_miss_tokens += usage.cache_miss_tokens;
+            self.last_usage.cache_prefix_hits += usage.cache_prefix_hits;
+            self.last_usage.cache_prefix_misses += usage.cache_prefix_misses;
+            self.last_usage.cache_prefix_messages = self
+                .last_usage
+                .cache_prefix_messages
+                .max(usage.cache_prefix_messages);
+        }
+        if let Some(timings) = result.timings {
+            self.last_timings.predicted_n += timings.predicted_n;
+            self.last_timings.predicted_ms += timings.predicted_ms;
+        }
+    }
     fn finalize_without_tools(
         &mut self,
         reason: &str,
@@ -787,7 +812,11 @@ impl Agent {
         let fallback = format!(
             "工具阶段已停止：{reason}。本地模型没有生成可用的最终答复，请缩小任务范围或补充信息后重试。"
         );
-        match self.llm.stream_without_reasoning(&req, &self.cancel, |_| {}) {
+        let attempt = self.llm.stream_without_reasoning(&req, &self.cancel, |_| {});
+        if let Ok(result) = &attempt {
+            self.acc_usage(result);
+        }
+        match attempt {
             Ok(result)
                 if result.tool_calls.is_empty()
                     && !result.text.trim().is_empty()
