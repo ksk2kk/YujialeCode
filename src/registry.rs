@@ -11,7 +11,7 @@ pub struct Category {
 pub const CATEGORIES: &[Category] = &[
     Category {
         id: "core",
-        title: "核心操作（系统提示词内建，无需查询）",
+        title: "核心操作（仅这两个原生暴露）",
         tools: &[
             ToolDef {
                 name: "execute_command",
@@ -22,6 +22,17 @@ pub const CATEGORIES: &[Category] = &[
                 name: "list_tools",
                 desc: "分类列出可用工具；指定 category 查看该分类工具说明",
                 args: "{\"category\":\"file\"} 可选",
+            },
+        ],
+    },
+    Category {
+        id: "tools",
+        title: "工具注册器",
+        tools: &[
+            ToolDef {
+                name: "make_tools",
+                desc: "严格校验并热注册脚本工具；注册后立即出现在 custom 分类，无需重启",
+                args: "{\"name\":\"tool_name\",\"description\":\"何时调用、做什么、返回什么（20-500字）\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"script\":\"#!/bin/sh\\n# 参数 JSON 在 $1\",\"timeout_secs\":120}",
             },
         ],
     },
@@ -108,6 +119,13 @@ pub const CATEGORIES: &[Category] = &[
             ToolDef { name: "ask_user", desc: "Claude Code 式结构化提问；1-4 题、每题 2-4 个选项，界面自动提供 Other；仅 TUI", args: "{\"questions\":[{\"question\":\"...?\",\"header\":\"短标题\",\"options\":[{\"label\":\"选项\",\"description\":\"影响\"}],\"multiSelect\":false}]}" },
         ],
     },
+    Category {
+        id: "goal",
+        title: "持续目标",
+        tools: &[
+            ToolDef { name: "goal", desc: "读取目标状态，或在严格完成审计后标记 complete；同一不可克服原因连续三轮才可 blocked", args: "{\"action\":\"get\"} 或 {\"action\":\"update\",\"status\":\"complete|blocked\",\"reason\":\"证据或阻塞原因\"}" },
+        ],
+    },
 ];
 pub fn find_category(id: &str) -> Option<&'static Category> {
     CATEGORIES.iter().find(|c| c.id == id)
@@ -136,24 +154,8 @@ pub fn native_tools_json() -> serde_json::Value {
         {
             "type": "function",
             "function": {
-                "name": "readline",
-                "description": "Read a local text file. This is the only allowed way to read file contents; never use execute_command, cat, sed, or head. Lines are 1-based and every returned page is complete. Continue from the explicit next offset when present.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "absolute or workspace-relative file path" },
-                        "offset": { "type": "integer", "minimum": 1, "description": "1-based first line; defaults to 1" },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "maximum lines in this complete page; defaults to 2000" }
-                    },
-                    "required": ["path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "execute_command",
-                "description": "Run, build, test, or perform shell-only work. Never read files with cat/sed/head; use readline. Can dispatch other tools with {\"op\":\"<tool>\",\"args\":{...}}.",
+                "description": "Execute a shell command, or dispatch any discovered tool with {\"op\":\"<tool>\",\"args\":{...}}. File reads must dispatch readline; cat/sed/head reads are rejected in code.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -172,56 +174,8 @@ pub fn native_tools_json() -> serde_json::Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "category": { "type": "string", "description": "category id, e.g. file, sec, net, skill" }
+                        "category": { "type": "string", "description": "category id; omit for the compact category index" }
                     }
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "ask_user",
-                "description": "Ask 1-4 structured multiple-choice questions. The UI automatically provides Other for custom text. Put a recommended option first and suffix its label with (Recommended).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "questions": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 4,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "question": { "type": "string", "description": "Clear, specific question" },
-                                    "header": { "type": "string", "description": "Very short label, max 12 characters" },
-                                    "options": {
-                                        "type": "array",
-                                        "minItems": 2,
-                                        "maxItems": 4,
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "label": { "type": "string", "description": "Concise display label, 1-5 words" },
-                                                "description": { "type": "string", "description": "Meaning, impact, or trade-off" },
-                                                "preview": { "type": "string", "description": "Optional text preview" }
-                                            },
-                                            "required": ["label", "description"]
-                                        }
-                                    },
-                                    "multiSelect": { "type": "boolean", "description": "Allow multiple selections" }
-                                },
-                                "required": ["question", "header", "options", "multiSelect"]
-                            },
-                            "description": "Questions to ask (1-4); do not add an Other option"
-                        },
-                        "metadata": {
-                            "type": "object",
-                            "properties": {
-                                "source": { "type": "string", "description": "Optional source identifier" }
-                            }
-                        }
-                    },
-                    "required": ["questions"]
                 }
             }
         }
@@ -255,18 +209,17 @@ mod tests {
         assert!(list_category_text("nope").is_none());
     }
     #[test]
-    fn native_tools_expose_read_as_a_core_tool() {
+    fn native_tools_are_exactly_two_stable_dispatchers() {
         let v = native_tools_json();
         let arr = v.as_array().unwrap();
-        assert_eq!(arr.len(), 4);
-        assert_eq!(arr[0]["function"]["name"], "readline");
+        assert_eq!(arr.len(), 2);
         let names: Vec<&str> = arr
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"list_tools"));
-        assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"execute_command"));
+        assert_eq!(names, vec!["execute_command", "list_tools"]);
     }
     #[test]
     fn find_tool_works() {

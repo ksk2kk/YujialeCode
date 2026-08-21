@@ -54,7 +54,7 @@ pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
         None => cleaned.clone(),
     };
     let mut args = object_from_value(&op, raw_args, &mut notes);
-    flatten_wrappers(&mut args, &mut notes);
+    flatten_wrappers(&op, &mut args, &mut notes);
     if op == "execute_command" {
         alias_key(&mut args, "cmd", &["command", "shell", "script"], &mut notes);
         let target = string_at(&args, &["op", "tool", "tool_name", "function"]);
@@ -175,11 +175,14 @@ fn object_from_value(op: &str, value: &Value, notes: &mut Vec<String>) -> Map<St
         }
     }
 }
-fn flatten_wrappers(args: &mut Map<String, Value>, notes: &mut Vec<String>) {
+fn flatten_wrappers(op: &str, args: &mut Map<String, Value>, notes: &mut Vec<String>) {
     for _ in 0..3 {
-        let wrapper = ["arguments", "parameters", "params", "payload", "request", "input"]
-            .into_iter()
-            .find(|key| args.contains_key(*key));
+        let wrappers: &[&str] = if op == "make_tools" {
+            &["arguments", "params", "payload", "request", "input"]
+        } else {
+            &["arguments", "parameters", "params", "payload", "request", "input"]
+        };
+        let wrapper = wrappers.iter().copied().find(|key| args.contains_key(*key));
         let Some(key) = wrapper else { break };
         let Some(raw_inner) = args.get(key).cloned() else { break };
         let inner = match raw_inner {
@@ -645,6 +648,26 @@ mod tests {
         assert_eq!(call.args["query"], "rust async");
         assert_eq!(call.args["count"], 5);
         assert!(!call.notes.is_empty());
+    }
+    #[test]
+    fn make_tools_parameters_schema_is_not_treated_as_a_wrapper() {
+        let call = normalize_call(
+            "make_tools",
+            &json!({
+                "name":"system_status",
+                "description":"读取系统运行状态并返回清晰的纯文本结果，适合诊断机器负载。",
+                "parameters":{
+                    "type":"object",
+                    "properties":{},
+                    "required":[],
+                    "additionalProperties":false
+                },
+                "script":"#!/bin/sh\nuptime"
+            }),
+        );
+        assert_eq!(call.op, "make_tools");
+        assert_eq!(call.args["parameters"]["type"], "object");
+        assert!(call.args["parameters"]["properties"].is_object());
     }
     #[test]
     fn dispatch_and_wrong_tool_are_forced_to_intent() {

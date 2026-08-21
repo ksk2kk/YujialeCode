@@ -92,6 +92,7 @@ pub struct ToolCtx<'a> {
 pub const KNOWN_OPS: &[&str] = &[
     "execute_command",
     "list_tools",
+    "make_tools",
     "readline",
     "writefile",
     "editline",
@@ -121,8 +122,42 @@ pub const KNOWN_OPS: &[&str] = &[
     "memory_search",
     "memory_write",
     "ask_user",
+    "goal",
 ];
 pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
+    if op.eq_ignore_ascii_case("make_tools") || op.eq_ignore_ascii_case("make-tools") {
+        let spec = make_tools_payload(args);
+        return crate::dynamic_tools::register(ctx.cfg, &spec, KNOWN_OPS);
+    }
+    if let Some(tool) = crate::dynamic_tools::load(ctx.cfg, op) {
+        return execute_dynamic_tool(&tool, args, ctx);
+    }
+    if op == "execute_command" {
+        let recovered_cmd = args
+            .get("cmd")
+            .and_then(Value::as_str)
+            .map(crate::tool_compat::parse_args)
+            .filter(|value| dispatch_name(value).is_some());
+        let dispatch = if dispatch_name(args).is_some() {
+            Some(args)
+        } else if let Some(inner) = args.get("args").filter(|inner| dispatch_name(inner).is_some()) {
+            Some(inner)
+        } else {
+            recovered_cmd.as_ref()
+        };
+        if let Some(dispatch) = dispatch {
+            if let Some(name) = dispatch_name(dispatch) {
+                let inner = dispatch_payload(dispatch, name);
+                if name.eq_ignore_ascii_case("make_tools") || name.eq_ignore_ascii_case("make-tools") {
+                    let spec = make_tools_payload(&inner);
+                    return crate::dynamic_tools::register(ctx.cfg, &spec, KNOWN_OPS);
+                }
+                if let Some(tool) = crate::dynamic_tools::load(ctx.cfg, name) {
+                    return execute_dynamic_tool(&tool, &inner, ctx);
+                }
+            }
+        }
+    }
     let call = crate::tool_compat::normalize_call(op, args);
     let note = if matches!(call.op.as_str(), "readline" | "listdir") {
         None
@@ -136,17 +171,72 @@ pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, Stri
         (None, result) => result,
     }
 }
+fn dispatch_name(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    ["op", "tool", "tool_name", "function"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(Value::as_str))
+}
+fn dispatch_payload(dispatch: &Value, target: &str) -> Value {
+    let Some(object) = dispatch.as_object() else {
+        return json!({});
+    };
+    let wrappers: &[&str] = if target.eq_ignore_ascii_case("make_tools")
+        || target.eq_ignore_ascii_case("make-tools")
+    {
+        &["args", "arguments", "params", "input", "payload", "request"]
+    } else {
+        &["args", "arguments", "parameters", "params", "input", "payload", "request"]
+    };
+    if let Some(value) = wrappers.iter().find_map(|key| object.get(*key)) {
+        return match value {
+            Value::String(raw) => crate::tool_compat::parse_args(raw),
+            other => other.clone(),
+        };
+    }
+    let mut flat = object.clone();
+    for key in ["op", "tool", "tool_name", "function"] {
+        flat.remove(key);
+    }
+    Value::Object(flat)
+}
+fn make_tools_payload(raw: &Value) -> Value {
+    let parsed = match raw {
+        Value::String(text) => crate::tool_compat::parse_args(text),
+        other => other.clone(),
+    };
+    let Some(object) = parsed.as_object() else {
+        return parsed;
+    };
+    for key in ["args", "arguments", "params", "input", "payload", "request"] {
+        if object.len() == 1 {
+            if let Some(inner) = object.get(key) {
+                return match inner {
+                    Value::String(text) => crate::tool_compat::parse_args(text),
+                    other => other.clone(),
+                };
+            }
+        }
+    }
+    parsed
+}
 fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     match op {
         "execute_command" => execute_command(args, ctx),
         "list_tools" => {
             let cat = args.get("category").and_then(|c| c.as_str());
             Ok(match cat {
+                Some(crate::dynamic_tools::CUSTOM_CATEGORY) => crate::dynamic_tools::list_detail(ctx.cfg),
                 Some(c) => list_category_text(c)
                     .ok_or_else(|| format!("未知分类: {c}（无参数调用 list_tools 查看分类目录）"))?,
-                None => list_categories_text(),
+                None => {
+                    let mut index = list_categories_text();
+                    index.push_str(&crate::dynamic_tools::list_index_line(ctx.cfg));
+                    index
+                }
             })
         }
+        "make_tools" => crate::dynamic_tools::register(ctx.cfg, args, KNOWN_OPS),
         "readline" => file_read(args),
         "writefile" => file_write(args),
         "editline" => file_edit(args),
@@ -176,7 +266,11 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "memory_search" => memory_search(args, ctx),
         "memory_write" => memory_write(args, ctx),
         "ask_user" => ask_user(args, ctx),
-        _ => Err(format!("未知工具: {op}（list_tools 查看可用工具）")),
+        "goal" => crate::goal::execute_tool(ctx.cfg, ctx.store.current_id(), args),
+        _ => match crate::dynamic_tools::load(ctx.cfg, op) {
+            Some(tool) => execute_dynamic_tool(&tool, args, ctx),
+            None => Err(format!("未知工具: {op}（list_tools 查看可用工具）")),
+        },
     }
 }
 fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
@@ -335,6 +429,14 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
             Err(e) => return Err(format!("等待命令失败: {e}")),
         }
     }
+}
+fn execute_dynamic_tool(
+    tool: &crate::dynamic_tools::DynamicTool,
+    args: &Value,
+    ctx: &mut ToolCtx,
+) -> Result<String, String> {
+    let cmd = crate::dynamic_tools::invocation_command(ctx.cfg, tool, args)?;
+    execute_command(&json!({"cmd":cmd,"timeout":tool.timeout_secs}), ctx)
 }
 fn shell_invokes_cat(command: &str) -> bool {
     shell_command_segments(command)
@@ -2264,6 +2366,66 @@ mod tests {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_dispatch_store"));
         let r = execute("execute_command", &json!({"op": "list_tools", "args": {}}), &mut t.ctx()).unwrap();
         assert!(r.contains("[file]"));
+    }
+    fn hot_registration_spec(name: &str) -> Value {
+        json!({
+            "name":name,
+            "description":"读取系统运行状态并返回清晰的纯文本结果；适合诊断机器负载和在线时间。",
+            "parameters":{
+                "type":"object",
+                "properties":{},
+                "required":[],
+                "additionalProperties":false
+            },
+            "script":"#!/bin/sh\nprintf 'registered-ok\\n'",
+            "timeout_secs":30
+        })
+    }
+    #[test]
+    fn execute_command_registers_and_runs_hot_tool_without_restart() {
+        let dir = std::env::temp_dir().join(format!("yjlcoder_hot_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut t = TestCtx::new(dir.join("sessions"));
+        t.cfg.set_test_data_dir(dir.clone());
+        let spec = hot_registration_spec("system_status_test");
+        let registered = execute(
+            "execute_command",
+            &json!({"op":"make_tools", "args":spec}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(registered.contains("已热注册工具 system_status_test"));
+        let output = execute(
+            "execute_command",
+            &json!({"op":"system_status_test", "args":{}}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(output.contains("registered-ok"));
+        assert!(execute("list_tools", &json!({"category":"custom"}), &mut t.ctx())
+            .unwrap()
+            .contains("system_status_test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn execute_command_recovers_make_tools_json_accidentally_put_in_cmd() {
+        let dir = std::env::temp_dir().join(format!("yjlcoder_make_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut t = TestCtx::new(dir.join("sessions"));
+        t.cfg.set_test_data_dir(dir.clone());
+        let dispatch = json!({
+            "op":"make_tools",
+            "args":hot_registration_spec("system_status_cmd_test")
+        });
+        let result = execute(
+            "execute_command",
+            &json!({"cmd":serde_json::to_string(&dispatch).unwrap()}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(result.contains("已热注册工具 system_status_cmd_test"));
+        assert!(crate::dynamic_tools::load(&t.cfg, "system_status_cmd_test").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn execute_command_self_op_runs_cmd() {
