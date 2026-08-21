@@ -322,7 +322,7 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                             || goal_control_is_safe_while_running(&cmd);
                         if turns.is_active() && !live_cmd {
                             tui.push_warn(
-                                "当前回合仍在运行，斜杠命令未执行；请等待完成或按 Esc/Ctrl+C 中断".into(),
+                                "当前回合仍在运行，斜杠命令未执行；请等待完成或按 Esc 中断".into(),
                             );
                         } else {
                             let (command_name, command_args) = cmd

@@ -17,6 +17,11 @@ const C_BG_CODE: &str = "\x1b[48;5;234m";
 const C_GRAY: &str = "\x1b[244m";                
 const C_SUGGEST: &str = "\x1b[209m";                                 
 const C_BG_ASK_TAB: &str = "\x1b[48;5;173;30m";                        
+// 与 Claude Code Best 的 AlternateScreen 相同：在备用屏幕中开启普通鼠标、
+// 按钮拖动和 SGR 扩展坐标。这样终端会把滚轮作为独立鼠标事件发送，键盘
+// ↑/↓ 仍然是方向键；1002 只在按住按钮时报告移动，避免无意义的悬停刷新。
+const ENABLE_MOUSE_TRACKING: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const DISABLE_MOUSE_TRACKING: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChatRole {
     User,
@@ -260,7 +265,7 @@ impl Tui {
             hist_pos: None,
             streaming: false,
             prompt: "❯ ".into(),
-            hint: "  ⏸ 本地模式 · /help 查看命令 · Ctrl+C 中断 · ←→ 移动光标 · ↑ 撤销排队".into(),
+            hint: "  ⏸ 本地模式 · /help 查看命令 · Esc 中断 · 滚轮滚动对话 · ↑ 撤销排队/历史".into(),
             input_scroll: 0,
             commands: &[],
             asking: None,
@@ -336,7 +341,7 @@ impl Tui {
                 };
                 Action::PermSubmit(kind)
             }
-            Key::Esc | Key::CtrlC => Action::PermSubmit(crate::tools::PermDecisionKind::No),
+            Key::Esc => Action::PermSubmit(crate::tools::PermDecisionKind::No),
             Key::Char('1') => Action::PermSubmit(crate::tools::PermDecisionKind::Yes),
             Key::Char('2') => Action::PermSubmit(crate::tools::PermDecisionKind::AlwaysAllow),
             Key::Char('3') => Action::PermSubmit(crate::tools::PermDecisionKind::No),
@@ -350,13 +355,13 @@ impl Tui {
     pub fn enter(&mut self) -> RawGuard {
         let g = RawGuard::enable();
         self.resize();
-        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h");
+        print!("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h{ENABLE_MOUSE_TRACKING}");
         self.last_frame.clear();
         let _ = std::io::stdout().flush();
         g
     }
     pub fn exit(&mut self) {
-        print!("\x1b[?2004l\x1b[?25h\x1b[?7h\x1b[?1049l");
+        print!("{DISABLE_MOUSE_TRACKING}\x1b[?2004l\x1b[?25h\x1b[?7h\x1b[?1049l");
         let _ = std::io::stdout().flush();
     }
     fn resize(&mut self) {
@@ -784,7 +789,7 @@ impl Tui {
                 self.scroll = self.scroll.saturating_sub(self.chat_height().saturating_sub(1).max(1));
                 Action::None
             }
-            Key::CtrlC | Key::Esc => Action::Cancel,
+            Key::Esc => Action::Cancel,
             Key::CtrlD => Action::Quit,
             Key::CtrlL => Action::Redraw,
             _ => Action::None,
@@ -812,25 +817,28 @@ impl Tui {
             .map(|(i, _)| i)
             .unwrap_or(self.input.len())
     }
-    #[allow(dead_code)]
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (Some(anchor), Some(focus)) = (self.sel_anchor, self.sel_cur) else {
+            return None;
+        };
+        Some(if anchor <= focus { (anchor, focus) } else { (focus, anchor) })
+    }
     fn extract_selection(&self) -> String {
-        let (Some(a), Some(c)) = (self.sel_anchor, self.sel_cur) else {
+        let Some((start, end)) = self.selection_bounds() else {
             return String::new();
         };
-        let (r0, r1) = (a.0.min(c.0), a.0.max(c.0));
-        let (c0, c1) = (a.1.min(c.1), a.1.max(c.1));
         let mut out: Vec<String> = Vec::new();
         for (i, line) in self.sel_rows.iter().enumerate() {
             let row = self.sel_start_row + i;                
-            if row < r0 || row > r1 {
+            if row < start.0 || row > end.0 {
                 continue;
             }
-            let cols = if r0 == r1 {
-                (c0, c1)
-            } else if row == r0 {
-                (c0, usize::MAX)
-            } else if row == r1 {
-                (0, c1)
+            let cols = if start.0 == end.0 {
+                (start.1, end.1)
+            } else if row == start.0 {
+                (start.1, usize::MAX)
+            } else if row == end.0 {
+                (0, end.1)
             } else {
                 (0, usize::MAX)
             };
@@ -845,27 +853,23 @@ impl Tui {
                 .filter(|(keep, _)| *keep)
                 .map(|(_, ch)| ch)
                 .collect();
-            if !s.trim().is_empty() {
-                out.push(s.trim_end().to_string());
-            }
+            out.push(s.trim_end().to_string());
         }
-        out.join("\n")
+        out.join("\n").trim_matches('\n').to_string()
     }
     fn apply_selection_highlight(&self, styled: &str, row_abs: usize) -> String {
-        let (Some(a), Some(c)) = (self.sel_anchor, self.sel_cur) else {
+        let Some((start, end)) = self.selection_bounds() else {
             return styled.to_string();
         };
-        let (r0, r1) = (a.0.min(c.0), a.0.max(c.0));
-        let (c0, c1) = (a.1.min(c.1), a.1.max(c.1));
-        if row_abs < r0 || row_abs > r1 {
+        if row_abs < start.0 || row_abs > end.0 {
             return styled.to_string();
         }
-        let cols = if r0 == r1 {
-            (c0, c1)
-        } else if row_abs == r0 {
-            (c0, usize::MAX)
-        } else if row_abs == r1 {
-            (0, c1)
+        let cols = if start.0 == end.0 {
+            (start.1, end.1)
+        } else if row_abs == start.0 {
+            (start.1, usize::MAX)
+        } else if row_abs == end.0 {
+            (0, end.1)
         } else {
             (0, usize::MAX)
         };
@@ -901,6 +905,46 @@ impl Tui {
             out.push_str("\x1b[27m");
         }
         out
+    }
+    fn mouse_selection_point(&self, row: usize, col: usize, clamp: bool) -> Option<(usize, usize)> {
+        if self.sel_rows.is_empty() {
+            return None;
+        }
+        let first = self.sel_start_row;
+        let last = first + self.sel_rows.len() - 1;
+        let row = if clamp {
+            row.clamp(first, last)
+        } else if (first..=last).contains(&row) {
+            row
+        } else {
+            return None;
+        };
+        // SGR 鼠标坐标从 1 开始；内部文本列从 0 开始。
+        Some((row, col.saturating_sub(1)))
+    }
+    fn finish_mouse_selection(&mut self, row: usize, col: usize) -> Action {
+        let Some(point) = self.mouse_selection_point(row, col, true) else {
+            return Action::None;
+        };
+        self.sel_cur = Some(point);
+        let text = self.extract_selection();
+        if text.is_empty() {
+            self.sel_anchor = None;
+            self.sel_cur = None;
+            return Action::Redraw;
+        }
+        if cfg!(test) {
+            self.copied_notice = Some(format!("已复制选区 · {} 字符", text.chars().count()));
+            return Action::Redraw;
+        }
+        match crate::clipboard_copy::copy_to_clipboard(&text) {
+            Ok(lease) => {
+                self.clipboard_lease = lease;
+                self.copied_notice = Some(format!("已复制选区 · {} 字符", text.chars().count()));
+            }
+            Err(error) => self.copied_notice = Some(format!("复制失败: {error}")),
+        }
+        Action::Redraw
     }
     #[allow(dead_code)]
     fn copy_to_clipboard(text: &str) -> bool {
@@ -1073,7 +1117,36 @@ impl Tui {
                 self.scroll = self.scroll.saturating_sub(3);
                 Action::None
             }
-            Key::MouseDown { .. } | Key::MouseDrag { .. } | Key::MouseUp { .. } => Action::None,
+            Key::MouseDown { row, col } => {
+                if let Some(point) = self.mouse_selection_point(row, col, false) {
+                    self.sel_anchor = Some(point);
+                    self.sel_cur = Some(point);
+                    self.copied_notice = None;
+                    Action::Redraw
+                } else {
+                    self.sel_anchor = None;
+                    self.sel_cur = None;
+                    Action::None
+                }
+            }
+            Key::MouseDrag { row, col } => {
+                if self.sel_anchor.is_none() {
+                    return Action::None;
+                }
+                if let Some(point) = self.mouse_selection_point(row, col, true) {
+                    self.sel_cur = Some(point);
+                    Action::Redraw
+                } else {
+                    Action::None
+                }
+            }
+            Key::MouseUp { row, col } => {
+                if self.sel_anchor.is_some() {
+                    self.finish_mouse_selection(row, col)
+                } else {
+                    Action::None
+                }
+            }
             Key::PasteStart => {
                 self.in_paste = true;
                 self.paste_prev_cr = false;
@@ -1095,7 +1168,8 @@ impl Tui {
             }
             Key::CtrlC => {
                 if self.streaming {
-                    Action::Cancel
+                    // 运行中的唯一中断键是 Esc。Ctrl+C 不再误杀当前任务。
+                    Action::None
                 } else {
                     self.input.clear();
                     self.cursor = 0;
@@ -2258,15 +2332,21 @@ impl KeyParser {
                         .unwrap_or((rest, true));
                     let mut parts = body.split(';');
                     let btn: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let row: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    // SGR 顺序固定为 button;column;row。旧实现把后两项
+                    // 读反，导致从窗口下方拖拽时选区跳到上方。
                     let col: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    return Some(match btn {
-                        64 => Key::WheelUp,
-                        65 => Key::WheelDown,
-                        0..=3 if pressed => Key::MouseDown { row, col },
-                        32..=35 if pressed => Key::MouseDrag { row, col },
-                        _ if !pressed => Key::MouseUp { row, col },
-                        _ => Key::Unknown,
+                    let row: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let base_button = btn & 0x03;
+                    return Some(if (btn & 0x40) != 0 {
+                        if base_button == 0 { Key::WheelUp } else { Key::WheelDown }
+                    } else if pressed && (btn & 0x20) != 0 && base_button == 0 {
+                        Key::MouseDrag { row, col }
+                    } else if pressed && base_button == 0 {
+                        Key::MouseDown { row, col }
+                    } else if !pressed && base_button == 0 {
+                        Key::MouseUp { row, col }
+                    } else {
+                        Key::Unknown
                     });
                 }
                 return Some(match seq.as_str() {
@@ -2445,13 +2525,15 @@ mod tests {
         assert!(t2.hist_pos.is_some(), "无排队时 ↑ 应回填历史");
     }
     #[test]
-    fn mouse_drag_is_owned_by_terminal_not_tui() {
+    fn mouse_drag_uses_real_screen_coordinates_and_copies_bottom_to_top() {
         let mut t = Tui::new();
-        assert_eq!(t.handle_key(Key::MouseDown { row: 20, col: 4 }), Action::None);
-        assert_eq!(t.handle_key(Key::MouseDrag { row: 21, col: 8 }), Action::None);
-        assert_eq!(t.handle_key(Key::MouseUp { row: 21, col: 8 }), Action::None);
-        assert!(t.sel_anchor.is_none());
-        assert!(t.sel_cur.is_none());
+        t.sel_start_row = 5;
+        t.sel_rows = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+        assert_eq!(t.handle_key(Key::MouseDown { row: 7, col: 3 }), Action::Redraw);
+        assert_eq!(t.handle_key(Key::MouseDrag { row: 5, col: 4 }), Action::Redraw);
+        assert_eq!(t.extract_selection(), "ha\nbravo\ncha");
+        assert_eq!(t.handle_key(Key::MouseUp { row: 5, col: 4 }), Action::Redraw);
+        assert!(t.copied_notice.as_deref().is_some_and(|notice| notice.contains("已复制选区")));
     }
     #[test]
     fn differential_frame_only_rewrites_changed_rows() {
@@ -2474,6 +2556,8 @@ mod tests {
         };
         open(&mut t);
         assert!(t.is_perm_prompt());
+        assert_eq!(t.handle_key(Key::CtrlC), Action::None);
+        assert!(t.is_perm_prompt(), "Ctrl+C 不应关闭权限面板");
         assert!(matches!(
             t.handle_key(Key::Enter),
             Action::PermSubmit(crate::tools::PermDecisionKind::Yes)
@@ -2858,6 +2942,8 @@ mod tests {
             ],
             multi_select: false,
         }]);
+        assert_eq!(t.handle_key(Key::CtrlC), Action::None);
+        assert!(t.is_asking(), "Ctrl+C 不应打断 ask_user");
         let plain = strip_ansi(&t.build_frame());
         assert!(plain.contains("YJLcoder v"), "小终端仍保留固定欢迎栏");
         assert!(plain.contains("选择一个方案"));
@@ -3111,25 +3197,32 @@ mod tests {
         panic!("未解析出滚轮上事件");
     }
     #[test]
+    fn alternate_screen_enables_distinct_mouse_events() {
+        assert!(ENABLE_MOUSE_TRACKING.contains("?1000h"));
+        assert!(ENABLE_MOUSE_TRACKING.contains("?1002h"));
+        assert!(ENABLE_MOUSE_TRACKING.contains("?1006h"));
+        assert!(DISABLE_MOUSE_TRACKING.contains("?1006l"));
+    }
+    #[test]
     fn key_parser_sgr_mouse_down_drag_release() {
         let mut p = KeyParser::new();
         for b in "\x1b[<0;10;5M".bytes() {
             if let Some(k) = p.feed(b) {
-                assert_eq!(k, Key::MouseDown { row: 10, col: 5 });
+                assert_eq!(k, Key::MouseDown { row: 5, col: 10 });
                 break;
             }
         }
         let mut p = KeyParser::new();
         for b in "\x1b[<32;3;20M".bytes() {
             if let Some(k) = p.feed(b) {
-                assert_eq!(k, Key::MouseDrag { row: 3, col: 20 });
+                assert_eq!(k, Key::MouseDrag { row: 20, col: 3 });
                 break;
             }
         }
         let mut p = KeyParser::new();
         for b in "\x1b[<0;10;5m".bytes() {
             if let Some(k) = p.feed(b) {
-                assert_eq!(k, Key::MouseUp { row: 10, col: 5 });
+                assert_eq!(k, Key::MouseUp { row: 5, col: 10 });
                 return;
             }
         }
@@ -3167,6 +3260,14 @@ mod tests {
         let a = t.handle_key(Key::WheelDown);
         assert_eq!(a, Action::None);
         assert_eq!(t.scroll, 0, "滚轮下应回到底部");
+    }
+    #[test]
+    fn only_escape_interrupts_a_running_turn() {
+        let mut t = Tui::new();
+        t.begin_assistant();
+        assert_eq!(t.handle_key(Key::CtrlC), Action::None);
+        assert!(t.is_streaming(), "Ctrl+C 不应改变运行状态");
+        assert_eq!(t.handle_key(Key::Esc), Action::Cancel);
     }
     #[test]
     fn tool_block_not_shown_in_frame() {
