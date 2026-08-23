@@ -105,6 +105,20 @@ struct PermUi {
     cmd_kind: String,
     focus: usize,
 }
+#[derive(Debug, Clone)]
+struct CommandCompletion {
+    matches: Vec<&'static str>,
+    next_index: usize,
+    token_start: usize,
+    token_end: usize,
+    expected_input: String,
+    expected_cursor: usize,
+}
+struct CommandToken {
+    start: usize,
+    end: usize,
+    prefix: String,
+}
 struct AskPanel {
     lines: Vec<String>,
     cursor: Option<(usize, usize, char)>,
@@ -190,6 +204,7 @@ pub struct Tui {
     hint: String,
     input_scroll: usize,
     commands: &'static [(&'static str, &'static str)],
+    command_completion: Option<CommandCompletion>,
     asking: Option<AskUi>,
     perm_prompt: Option<PermUi>,
     mascot_state: MascotState,
@@ -268,6 +283,7 @@ impl Tui {
             hint: "  ⏸ 本地模式 · /help 查看命令 · Esc 中断 · 滚轮滚动对话 · ↑ 撤销排队/历史".into(),
             input_scroll: 0,
             commands: &[],
+            command_completion: None,
             asking: None,
             perm_prompt: None,
             mascot_state: MascotState::Idle,
@@ -284,6 +300,7 @@ impl Tui {
         }
     }
     pub fn ask(&mut self, questions: Vec<AskQuestion>) {
+        self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
         self.asking = Some(AskUi {
@@ -298,6 +315,7 @@ impl Tui {
     }
     pub fn finish_ask(&mut self) {
         self.asking = None;
+        self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
         if self.mascot_state == MascotState::Asking {
@@ -308,6 +326,7 @@ impl Tui {
         self.asking.is_some()
     }
     pub fn open_perm_prompt(&mut self, req: crate::tools::PermRequest) {
+        self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
         self.perm_prompt = Some(PermUi { cmd: req.cmd, cmd_kind: req.cmd_kind, focus: 0 });
@@ -350,6 +369,7 @@ impl Tui {
         }
     }
     pub fn set_commands(&mut self, cmds: &'static [(&'static str, &'static str)]) {
+        self.command_completion = None;
         self.commands = cmds;
     }
     pub fn enter(&mut self) -> RawGuard {
@@ -386,6 +406,7 @@ impl Tui {
     }
     pub fn retrieve_queued(&mut self, text: String) {
         self.queued_count = self.queued_count.saturating_sub(1);
+        self.command_completion = None;
         self.input = text;
         self.cursor = self.input.chars().count();
         self.hist_pos = None;
@@ -572,6 +593,7 @@ impl Tui {
         if self.asking.is_some() {
             return Some(self.submit_ask());
         }
+        self.command_completion = None;
         let text = std::mem::take(&mut self.input);
         self.cursor = 0;
         self.hist_pos = None;
@@ -651,6 +673,7 @@ impl Tui {
         self.commit_ask_answer(answers.join(", "))
     }
     fn commit_ask_answer(&mut self, answer: String) -> Action {
+        self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
         self.hist_pos = None;
@@ -1023,6 +1046,9 @@ impl Tui {
         }
     }
     pub fn handle_key(&mut self, key: Key) -> Action {
+        if key != Key::Tab {
+            self.command_completion = None;
+        }
         if self.perm_prompt.is_some() {
             return self.handle_perm_key(key);
         }
@@ -1098,7 +1124,13 @@ impl Tui {
                 }
             }
             Key::Tab => {
-                self.complete_command();
+                if self.in_paste {
+                    self.command_completion = None;
+                    self.input.insert(self.cursor_byte(), '\t');
+                    self.cursor += 1;
+                } else {
+                    self.complete_command();
+                }
                 Action::None
             }
             Key::PageUp => {
@@ -1306,29 +1338,131 @@ impl Tui {
         }
         self.cursor = ci;
     }
+    fn command_token(&self) -> Option<CommandToken> {
+        let trimmed = self.input.trim_start();
+        let leading = self.input.len().saturating_sub(trimmed.len());
+        if self.input.as_bytes().get(leading) != Some(&b'/') {
+            return None;
+        }
+        let start = leading + 1;
+        let end = self.input[start..]
+            .find(char::is_whitespace)
+            .map(|offset| start + offset)
+            .unwrap_or(self.input.len());
+        let cursor = self.cursor_byte();
+        if cursor < start || cursor > end {
+            return None;
+        }
+        Some(CommandToken {
+            start,
+            end,
+            prefix: self.input[start..cursor].to_ascii_lowercase(),
+        })
+    }
+    fn replace_command_token(&mut self, start: usize, end: usize, replacement: &str, add_space: bool) -> usize {
+        self.input.replace_range(start..end, replacement);
+        let token_end = start + replacement.len();
+        let mut cursor = token_end;
+        if add_space {
+            match self.input[cursor..].chars().next() {
+                Some(ch) if ch.is_whitespace() => cursor += ch.len_utf8(),
+                _ => {
+                    self.input.insert(cursor, ' ');
+                    cursor += 1;
+                }
+            }
+        }
+        self.cursor = self.input[..cursor].chars().count();
+        token_end
+    }
+    fn common_command_prefix(matches: &[&'static str]) -> String {
+        let Some(first) = matches.first() else { return String::new() };
+        let mut len = first.len();
+        for candidate in &matches[1..] {
+            len = first
+                .bytes()
+                .zip(candidate.bytes())
+                .take(len)
+                .take_while(|(left, right)| left == right)
+                .count();
+        }
+        first[..len].to_string()
+    }
+    fn remember_command_completion(
+        &mut self,
+        matches: Vec<&'static str>,
+        next_index: usize,
+        token_start: usize,
+        token_end: usize,
+    ) {
+        self.command_completion = Some(CommandCompletion {
+            matches,
+            next_index,
+            token_start,
+            token_end,
+            expected_input: self.input.clone(),
+            expected_cursor: self.cursor,
+        });
+    }
+    fn continue_command_completion(&mut self) -> bool {
+        let Some(state) = self.command_completion.take() else { return false };
+        if self.input != state.expected_input || self.cursor != state.expected_cursor || state.matches.is_empty() {
+            return false;
+        }
+        let selected = state.next_index % state.matches.len();
+        let token_end = self.replace_command_token(
+            state.token_start,
+            state.token_end,
+            state.matches[selected],
+            true,
+        );
+        let next_index = (selected + 1) % state.matches.len();
+        self.remember_command_completion(state.matches, next_index, state.token_start, token_end);
+        true
+    }
     fn complete_command(&mut self) {
-        let Some(rest) = self.input.trim_start().strip_prefix('/') else { return };
-        let filter = rest.trim_start();
-        let hits: Vec<&&'static str> = self
+        if self.continue_command_completion() {
+            return;
+        }
+        let Some(token) = self.command_token() else {
+            self.command_completion = None;
+            return;
+        };
+        let matches: Vec<&'static str> = self
             .commands
             .iter()
-            .filter(|(n, _)| n.starts_with(filter))
-            .map(|(n, _)| n)
+            .filter(|(name, _)| name.starts_with(&token.prefix))
+            .map(|(name, _)| *name)
             .collect();
-        if hits.len() == 1 {
-            self.input = format!("/{} ", hits[0]);
-            self.cursor = self.input.chars().count();
+        if matches.is_empty() {
+            self.command_completion = None;
+            return;
+        }
+        if matches.len() == 1 {
+            self.replace_command_token(token.start, token.end, matches[0], true);
+            self.command_completion = None;
+            return;
+        }
+        let common = Self::common_command_prefix(&matches);
+        if common.len() > token.prefix.len() {
+            let token_end = self.replace_command_token(token.start, token.end, &common, false);
+            let next_index = matches.iter().position(|name| *name != common).unwrap_or(0);
+            self.remember_command_completion(matches, next_index, token.start, token_end);
+        } else {
+            let token_end = self.replace_command_token(token.start, token.end, matches[0], true);
+            let next_index = 1 % matches.len();
+            self.remember_command_completion(matches, next_index, token.start, token_end);
         }
     }
     fn command_popup(&self) -> (Vec<String>, usize) {
         if self.asking.is_some() {
             return (Vec::new(), 0);
         }
-        let Some(rest) = self.input.trim_start().strip_prefix('/') else {
+        let Some(token) = self.command_token() else {
             return (Vec::new(), 0);
         };
-        let filter = rest.trim_start();
-        let hits: Vec<_> = self.commands.iter().filter(|(n, _)| n.starts_with(filter)).collect();
+        let filter = token.prefix;
+        let hits: Vec<_> = self.commands.iter().filter(|(n, _)| n.starts_with(&filter)).collect();
         if hits.is_empty() {
             return (Vec::new(), 0);
         }
@@ -3070,21 +3204,15 @@ mod tests {
         assert_eq!(t.cursor, 3);
     }
     #[test]
-    fn tab_completes_unique_command() {
+    fn tab_completes_unique_command_case_insensitively() {
         let mut t = Tui::new();
         t.set_commands(&[("help", "查看命令帮助"), ("ls", "列出会话"), ("tool_times", "设置轮数")]);
-        for c in "/he".chars() {
+        for c in "/HE".chars() {
             let _ = t.handle_key(Key::Char(c));
         }
         let _ = t.handle_key(Key::Tab);
         assert_eq!(t.input, "/help ");
-        let mut t = Tui::new();
-        t.set_commands(&[("help", "a"), ("ls", "b")]);
-        for c in "/".chars() {
-            let _ = t.handle_key(Key::Char(c));
-        }
-        let _ = t.handle_key(Key::Tab);
-        assert_eq!(t.input, "/");
+
         let mut t = Tui::new();
         t.set_commands(&[("help", "a")]);
         for c in "h".chars() {
@@ -3092,6 +3220,55 @@ mod tests {
         }
         let _ = t.handle_key(Key::Tab);
         assert_eq!(t.input, "h");
+    }
+    #[test]
+    fn tab_expands_common_prefix_then_cycles_candidates() {
+        let mut t = Tui::new();
+        t.set_commands(&[("model", "a"), ("models", "b"), ("maxtokens", "c")]);
+        for c in "/mo".chars() {
+            let _ = t.handle_key(Key::Char(c));
+        }
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/model", "第一次 Tab 扩展最长公共前缀");
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/models ", "再次 Tab 选择下一个候选");
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/model ", "候选应循环");
+
+        let mut t = Tui::new();
+        t.set_commands(&[("help", "a"), ("ls", "b")]);
+        let _ = t.handle_key(Key::Char('/'));
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/help ", "无公共前缀时选择首项");
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/ls ", "连续 Tab 循环候选");
+    }
+    #[test]
+    fn tab_completion_uses_cursor_and_preserves_arguments() {
+        let mut t = Tui::new();
+        t.set_commands(&[("help", "a"), ("history", "b")]);
+        t.input = "/hexx --verbose".into();
+        t.cursor = 3;
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/help --verbose");
+        assert_eq!(t.cursor, 6, "光标应位于参数开头");
+
+        let _ = t.handle_key(Key::Char('x'));
+        assert_eq!(t.input, "/help x--verbose");
+        let _ = t.handle_key(Key::Tab);
+        assert_eq!(t.input, "/help x--verbose", "编辑后不得沿用旧候选状态");
+    }
+    #[test]
+    fn pasted_tab_is_inserted_instead_of_triggering_completion() {
+        let mut t = Tui::new();
+        t.set_commands(&[("help", "a")]);
+        let _ = t.handle_key(Key::PasteStart);
+        for c in "/he".chars() {
+            let _ = t.handle_key(Key::Char(c));
+        }
+        let _ = t.handle_key(Key::Tab);
+        let _ = t.handle_key(Key::PasteEnd);
+        assert_eq!(t.input, "/he\t");
     }
     #[test]
     fn command_popup_filters_and_styles() {
