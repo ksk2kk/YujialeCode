@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "description": "由网页研究确认后把企业公开 ATS board 加到这里。未知 slug 不猜测；失效 board 由脚本记录但不阻断其他来源。",
+  "boards": []
+}

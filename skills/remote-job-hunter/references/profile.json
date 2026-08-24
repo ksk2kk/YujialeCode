@@ -1,0 +1,31 @@
+{
+  "profile_name": "ksk2kk",
+  "home_country": "CN",
+  "home_timezone": "Asia/Shanghai",
+  "utc_offset": "+08:00",
+  "languages": [
+    {"name": "Rust", "years": null, "level": "unknown"},
+    {"name": "C++", "years": null, "level": "unknown"},
+    {"name": "Go", "years": null, "level": "unknown"}
+  ],
+  "other_skills": ["Linux", "Git"],
+  "english": {"reading": "can_read_docs", "writing": "unknown", "speaking": "unknown"},
+  "role_families": [
+    "backend", "systems", "distributed-systems", "database", "compiler", "embedded",
+    "robotics", "networking", "security", "cloud", "devops", "sre", "platform",
+    "quant", "blockchain", "game-engine", "audio-video", "hpc", "developer-tools",
+    "data-infrastructure", "ai-infrastructure"
+  ],
+  "employment_types": ["full-time", "part-time", "contract", "freelance", "temporary", "internship"],
+  "minimum_salary": 0,
+  "minimum_salary_currency": "USD",
+  "accept_unknown_salary": true,
+  "accept_night_shift": true,
+  "max_timezone_overlap_penalty": 100,
+  "work_authorizations": ["CN"],
+  "needs_visa_sponsorship_outside_cn": true,
+  "worldwide_only": false,
+  "freshness_days": 45,
+  "preferred_weekly_hours": null,
+  "notes": "所有能带来合法收入的雇佣形式都纳入；优先全球可申请、报酬高、时区友好和匹配度高的岗位。"
+}

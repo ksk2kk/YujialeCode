@@ -3,12 +3,52 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use crate::config::Config;
 const SKILLS_REPO_RAW: &str = "https://raw.githubusercontent.com/anthropics/skills/main/skills";
+const BUNDLED_REMOTE_JOB_HUNTER_VERSION: &str = "1";
+const BUNDLED_REMOTE_JOB_HUNTER: &[(&str, &str)] = &[
+    ("SKILL.md", include_str!("../skills/remote-job-hunter/SKILL.md")),
+    ("references/profile.json", include_str!("../skills/remote-job-hunter/references/profile.json")),
+    ("references/scoring.md", include_str!("../skills/remote-job-hunter/references/scoring.md")),
+    ("references/source-policy.md", include_str!("../skills/remote-job-hunter/references/source-policy.md")),
+    ("references/sources.json", include_str!("../skills/remote-job-hunter/references/sources.json")),
+    ("references/ats-boards.json", include_str!("../skills/remote-job-hunter/references/ats-boards.json")),
+    ("references/tech-taxonomy.json", include_str!("../skills/remote-job-hunter/references/tech-taxonomy.json")),
+    ("references/import-schema.md", include_str!("../skills/remote-job-hunter/references/import-schema.md")),
+    ("scripts/job_hunter.py", include_str!("../skills/remote-job-hunter/scripts/job_hunter.py")),
+];
 fn skills_dir(cfg: &Config) -> PathBuf {
     let d = cfg.skills_dir();
     let _ = fs::create_dir_all(&d);
     d
 }
+fn ensure_bundled_skills(cfg: &Config) -> Result<(), String> {
+    let target = skills_dir(cfg).join("remote-job-hunter");
+    let marker = target.join(".yjlcoder-bundled-version");
+    if target.exists() && !marker.exists() {
+        // 没有标记的同名目录属于用户，绝不覆盖。
+        return Ok(());
+    }
+    if marker.exists()
+        && fs::read_to_string(&marker).unwrap_or_default().trim()
+            == BUNDLED_REMOTE_JOB_HUNTER_VERSION
+        && BUNDLED_REMOTE_JOB_HUNTER
+            .iter()
+            .all(|(relative, _)| target.join(relative).exists())
+    {
+        return Ok(());
+    }
+    for (relative, content) in BUNDLED_REMOTE_JOB_HUNTER {
+        let path = target.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建内置技能目录失败: {e}"))?;
+        }
+        fs::write(&path, content).map_err(|e| format!("写入内置技能 {relative} 失败: {e}"))?;
+    }
+    fs::write(marker, BUNDLED_REMOTE_JOB_HUNTER_VERSION)
+        .map_err(|e| format!("写入内置技能版本失败: {e}"))?;
+    Ok(())
+}
 pub fn op_list_skills(cfg: &Config) -> Result<String, String> {
+    ensure_bundled_skills(cfg)?;
     let dir = skills_dir(cfg);
     let mut out = String::from("已安装技能:\n");
     let mut found = false;
@@ -69,6 +109,13 @@ pub fn op_install_skill(args: &Value, cfg: &Config) -> Result<String, String> {
         .collect();
     if safe_name.is_empty() {
         return Err("技能名非法".into());
+    }
+    if safe_name == "remote-job-hunter" {
+        ensure_bundled_skills(cfg)?;
+        return Ok(format!(
+            "内置技能 remote-job-hunter 已就绪（{}）\nrun_skill remote-job-hunter 加载使用",
+            skills_dir(cfg).join("remote-job-hunter").display()
+        ));
     }
     let target = skills_dir(cfg).join(&safe_name);
     if target.exists() {
@@ -140,6 +187,7 @@ fn fetch_url(url: &str) -> Result<String, String> {
     Ok(text)
 }
 pub fn op_run_skill(args: &Value, cfg: &Config) -> Result<String, String> {
+    ensure_bundled_skills(cfg)?;
     let name = args
         .get("name")
         .and_then(|n| n.as_str())
@@ -182,5 +230,26 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&skills_dir);
+    }
+    #[test]
+    fn bundled_remote_job_hunter_is_installed_without_network() {
+        let root = std::env::temp_dir().join(format!(
+            "yjlcoder_bundled_skill_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.clone());
+        let list = op_list_skills(&cfg).unwrap();
+        assert!(list.contains("remote-job-hunter"));
+        assert!(root.join("skills/remote-job-hunter/scripts/job_hunter.py").exists());
+        let loaded = op_run_skill(
+            &serde_json::json!({"name": "remote-job-hunter"}),
+            &cfg,
+        )
+        .unwrap();
+        assert!(loaded.contains("全球远程工作猎手"));
+        let _ = fs::remove_dir_all(&root);
     }
 }
