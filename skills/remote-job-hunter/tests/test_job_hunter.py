@@ -1,17 +1,17 @@
 import importlib.util
-import pathlib
+from pathlib import Path
 import unittest
 
 
-HERE = pathlib.Path(__file__).resolve().parent
-SCRIPT = HERE.parent / "scripts" / "job_hunter.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "job_hunter.py"
+HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("job_hunter", SCRIPT)
 job_hunter = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader
+assert SPEC.loader is not None
 SPEC.loader.exec_module(job_hunter)
 
 
-class JobHunterTests(unittest.TestCase):
+class JobHunterExistingTests(unittest.TestCase):
     def setUp(self):
         self.source = {"id": "fixture", "name": "Fixture", "homepage": "https://example.test", "priority": 100}
         self.profile = job_hunter.load_json(HERE.parent / "references" / "profile.json")
@@ -52,8 +52,7 @@ class JobHunterTests(unittest.TestCase):
         self.assertEqual(normalized["eligibility"], "ineligible")
 
     def test_years_are_not_parsed_as_salary(self):
-        parsed = job_hunter.parse_salary_text("Minimum 5 years experience and 40 hours per week")
-        self.assertEqual(parsed, {})
+        self.assertEqual(job_hunter.parse_salary_text("Minimum 5 years experience and 40 hours per week"), {})
 
     def test_funding_and_trading_volume_are_not_salary(self):
         self.assertEqual(job_hunter.parse_salary_text("We raised $18M at Series A and process $285B in trading volume."), {})
@@ -78,6 +77,114 @@ class JobHunterTests(unittest.TestCase):
         ids = {source["id"] for source in sources}
         expected = {"web3career", "cryptojobslist", "cryptocurrencyjobs", "remote3", "web3jobsio", "blockjobs", "web3vacancy", "solana_jobs", "rustjobs", "jobsinrust", "golangcafe", "golangprojects", "remoteok", "weworkremotely", "wellfound", "himalayas", "arc", "workingnomads", "upwork", "toptal"}
         self.assertTrue(expected <= ids)
+
+    def test_alternative_job_catalog_does_not_pollute_skills(self):
+        job = job_hunter.blank_job(self.source, "https://example.test/jobs/designer")
+        job.update({"title": "Senior Graphic Designer", "description":
+                    "Requirements: Adobe Illustrator and strong design craft. NOT YOUR TECH STACK? "
+                    "Other projects need Rust, C++, Golang, Kubernetes, React and Python.",
+                    "location": "Remote", "remote": True})
+        normalized = job_hunter.normalize_job(job, self.profile, self.taxonomy, job_hunter.default_rates())
+        self.assertNotIn("Rust", normalized["skills"])
+        self.assertNotIn("C++", normalized["skills"])
+        self.assertNotIn("Go", normalized["skills"])
+
+
+class SalaryQualityTests(unittest.TestCase):
+    def test_salary_parser_keeps_thousands(self):
+        parsed = job_hunter.parse_salary_text("Salary range: $100,000 - $200,000 per year")
+        self.assertEqual(parsed["salary_min"], 100_000)
+        self.assertEqual(parsed["salary_max"], 200_000)
+        self.assertEqual(parsed["salary_period"], "year")
+
+    def test_funding_is_not_salary(self):
+        parsed = job_hunter.parse_salary_text("We raised $220M in Series B funding and are hiring engineers")
+        self.assertEqual(parsed, {})
+
+    def test_impossible_structured_salary_is_quarantined(self):
+        source = {"id": "test", "name": "Test", "homepage": "https://example.com"}
+        job = job_hunter.blank_job(source, "https://example.com/job")
+        job.update({"salary_min": 2.0, "salary_max": 0.0, "salary_currency": "USD", "salary_period": "year"})
+        job_hunter.annualize_salary(job, job_hunter.default_rates())
+        self.assertIsNone(job["salary_usd_annual_min"])
+        self.assertEqual(job["salary_confidence"], "rejected")
+        self.assertTrue(job["salary_rejected_reason"])
+
+    def test_missing_salary_period_is_not_assumed_annual(self):
+        source = {"id": "test", "name": "Test", "homepage": "https://example.com"}
+        job = job_hunter.blank_job(source, "https://example.com/job")
+        job.update({"salary_min": 31.0, "salary_max": 31.0, "salary_currency": "USD",
+                    "salary_original": "$31"})
+        job_hunter.annualize_salary(job, job_hunter.default_rates())
+        self.assertIsNone(job["salary_usd_annual_min"])
+        self.assertFalse(job["salary_rejected_reason"])
+        self.assertIn("周期未公开", job["warnings"][-1])
+
+    def test_learning_budget_is_not_salary(self):
+        text = "Personal learning and development budget of USD 2000 per year. Annual compensation review."
+        self.assertEqual(job_hunter.parse_salary_text(text), {})
+
+    def test_previously_parsed_learning_budget_is_quarantined(self):
+        source = {"id": "test", "name": "Test", "homepage": "https://example.com"}
+        job = job_hunter.blank_job(source, "https://example.com/job")
+        job.update({"salary_min": 2000.0, "salary_max": 2000.0, "salary_currency": "USD",
+                    "salary_period": "year", "salary_kind": "explicit_text",
+                    "salary_evidence": "Personal learning and development budget of USD 2000 per year. Annual compensation review."})
+        job_hunter.annualize_salary(job, job_hunter.default_rates())
+        self.assertIsNone(job["salary_usd_annual_min"])
+        self.assertIn("福利预算", job["salary_rejected_reason"])
+
+    def test_aggregator_estimate_is_replaced_by_explicit_description(self):
+        source = {"id": "blockjobs", "name": "BlockJobs", "homepage": "https://blockjobs.careers/",
+                  "salary_trust": "estimate", "eligibility_trust": "unverified_aggregator"}
+        job = job_hunter.blank_job(source, "https://employer.example/job")
+        job.update({
+            "title": "Graduate Backend Engineer", "company": "Example", "description":
+            "Starting Salary: £50,000 Location: London. Join the backend team.",
+            "location": "Worldwide", "remote": True, "salary_min": 100_000,
+            "salary_max": 200_000, "salary_currency": "USD", "salary_period": "year",
+            "salary_kind": "explicit_structured", "salary_original": "USD 100000-200000",
+        })
+        profile = {"languages": [{"name": "Rust"}], "other_skills": [], "accept_night_shift": True,
+                   "freshness_days": 45}
+        taxonomy = {"Backend": ["backend"], "Rust": ["rust"]}
+        normalized = job_hunter.normalize_job(job, profile, taxonomy, job_hunter.default_rates())
+        self.assertEqual(normalized["salary_kind"], "explicit_text")
+        self.assertEqual(normalized["salary_min"], 50_000)
+        self.assertEqual(normalized["salary_currency"], "GBP")
+        self.assertEqual(normalized["location"], "London")
+        self.assertEqual(normalized["eligibility"], "unknown")
+
+
+class LearningRoadmapTests(unittest.TestCase):
+    def test_roadmap_contains_evidence_and_acceptance_steps(self):
+        profile = {"profile_name": "learner", "languages": [{"name": "Rust", "years": None}],
+                   "other_skills": ["Linux"]}
+        jobs = [{
+            "title": "Rust Protocol Engineer", "eligibility": "eligible", "score": 70,
+            "skills": ["Rust", "Web3", "Kubernetes", "System Design"],
+            "skill_requirements": {"Rust": "required", "Web3": "required", "Kubernetes": "preferred", "System Design": "required"},
+        }]
+        roadmap = job_hunter.build_learning_roadmap(jobs, profile)
+        self.assertIn("12 周执行表", roadmap)
+        self.assertIn("明确必需", roadmap)
+        self.assertIn("通过标准", roadmap)
+        self.assertIn("Rust 异步 RPC/链上索引器", roadmap)
+        self.assertIn("画像里 Rust 的年限/熟练度仍是未知", roadmap)
+
+    def test_mentioned_languages_do_not_score_like_required_language(self):
+        profile = {"languages": [{"name": "Rust"}, {"name": "C++"}, {"name": "Go"}],
+                   "other_skills": ["Linux"], "accept_night_shift": True, "freshness_days": 45}
+        mentioned = {"title": "Engineering Manager", "description": "", "skills": ["Rust", "C++", "Go", "Linux"],
+                     "skill_requirements": {"Rust": "mentioned", "C++": "mentioned", "Go": "mentioned", "Linux": "mentioned"},
+                     "eligibility": "eligible", "timezone_original": "未公开", "published_at": None,
+                     "source_priority": 50, "salary_kind": "unknown", "salary_usd_annual_max": None}
+        required = dict(mentioned)
+        required.update({"title": "Rust Protocol Engineer", "skills": ["Rust", "Linux"],
+                         "skill_requirements": {"Rust": "required", "Linux": "required"}})
+        job_hunter.score_job(mentioned, profile, job_hunter.profile_skill_set(profile))
+        job_hunter.score_job(required, profile, job_hunter.profile_skill_set(profile))
+        self.assertGreater(required["score_breakdown"]["skill"], mentioned["score_breakdown"]["skill"])
 
 
 if __name__ == "__main__":

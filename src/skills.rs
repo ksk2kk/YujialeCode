@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use crate::config::Config;
 const SKILLS_REPO_RAW: &str = "https://raw.githubusercontent.com/anthropics/skills/main/skills";
-const BUNDLED_REMOTE_JOB_HUNTER_VERSION: &str = "2";
+const BUNDLED_REMOTE_JOB_HUNTER_VERSION: &str = "3";
 const BUNDLED_REMOTE_JOB_HUNTER: &[(&str, &str)] = &[
     ("SKILL.md", include_str!("../skills/remote-job-hunter/SKILL.md")),
     ("references/profile.json", include_str!("../skills/remote-job-hunter/references/profile.json")),
