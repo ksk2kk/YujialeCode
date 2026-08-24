@@ -4,6 +4,7 @@ mod clipboard_copy;
 mod compress;
 mod config;
 mod dynamic_tools;
+mod fuck_master;
 mod goal;
 mod llm;
 mod md;
@@ -174,6 +175,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("maxtokens", "查看/设置单轮生成上限"),
     ("config", "查看当前全部配置总览"),
     ("goal", "持续执行目标（状态/暂停/恢复/清除）"),
+    ("FuckMaster", "定时主动通过 QQ 推进目标"),
     ("copy", "复制最近一条助手完整回复（Ctrl+O）"),
     ("new", "新建会话"),
     ("ls", "列出会话"),
@@ -319,7 +321,8 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                     }
                     Action::Command(cmd) => {
                         let live_cmd = matches!(cmd.split(' ').next(), Some("autodangerous" | "copy"))
-                            || goal_control_is_safe_while_running(&cmd);
+                            || goal_control_is_safe_while_running(&cmd)
+                            || cmd.split_whitespace().next().is_some_and(|name| name.eq_ignore_ascii_case("FuckMaster"));
                         if turns.is_active() && !live_cmd {
                             tui.push_warn(
                                 "当前回合仍在运行，斜杠命令未执行；请等待完成或按 Esc 中断".into(),
@@ -762,7 +765,8 @@ fn handle_command(
         Some((n, r)) => (n, r.trim()),
         None => (cmd, ""),
     };
-    match name {
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
         "help" => {
             tui.push_system(
                 "命令:\n\
@@ -773,6 +777,7 @@ fn handle_command(
                  /compress     手动压缩上下文\n\
                  /stats        上下文统计\n\
                  /goal <目标>  持续执行直到完成（status/pause/resume/continue/clear）\n\
+                 /FuckMaster [目标] 主动推进；add 2h 目标 / list / pause|resume|now|delete fm-0001\n\
                  /copy         复制最近一条助手完整回复（Ctrl+O；不受屏幕折行影响）\n\
                  /tool_times <N> 工具调用轮数上限（默认 24，1-200）\n\
                  /timeout <秒> 请求/流式读取超时（默认 120，10-3600）\n\
@@ -809,6 +814,12 @@ fn handle_command(
                  其余输入即对话。输入「搜索 xxx / 查一下 xxx / 抓取 URL / 读取 文件」会直接触发对应工具，\n\
                  无需模型介入。启动时若上次会话有历史会自动开新会话，/use 可切回旧会话".into(),
             );
+        }
+        "fuckmaster" => {
+            match fuck_master::execute_slash(cfg, store.current_id(), rest) {
+                Ok(reply) => tui.push_system(reply),
+                Err(error) => tui.push_error(error),
+            }
         }
         "copy" => {
             let _ = tui.copy_last_assistant();

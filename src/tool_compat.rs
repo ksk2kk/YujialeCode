@@ -128,6 +128,7 @@ fn alias_name(name: &str) -> Option<&'static str> {
         "remember" => "memory_write",
         "recall" => "memory_search",
         "ask" | "clarify" | "ask_user_question" | "askuserquestion" => "ask_user",
+        "fuckmaster" | "proactive_goal" | "goal_reminder" => "fuck_master",
         "tools" | "help_tools" => "list_tools",
         _ => return None,
     })
@@ -700,6 +701,11 @@ mod tests {
         );
         assert_eq!(call.op, "ask_user");
         assert!(call.args["questions"].is_array());
+    }
+    #[test]
+    fn fuck_master_weak_names_map_to_system_tool() {
+        assert_eq!(normalize_call("FuckMaster", &json!({"action":"list"})).op, "fuck_master");
+        assert_eq!(normalize_call("goal-reminder", &json!({"action":"list"})).op, "fuck_master");
     }
     #[test]
     fn listdir_aliases_and_paging_fields_are_normalized() {

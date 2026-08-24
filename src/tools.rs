@@ -133,6 +133,7 @@ pub const KNOWN_OPS: &[&str] = &[
     "memory_write",
     "ask_user",
     "goal",
+    "fuck_master",
 ];
 pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     if op.eq_ignore_ascii_case("make_tools") || op.eq_ignore_ascii_case("make-tools") {
@@ -277,6 +278,7 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "memory_write" => memory_write(args, ctx),
         "ask_user" => ask_user(args, ctx),
         "goal" => crate::goal::execute_tool(ctx.cfg, ctx.store.current_id(), args),
+        "fuck_master" => crate::fuck_master::execute_tool(ctx.cfg, ctx.store.current_id(), args),
         _ => match crate::dynamic_tools::load(ctx.cfg, op) {
             Some(tool) => execute_dynamic_tool(&tool, args, ctx),
             None => Err(format!("未知工具: {op}（list_tools 查看可用工具）")),
@@ -2698,6 +2700,24 @@ mod tests {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_dispatch_store"));
         let r = execute("execute_command", &json!({"op": "list_tools", "args": {}}), &mut t.ctx()).unwrap();
         assert!(r.contains("[file]"));
+    }
+    #[test]
+    fn fuck_master_is_a_persistent_system_tool() {
+        let dir = std::env::temp_dir().join(format!("yjlcoder_fuck_master_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut t = TestCtx::new(dir.join("sessions"));
+        t.cfg.set_test_data_dir(dir.clone());
+        t.cfg.qq.groups.push(123);
+        t.store.new_session("qq_g123");
+        let added = execute(
+            "FuckMaster",
+            &json!({"action":"add","goal":"推进学习路线","every":"1h"}),
+            &mut t.ctx(),
+        ).unwrap();
+        assert!(added.contains("fm-0001"));
+        let listed = execute("fuck_master", &json!({"action":"list"}), &mut t.ctx()).unwrap();
+        assert!(listed.contains("推进学习路线"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
     fn hot_registration_spec(name: &str) -> Value {
         json!({

@@ -4,6 +4,7 @@ pub mod clipboard_copy;
 pub mod compress;
 pub mod config;
 pub mod dynamic_tools;
+pub mod fuck_master;
 pub mod goal;
 pub mod llm;
 pub mod md;

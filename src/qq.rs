@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,8 +15,20 @@ use crate::tools::QqOut;
 struct ChatState {
     running: bool,
     pending: Option<(String, bool)>,
+    reminders: VecDeque<crate::fuck_master::MasterTask>,
     msg_since_roll: usize,
     cancel: Arc<AtomicBool>,
+}
+impl Default for ChatState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            pending: None,
+            reminders: VecDeque::new(),
+            msg_since_roll: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 fn is_admin(inner: &BridgeInner, ev: &Value) -> bool {
     let uid = ev["user_id"].as_i64().unwrap_or(0);
@@ -76,13 +88,17 @@ fn handle_ws_conn(
     ws.get_mut().set_nonblocking(true).map_err(|e| format!("设置非阻塞失败: {e}"))?;
     let ws = Arc::new(Mutex::new(ws));                
     let (out_tx, out_rx): (Sender<String>, Receiver<String>) = channel();
+    let connection_cancel = Arc::new(AtomicBool::new(false));
+    let scheduler = spawn_fuck_master_scheduler(inner.clone(), out_tx.clone(), connection_cancel.clone());
     log("NapCat 已连接");
     let ws_reader = ws.clone();
     let inner_r = inner.clone();
+    let reader_out_tx = out_tx.clone();
+    let reader_cancel = connection_cancel.clone();
     let reader = thread::spawn(move || {
         loop {
             if inner_r.cancel.load(Ordering::Relaxed) {
-                return;
+                break;
             }
             let (would_block, msg, err) = {
                 let mut guard = ws_reader.lock().unwrap();
@@ -98,11 +114,11 @@ fn handle_ws_conn(
             if let Some(msg) = msg {
                 match msg {
                     tungstenite::Message::Text(t) => {
-                        handle_event(inner_r.clone(), &t, out_tx.clone());
+                        handle_event(inner_r.clone(), &t, reader_out_tx.clone());
                     }
                     tungstenite::Message::Close(_) => {
                         log("连接已关闭");
-                        return;
+                        break;
                     }
                     _ => {}
                 }
@@ -110,13 +126,15 @@ fn handle_ws_conn(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             } else {
                 log(&format!("WS 读取错误: {err}"));
-                return;
+                break;
             }
         }
+        reader_cancel.store(true, Ordering::Relaxed);
     });
     let ws_writer = ws.clone();
     let writer = thread::spawn(move || {
         while let Ok(text) = out_rx.recv() {
+            let text = sanitize_qq_action(&text);
             let mut guard = ws_writer.lock().unwrap();
             if let Err(e) = guard.write(tungstenite::Message::Text(text)) {
                 log(&format!("发送失败: {e}"));
@@ -127,6 +145,9 @@ fn handle_ws_conn(
         }
     });
     reader.join().ok();
+    connection_cancel.store(true, Ordering::Relaxed);
+    scheduler.join().ok();
+    drop(out_tx);
     writer.join().ok();
     Ok(())
 }
@@ -156,43 +177,54 @@ fn connect_client(inner: Arc<BridgeInner>, url: &str) -> Result<(), String> {
     }
     let ws = Arc::new(Mutex::new(ws));
     let (out_tx, out_rx): (Sender<String>, Receiver<String>) = channel();
+    let connection_cancel = Arc::new(AtomicBool::new(false));
+    let scheduler = spawn_fuck_master_scheduler(inner.clone(), out_tx.clone(), connection_cancel.clone());
     log("已连接 OneBot");
     let ws_reader = ws.clone();
     let inner_r = inner.clone();
-    let reader = thread::spawn(move || loop {
-        let (would_block, msg, err) = {
-            let mut guard = ws_reader.lock().unwrap();
-            match guard.read() {
-                Ok(m) => (false, Some(m), String::new()),
-                Err(e) => {
-                    let wb = matches!(&e, tungstenite::Error::Io(ioe)
-                        if ioe.kind() == std::io::ErrorKind::WouldBlock);
-                    (wb, None, e.to_string())
+    let reader_out_tx = out_tx.clone();
+    let reader_cancel = connection_cancel.clone();
+    let reader = thread::spawn(move || {
+        loop {
+            let (would_block, msg, err) = {
+                let mut guard = ws_reader.lock().unwrap();
+                match guard.read() {
+                    Ok(m) => (false, Some(m), String::new()),
+                    Err(e) => {
+                        let wb = matches!(&e, tungstenite::Error::Io(ioe)
+                            if ioe.kind() == std::io::ErrorKind::WouldBlock);
+                        (wb, None, e.to_string())
+                    }
                 }
+            };
+            if let Some(msg) = msg {
+                match msg {
+                    tungstenite::Message::Text(t) => handle_event(inner_r.clone(), &t, reader_out_tx.clone()),
+                    tungstenite::Message::Close(_) => break,
+                    _ => {}
+                }
+            } else if would_block {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            } else {
+                log(&format!("WS 读取错误: {err}"));
+                break;
             }
-        };
-        if let Some(msg) = msg {
-            match msg {
-                tungstenite::Message::Text(t) => handle_event(inner_r.clone(), &t, out_tx.clone()),
-                tungstenite::Message::Close(_) => return,
-                _ => {}
-            }
-        } else if would_block {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        } else {
-            log(&format!("WS 读取错误: {err}"));
-            return;
         }
+        reader_cancel.store(true, Ordering::Relaxed);
     });
     let ws_writer = ws.clone();
     let writer = thread::spawn(move || {
         while let Ok(text) = out_rx.recv() {
+            let text = sanitize_qq_action(&text);
             let mut guard = ws_writer.lock().unwrap();
             let _ = guard.write(tungstenite::Message::Text(text));
             let _ = guard.flush();
         }
     });
     reader.join().ok();
+    connection_cancel.store(true, Ordering::Relaxed);
+    scheduler.join().ok();
+    drop(out_tx);
     writer.join().ok();
     Ok(())
 }
@@ -244,6 +276,9 @@ fn should_respond(inner: &BridgeInner, ev: &Value, self_id: &str) -> bool {
                 return false;
             }
             let text = extract_text(ev);
+            if text.trim().split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("/FuckMaster")) {
+                return true;
+            }
             let has_trigger = qq.triggers.iter().any(|t| {
                 !t.is_empty() && text.to_lowercase().contains(&t.to_lowercase())
             });
@@ -283,19 +318,25 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
     if text.trim().is_empty() {
         return;
     }
-    if let Some(message_id) = ev["message_id"].as_i64() {
-        let _ = out_tx.send(
-            json!({
-                "action": "set_msg_emoji_like",
-                "params": { "message_id": message_id, "emoji_id": "76" }
-            })
-            .to_string(),
-        );
-    }
     let cid = chat_id(ev);
     let msg_type = ev["message_type"].as_str().unwrap_or("").to_string();
     let target_id = ev["group_id"].as_i64().unwrap_or(ev["user_id"].as_i64().unwrap_or(0));
     log(&format!("[{cid}] {text}"));
+    let trimmed = text.trim();
+    if trimmed.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("/FuckMaster")) {
+        let reply = if !is_admin(&inner, ev) {
+            "无权限：FuckMaster 仅管理员可注册和管理".to_string()
+        } else {
+            let rest = trimmed.split_once(char::is_whitespace).map(|(_, rest)| rest).unwrap_or("");
+            crate::fuck_master::execute_slash(&inner.cfg, &cid, rest).unwrap_or_else(|e| format!("FuckMaster 操作失败：{e}"))
+        };
+        let action = match msg_type.as_str() {
+            "group" => json!({ "action": "send_group_msg", "params": { "group_id": target_id, "message": qq_clean(&reply) } }),
+            _ => json!({ "action": "send_private_msg", "params": { "user_id": target_id, "message": qq_clean(&reply) } }),
+        };
+        let _ = out_tx.send(action.to_string());
+        return;
+    }
     if text.trim().starts_with("/compact") {
         let inner2 = inner.clone();
         let out_tx2 = out_tx.clone();
@@ -350,15 +391,21 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
             return;
         }
         let mut stopped = 0usize;
+        let mut delayed_reminders = Vec::new();
         {
             let mut states = inner.states.lock().unwrap();
             for (cid2, st) in states.iter_mut() {
                 st.cancel.store(true, Ordering::Relaxed);
                 st.running = false;
                 st.pending = None;
+                delayed_reminders.extend(st.reminders.drain(..).map(|task| task.id));
                 stopped += 1;
                 log(&format!("[{cid2}] /stop 强制终结"));
             }
+        }
+        let now = crate::fuck_master::current_epoch();
+        for id in delayed_reminders {
+            let _ = crate::fuck_master::mark_failed(&inner.cfg, &id, now);
         }
         log(&format!("[qq] /stop 强制终结所有对话（{stopped} 个会话）"));
         let reply = format!("已强制终结所有对话（{stopped} 个会话，正在处理的请求已中断）");
@@ -401,43 +448,84 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
     };
     let agent_text = format!("【{role_tag} @{where_tag}】{text}");
     let mut states = inner.states.lock().unwrap();
-    let st = states.entry(cid.clone()).or_insert(ChatState { running: false, pending: None, msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
+    let st = states.entry(cid.clone()).or_default();
     st.pending = Some((agent_text, allow_tools));
-    if st.running {
-        return;                                      
+    drop(states);
+    start_chat_worker(inner, cid, msg_type, target_id, out_tx);
+}
+
+enum QueuedTurn {
+    User { text: String, allow_tools: bool },
+    Reminder(crate::fuck_master::MasterTask),
+}
+
+fn start_chat_worker(
+    inner: Arc<BridgeInner>,
+    cid: String,
+    msg_type: String,
+    target_id: i64,
+    out_tx: Sender<String>,
+) {
+    {
+        let mut states = inner.states.lock().unwrap();
+        let st = states.entry(cid.clone()).or_default();
+        if st.running || (st.pending.is_none() && st.reminders.is_empty()) {
+            return;
+        }
+        st.running = true;
     }
-    st.running = true;                               
-    drop(states);                             
-    let inner2 = inner.clone();
-    let out_tx2 = out_tx.clone();
     thread::spawn(move || {
         loop {
-            let mut states = inner2.states.lock().unwrap();
-            let st = states.entry(cid.clone()).or_insert(ChatState { running: false, pending: None, msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
+            let mut states = inner.states.lock().unwrap();
+            let st = states.entry(cid.clone()).or_default();
             if !st.running {
-                return;                                
+                return;
             }
-            let (job, allow_tools) = match &st.pending {
-                Some(p) => p.clone(),
-                None => break,                            
+            let queued = if let Some((text, allow_tools)) = st.pending.take() {
+                QueuedTurn::User { text, allow_tools }
+            } else if let Some(task) = st.reminders.pop_front() {
+                QueuedTurn::Reminder(task)
+            } else {
+                st.running = false;
+                return;
             };
-            st.pending = None;            
             let turn_cancel = st.cancel.clone();
-            drop(states);                         
-            let reply = run_chat_turn(&inner2, &cid, &job, allow_tools, out_tx2.clone(), turn_cancel);
+            drop(states);
+            let (job, allow_tools, reminder) = match queued {
+                QueuedTurn::User { text, allow_tools } => (text, allow_tools, None),
+                QueuedTurn::Reminder(task) => {
+                    if !crate::fuck_master::still_dispatchable(&inner.cfg, &task.id) {
+                        continue;
+                    }
+                    let where_tag = if msg_type == "group" { format!("群{target_id}") } else { "私聊".to_string() };
+                    let owner = inner.qq_cfg.admins.first().copied().unwrap_or(0);
+                    let prompt = format!(
+                        "【管理员 {owner} @{where_tag}】FuckMaster 定时推进目标：{}。现在主动联系用户，简短询问目前进展、遇到的阻碍和下一步计划。不要说这是系统提示。",
+                        task.goal
+                    );
+                    (prompt, false, Some(task))
+                }
+            };
+            let reply = run_chat_turn(&inner, &cid, &job, allow_tools, out_tx.clone(), turn_cancel);
             {
-                let mem_inner = inner2.clone();
+                let mem_inner = inner.clone();
                 let mem_cid = cid.clone();
-                let mem_dir = inner2.cfg.data_dir().join("memory");
-                let msgs = SessionStore::new(inner2.cfg.sessions_dir()).load(&mem_cid).messages;
+                let mem_dir = inner.cfg.data_dir().join("memory");
+                let msgs = SessionStore::new(inner.cfg.sessions_dir()).load(&mem_cid).messages;
                 thread::spawn(move || remember_one_turn(&mem_inner, &mem_cid, &mem_dir, msgs));
             }
             if reply.is_empty() {
+                if let Some(task) = reminder {
+                    let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, crate::fuck_master::current_epoch());
+                }
                 continue;
             }
             let cleaned = qq_clean(&reply);
             if cleaned.trim().is_empty() {
                 log(&format!("[qq] 回复过滤后为空，跳过发送: {reply:?}"));
+                if let Some(task) = reminder {
+                    let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, crate::fuck_master::current_epoch());
+                }
                 continue;
             }
             let action = match msg_type.as_str() {
@@ -450,32 +538,112 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
                     "params": { "user_id": target_id, "message": cleaned }
                 }),
             };
-            let _ = out_tx2.send(action.to_string());
-            let auto_new = inner2.cfg.qq.auto_new;
+            let sent = out_tx.send(action.to_string()).is_ok();
+            if let Some(task) = reminder {
+                let now = crate::fuck_master::current_epoch();
+                if sent {
+                    let _ = crate::fuck_master::mark_delivered(&inner.cfg, &task.id, now);
+                    log(&format!("[FuckMaster] {} 已推进 {}", task.id, task.chat));
+                } else {
+                    let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, now);
+                }
+                continue;
+            }
+            let auto_new = inner.cfg.qq.auto_new;
             if auto_new > 0 {
                 let mut hit = false;
                 {
-                    let mut states = inner2.states.lock().unwrap();
+                    let mut states = inner.states.lock().unwrap();
                     if let Some(st) = states.get_mut(&cid) {
                         st.msg_since_roll += 1;
                         hit = st.msg_since_roll >= auto_new;
                     }
                 }
                 if hit {
-                    auto_new_rollover(&inner2, &cid, &msg_type, target_id, out_tx2.clone());
-                    let mut states = inner2.states.lock().unwrap();
+                    auto_new_rollover(&inner, &cid, &msg_type, target_id, out_tx.clone());
+                    let mut states = inner.states.lock().unwrap();
                     if let Some(st) = states.get_mut(&cid) {
                         st.msg_since_roll = 0;
                     }
                 }
             }
         }
-        let mut states = inner2.states.lock().unwrap();
-        if let Some(st) = states.get_mut(&cid) {
-            st.running = false;
-        }
     });
 }
+
+fn chat_route(chat: &str) -> Option<(String, String, i64)> {
+    if let Some(id) = chat.strip_prefix("group:").and_then(|id| id.parse::<i64>().ok()) {
+        Some((format!("qq_g{id}"), "group".to_string(), id))
+    } else if let Some(id) = chat.strip_prefix("private:").and_then(|id| id.parse::<i64>().ok()) {
+        Some((format!("qq_u{id}"), "private".to_string(), id))
+    } else {
+        None
+    }
+}
+
+fn spawn_fuck_master_scheduler(
+    inner: Arc<BridgeInner>,
+    out_tx: Sender<String>,
+    connection_cancel: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !inner.cancel.load(Ordering::Relaxed) && !connection_cancel.load(Ordering::Relaxed) {
+            let now = crate::fuck_master::current_epoch();
+            match crate::fuck_master::claim_due(&inner.cfg, now) {
+                Ok(Some(task)) => {
+                    if let Some((cid, _, _)) = chat_route(&task.chat) {
+                        let mut states = inner.states.lock().unwrap();
+                        let st = states.entry(cid).or_default();
+                        if !st.reminders.iter().any(|queued| queued.id == task.id) {
+                            st.reminders.push_back(task);
+                        }
+                    } else {
+                        let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, now);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => log(&format!("[FuckMaster] 调度读取失败: {e}")),
+            }
+            if !crate::agent::runtime_is_busy() {
+                let route = {
+                    let states = inner.states.lock().unwrap();
+                    states.iter().find_map(|(cid, state)| {
+                        if state.running || state.reminders.is_empty() {
+                            return None;
+                        }
+                        let task = state.reminders.front()?;
+                        chat_route(&task.chat).filter(|(task_cid, _, _)| task_cid == cid)
+                    })
+                };
+                if let Some((cid, msg_type, target_id)) = route {
+                    start_chat_worker(inner.clone(), cid, msg_type, target_id, out_tx.clone());
+                }
+            }
+            for _ in 0..10 {
+                if inner.cancel.load(Ordering::Relaxed) || connection_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    })
+}
+
+fn sanitize_qq_action(raw: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    let action = value.get("action").and_then(Value::as_str).unwrap_or("");
+    if matches!(action, "send_group_msg" | "send_private_msg") {
+        if let Some(message) = value.get_mut("params").and_then(|params| params.get_mut("message")) {
+            if let Some(text) = message.as_str() {
+                *message = Value::String(qq_clean(text));
+            }
+        }
+    }
+    value.to_string()
+}
+
 fn qq_out_to_action(out: &QqOut) -> String {
     let (action, key, id) = if let Some(gid) = out.chat.strip_prefix("group:") {
         ("send_group_msg", "group_id", gid)
@@ -530,6 +698,15 @@ fn qq_clean(text: &str) -> String {
         if n >= 3 && line.chars().all(|c| c == '-' || c == '=' || c == '*') {
             continue;
         }
+        if line.contains('|') {
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            if cells.len() > 1 && cells.iter().all(|cell| {
+                let cell = cell.trim_matches(':').trim();
+                !cell.is_empty() && cell.chars().all(|c| c == '-')
+            }) {
+                continue;
+            }
+        }
         let mut s = line.to_string();
         loop {
             let t = s.trim_start();
@@ -559,7 +736,18 @@ fn qq_clean(text: &str) -> String {
                 None => break,
             }
         }
-        out.push(strip_inline(&s));
+        for checkbox in ["[ ]", "[x]", "[X]"] {
+            if s.starts_with(checkbox) {
+                s = s[checkbox.len()..].trim_start().to_string();
+                break;
+            }
+        }
+        let plain = if s.starts_with('|') || s.ends_with('|') || s.contains(" | ") {
+            s.trim_matches('|').split('|').map(str::trim).collect::<Vec<_>>().join("  ")
+        } else {
+            s
+        };
+        out.push(strip_emoji(&strip_inline(&plain)).trim_end().to_string());
     }
     out.join("\n")
 }
@@ -602,11 +790,34 @@ fn strip_inline(s: &str) -> String {
                 continue;
             }
         }
+        if (c == '~' || c == '_') && i + 1 < chars.len() && chars[i + 1] == c {
+            let marker = if c == '~' { "~~" } else { "__" };
+            if let Some(end) = find_seq(&chars, i + 2, marker) {
+                out.push_str(&strip_inline(&chars[i + 2..end].iter().collect::<String>()));
+                i = end + 2;
+                continue;
+            }
+        }
         if c == '`' {
             if let Some(end) = find_seq(&chars, i + 1, "`") {
                 out.push_str(&chars[i + 1..end].iter().collect::<String>());
                 i = end + 1;
                 continue;
+            }
+        }
+        if c == '<' {
+            if let Some(end) = find_seq(&chars, i + 1, ">") {
+                let target: String = chars[i + 1..end].iter().collect();
+                if target.starts_with("https://") || target.starts_with("http://") {
+                    out.push_str(&target);
+                    i = end + 1;
+                    continue;
+                }
+                if let Some(address) = target.strip_prefix("mailto:") {
+                    out.push_str(address);
+                    i = end + 1;
+                    continue;
+                }
             }
         }
         if c == '*' {
@@ -620,10 +831,47 @@ fn strip_inline(s: &str) -> String {
                 }
             }
         }
+        if c == '_' {
+            let prev_word = i > 0 && chars[i - 1].is_alphanumeric();
+            if !prev_word {
+                if let Some(end) = find_seq(&chars, i + 1, "_") {
+                    let after_word = end + 1 < chars.len() && chars[end + 1].is_alphanumeric();
+                    if !after_word {
+                        out.push_str(&chars[i + 1..end].iter().collect::<String>());
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
         out.push(c);
         i += 1;
     }
     out
+}
+
+fn strip_emoji(text: &str) -> String {
+    text.chars().filter(|c| {
+        let code = *c as u32;
+        !matches!(code,
+            0x00A9 |
+            0x00AE |
+            0x203C |
+            0x2049 |
+            0x2122 |
+            0x2139 |
+            0x3030 |
+            0x303D |
+            0x3297 |
+            0x3299 |
+            0x1F000..=0x1FAFF |
+            0x2600..=0x26FF |
+            0x2700..=0x27BF |
+            0xFE0E..=0xFE0F |
+            0x200D |
+            0x20E3
+        )
+    }).collect()
 }
 fn find_seq(chars: &[char], from: usize, needle: &str) -> Option<usize> {
     let n: Vec<char> = needle.chars().collect();
@@ -990,6 +1238,20 @@ mod tests {
         assert_eq!(qq_clean("**[粗](http://a.b)** 中的代码 `x`"), "粗（http://a.b） 中的代码 x");
     }
     #[test]
+    fn qq_clean_strips_emoji_and_more_markdown() {
+        let src = "## 进度 🚀\n| 项目 | 状态 |\n|---|---|\n| Rust | **完成** ✅ |\n- [x] ~~删除~~ __强调__ _斜体_ config_file\n<https://example.com>";
+        assert_eq!(qq_clean(src), "进度\n项目  状态\nRust  完成\n删除 强调 斜体 config_file\nhttps://example.com");
+        assert!(!qq_clean("你好😄👨‍💻！").chars().any(|c| (c as u32) >= 0x1F000));
+    }
+    #[test]
+    fn final_transport_sanitizes_every_qq_message() {
+        let raw = json!({"action":"send_private_msg","params":{"user_id":1,"message":"**完成** 🎉"}}).to_string();
+        let value: Value = serde_json::from_str(&sanitize_qq_action(&raw)).unwrap();
+        assert_eq!(value["params"]["message"], "完成");
+        let non_message = json!({"action":"get_status","params":{}}).to_string();
+        assert_eq!(sanitize_qq_action(&non_message), non_message);
+    }
+    #[test]
     fn qq_out_to_action_json_shape() {
         let out = QqOut { chat: "group:728563593".into(), text: "在呀！老大有啥事吗？".into() };
         let v: serde_json::Value = serde_json::from_str(&qq_out_to_action(&out)).unwrap();
@@ -1126,7 +1388,7 @@ mod tests {
     fn manual_compact_skips_when_running() {
         let sessions = tmp_sessions_dir("running");
         let inner = bridge_with(qq_cfg(vec![123], vec![456]));
-        inner.states.lock().unwrap().insert("qq_g123".into(), ChatState { running: true, pending: None, msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
+        inner.states.lock().unwrap().insert("qq_g123".into(), ChatState { running: true, ..ChatState::default() });
         let reply = do_manual_compact(&inner, "qq_g123", &sessions);
         assert!(reply.contains("稍等"), "生成中应提示稍等: {reply}");
     }
@@ -1165,7 +1427,7 @@ mod tests {
         for i in 0..3 {
             store.append(&Msg::new("user", format!("旧消息 {i}")));
         }
-        inner.states.lock().unwrap().insert("qq_g123".into(), ChatState { running: true, pending: None, msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
+        inner.states.lock().unwrap().insert("qq_g123".into(), ChatState { running: true, ..ChatState::default() });
         let inner2 = inner.clone();
         let t = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1264,6 +1526,23 @@ mod tests {
         assert!(!should_respond(&inner, &private_ev(789, "你好"), "10001"));
     }
     #[test]
+    fn fuck_master_command_bypasses_group_trigger_and_persists() {
+        let mut qq = qq_cfg(vec![123], vec![456]);
+        qq.admins = vec![777];
+        let inner = bridge_with(qq);
+        let mut ev = group_ev(123, "/FuckMaster add 2h 推进找工作学习路线");
+        ev["user_id"] = json!(777);
+        assert!(should_respond(&inner, &ev, "10001"));
+        let (tx, rx) = channel::<String>();
+        handle_message(inner.clone(), &ev, tx);
+        let raw = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("应返回注册结果");
+        let action: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(action["params"]["message"].as_str().unwrap().contains("fm-0001"), true);
+        let list = crate::fuck_master::execute_tool(&inner.cfg, "qq_g123", &json!({"action":"list"})).unwrap();
+        assert!(list.contains("推进找工作学习路线"));
+        let _ = std::fs::remove_dir_all(inner.cfg.data_dir());
+    }
+    #[test]
     fn single_message_gets_reply() {
         let inner = bridge_with(qq_cfg(vec![123], vec![456]));
         let (tx, rx) = channel::<String>();
@@ -1284,7 +1563,7 @@ mod tests {
         let _ = std::fs::remove_file(inner.cfg.sessions_dir().join("qq_g123.jsonl"));
     }
     #[test]
-    fn reacted_emoji_before_reply() {
+    fn never_sends_emoji_reaction_before_reply() {
         let inner = bridge_with(qq_cfg(vec![123], vec![456]));
         let (tx, rx) = channel::<String>();
         let mut ev = group_ev(123, "yjlcoder 你好");
@@ -1292,24 +1571,20 @@ mod tests {
         handle_message(inner.clone(), &ev, tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut first: Option<String> = None;
-        let mut saw_reply = false;
         while std::time::Instant::now() < deadline {
             if let Ok(s) = rx.try_recv() {
                 if first.is_none() {
                     first = Some(s.clone());
                 }
                 if s.contains("send_group_msg") {
-                    saw_reply = true;
                     break;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let f = first.expect("应首先收到表情 action");
-        assert!(f.contains("set_msg_emoji_like"), "first action: {f}");
-        assert!(f.contains("\"message_id\":42"), "first action: {f}");
-        assert!(f.contains("\"emoji_id\":\"76\""), "first action: {f}");
-        assert!(saw_reply, "随后应有回复 action");
+        let f = first.expect("应收到回复 action");
+        assert!(f.contains("send_group_msg"), "first action: {f}");
+        assert!(!f.contains("emoji"), "禁止发送任何 Emoji reaction: {f}");
         let _ = std::fs::remove_file(inner.cfg.sessions_dir().join("qq_g123.jsonl"));
     }
     #[test]
@@ -1318,7 +1593,7 @@ mod tests {
         let cid = "qq_g123".to_string();
         {
             let mut states = inner.states.lock().unwrap();
-            states.insert(cid.clone(), ChatState { running: true, pending: Some(("第一条".into(), true)), msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
+            states.insert(cid.clone(), ChatState { running: true, pending: Some(("第一条".into(), true)), ..ChatState::default() });
         }
         let (tx, _rx) = channel::<String>();
         handle_message(inner.clone(), &group_ev(123, "yjlcoder 第二条"), tx);
@@ -1334,8 +1609,8 @@ mod tests {
         let inner = bridge_with(qq);
         {
             let mut states = inner.states.lock().unwrap();
-            states.insert("qq_g123".into(), ChatState { running: true, pending: Some(("旧消息".into(), true)), msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
-            states.insert("qq_u456".into(), ChatState { running: true, pending: None, msg_since_roll: 0, cancel: Arc::new(AtomicBool::new(false)) });
+            states.insert("qq_g123".into(), ChatState { running: true, pending: Some(("旧消息".into(), true)), ..ChatState::default() });
+            states.insert("qq_u456".into(), ChatState { running: true, ..ChatState::default() });
         }
         let (tx, rx) = channel::<String>();
         let mut ev = group_ev(123, "/stop");

@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use crate::backend::TokenBudget;
@@ -24,6 +24,23 @@ const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;
 const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 4;
 const NO_PERM_MSG: &str = "（无权限：当前用户只能闲聊，无法操作电脑或调用工具。请礼貌拒绝，不要尝试其他工具。）";
+static ACTIVE_AGENT_TURNS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveTurnGuard;
+impl ActiveTurnGuard {
+    fn enter() -> Self {
+        ACTIVE_AGENT_TURNS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        ACTIVE_AGENT_TURNS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+pub fn runtime_is_busy() -> bool {
+    ACTIVE_AGENT_TURNS.load(Ordering::Acquire) > 0
+}
 #[derive(Default)]
 struct ToolLoopGuard {
     last_call: Option<String>,
@@ -368,6 +385,7 @@ impl Agent {
         }
     }
     pub fn run_turn(&mut self, user_input: &str, on_event: &mut impl FnMut(AgentEvent)) -> Result<String, String> {
+        let _active_turn = ActiveTurnGuard::enter();
         self.cancel.store(false, Ordering::Relaxed);
         self.last_usage = crate::llm::Usage::default();
         self.last_timings = crate::llm::Timings::default();

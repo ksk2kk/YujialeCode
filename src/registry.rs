@@ -124,6 +124,7 @@ pub const CATEGORIES: &[Category] = &[
         title: "持续目标",
         tools: &[
             ToolDef { name: "goal", desc: "读取目标状态，或在严格完成审计后标记 complete；同一不可克服原因连续三轮才可 blocked", args: "{\"action\":\"get\"} 或 {\"action\":\"update\",\"status\":\"complete|blocked\",\"reason\":\"证据或阻塞原因\"}" },
+            ToolDef { name: "fuck_master", desc: "注册持久化主动推进任务；到点后模型空闲才通过 QQ 追问，忙碌时自动等待。支持查看、暂停、恢复、立即执行和删除", args: "{\"action\":\"add|list|pause|resume|now|delete\",\"goal\":\"推进找工作学习路线\",\"every\":\"1d\",\"chat\":\"private:123\",\"id\":\"fm-0001\"}" },
         ],
     },
 ];
@@ -198,6 +199,7 @@ mod tests {
         assert!(names.contains(&"portscan"));
         assert!(names.contains(&"install_skill"));
         assert!(names.contains(&"qq_send"));
+        assert!(names.contains(&"fuck_master"));
     }
     #[test]
     fn list_outputs() {
@@ -206,6 +208,7 @@ mod tests {
         assert!(index.contains("[sec]"));
         let file = list_category_text("file").unwrap();
         assert!(file.contains("readline"));
+        assert!(list_category_text("goal").unwrap().contains("fuck_master"));
         assert!(list_category_text("nope").is_none());
     }
     #[test]
