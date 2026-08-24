@@ -423,6 +423,7 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                     }
                 }
                 AgentEvent::ToolRun { op, args } => tui.push_tool(&op, &args),
+                AgentEvent::ToolProgress(progress) => tui.push_tool_progress(&progress),
                 AgentEvent::ToolResult(r) => tui.push_tool_result(&r),
                 AgentEvent::Notice(n) => tui.push_system(n),
                 AgentEvent::Garbage { kind, sample, run, total, limit } => {
@@ -710,6 +711,7 @@ fn spawn_turn(turn: TurnSpawn) -> TurnChannels {
             Agent::with_store(turn.cfg, turn.llm, turn.store, None, false, false, turn.cancel);
         agent.set_ask_channels(turn.ask_tx, answer_rx);
         agent.set_perm_channels(turn.perm_tx, decision_rx, turn.perm_auto, turn.perm_allowed);
+        agent.set_tool_event_channel(turn.ev_tx.clone());
         match agent.run_turn(&turn.input, &mut |ev| {
             let _ = turn.ev_tx.send(ev);
         }) {

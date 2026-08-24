@@ -183,6 +183,7 @@ pub enum AgentEvent {
     Delta(String),
     Reasoning(String),
     ToolRun { op: String, args: String },
+    ToolProgress(crate::tools::ToolProgress),
     ToolResult(String),
     Notice(String),
     Error(String),
@@ -210,6 +211,12 @@ fn trace_record_at(data_root: &std::path::Path, session: &str, ev: &AgentEvent) 
             "kind": "garbage", "pos": kind, "sample": sample, "run": run, "total": total, "limit": limit
         }),
         AgentEvent::ToolRun { op, args } => serde_json::json!({"kind": "tool_run", "op": op, "args": args}),
+        AgentEvent::ToolProgress(progress) => serde_json::json!({
+            "kind": "tool_progress",
+            "elapsed_secs": progress.elapsed_secs,
+            "total_lines": progress.total_lines,
+            "total_bytes": progress.total_bytes,
+        }),
         AgentEvent::ToolResult(r) => serde_json::json!({"kind": "tool_result", "text": r}),
         AgentEvent::Notice(n) => serde_json::json!({"kind": "notice", "text": n}),
         AgentEvent::Error(e) => serde_json::json!({"kind": "error", "text": e}),
@@ -243,6 +250,7 @@ pub struct Agent {
     perm_auto: Arc<AtomicBool>,
     perm_allowed: Arc<Mutex<HashSet<String>>>,
     perm_seq: Arc<AtomicU64>,
+    tool_event_tx: Option<Sender<AgentEvent>>,
     pub last_usage: crate::llm::Usage,
     pub last_timings: crate::llm::Timings,
 }
@@ -272,6 +280,7 @@ impl Agent {
             perm_auto: Arc::new(AtomicBool::new(false)),
             perm_allowed: Arc::new(Mutex::new(HashSet::new())),
             perm_seq: Arc::new(AtomicU64::new(0)),
+            tool_event_tx: None,
             last_usage: crate::llm::Usage::default(),
             last_timings: crate::llm::Timings::default(),
         }
@@ -291,6 +300,9 @@ impl Agent {
         self.perm_rx = Some(rx);
         self.perm_auto = auto;
         self.perm_allowed = allowed;
+    }
+    pub fn set_tool_event_channel(&mut self, tx: Sender<AgentEvent>) {
+        self.tool_event_tx = Some(tx);
     }
     pub fn for_session(
         cfg: Config,
@@ -916,6 +928,7 @@ impl Agent {
             mem_dir: None,
             ask,
             perm,
+            event_tx: self.tool_event_tx.as_ref(),
         };
         match execute(op, args, &mut ctx) {
             Ok(out) => out,

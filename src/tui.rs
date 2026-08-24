@@ -209,6 +209,7 @@ pub struct Tui {
     perm_prompt: Option<PermUi>,
     mascot_state: MascotState,
     last_tool_op: Option<String>,
+    tool_progress_index: Option<usize>,
     last_frame: String,
     in_paste: bool,
     paste_prev_cr: bool,
@@ -288,6 +289,7 @@ impl Tui {
             perm_prompt: None,
             mascot_state: MascotState::Idle,
             last_tool_op: None,
+            tool_progress_index: None,
             last_frame: String::new(),
             in_paste: false,
             paste_prev_cr: false,
@@ -495,12 +497,48 @@ impl Tui {
         self.mascot_event(MascotEvent::ToolStart);
         let (canonical, display, detail) = tool_display(op, args);
         self.last_tool_op = Some(canonical);
+        self.tool_progress_index = None;
         self.chat.push(ChatLine {
             role: ChatRole::Tool,
             text: format!("{display}({detail})"),
             pending: false,
             op: Some(display),
         });
+        self.scroll = 0;
+    }
+    pub fn push_tool_progress(&mut self, progress: &crate::tools::ToolProgress) {
+        self.mascot_event(MascotEvent::ToolStart);
+        let clean = strip_ansi(&progress.output);
+        let lines: Vec<&str> = clean.lines().filter(|line| !line.trim().is_empty()).collect();
+        let visible = lines.len().min(5);
+        let tail = lines[lines.len().saturating_sub(visible)..].join("\n");
+        let size = human_bytes(progress.total_bytes);
+        let status = if progress.total_lines == 0 {
+            format!("Running… {}s · {size}", progress.elapsed_secs)
+        } else {
+            format!("Running… {}s · {} lines · {size}", progress.elapsed_secs, progress.total_lines)
+        };
+        let text = if tail.is_empty() {
+            status
+        } else {
+            format!("{tail}\n{status}")
+        };
+        if let Some(index) = self.tool_progress_index {
+            if let Some(line) = self.chat.get_mut(index) {
+                line.text = text;
+                line.pending = true;
+                self.scroll = 0;
+                return;
+            }
+        }
+        let index = self.chat.len();
+        self.chat.push(ChatLine {
+            role: ChatRole::ToolResult,
+            text,
+            pending: true,
+            op: None,
+        });
+        self.tool_progress_index = Some(index);
         self.scroll = 0;
     }
     pub fn push_tool_result(&mut self, result: &str) {
@@ -511,17 +549,25 @@ impl Tui {
             MascotEvent::ToolOk
         });
         let op = self.last_tool_op.take();
+        let clean_result = strip_ansi(result);
         let text = if matches!(op.as_deref(), Some("readline" | "listdir")) {
-            result.to_string()
+            clean_result
         } else {
-            let snippet: String = result.chars().take(400).collect();
-            let more = if result.chars().count() > 400 {
-                format!("\n…共 {} 字符", result.chars().count())
+            let snippet: String = clean_result.chars().take(1_200).collect();
+            let more = if clean_result.chars().count() > 1_200 {
+                format!("\n…共 {} 字符", clean_result.chars().count())
             } else {
                 String::new()
             };
             format!("{snippet}{more}")
         };
+        if let Some(index) = self.tool_progress_index.take() {
+            if let Some(line) = self.chat.get_mut(index) {
+                *line = ChatLine::new(ChatRole::ToolResult, text);
+                self.scroll = 0;
+                return;
+            }
+        }
         self.chat.push(ChatLine::new(ChatRole::ToolResult, text));
         self.scroll = 0;
     }
@@ -571,6 +617,8 @@ impl Tui {
     }
     pub fn clear_chat(&mut self) {
         self.chat.clear();
+        self.last_tool_op = None;
+        self.tool_progress_index = None;
         self.scroll = 0;
         self.mascot_event(MascotEvent::Cancel);
     }
@@ -2300,6 +2348,15 @@ fn tool_result_failed(result: &str) -> bool {
             .is_some_and(|code| code != 0)
     })
 }
+fn human_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / 1024.0 / 1024.0)
+    }
+}
 fn mascot_art(state: MascotState) -> [String; 6] {
     let (antenna, eyes, mouth, bubble) = match state {
         MascotState::Idle => ("   ╭╮", "• •", "ᴗ", ""),
@@ -2942,6 +2999,35 @@ mod tests {
         assert_eq!(t.mascot_state, MascotState::Thinking);
         t.end_assistant("完成");
         assert_eq!(t.mascot_state, MascotState::Success);
+    }
+    #[test]
+    fn shell_progress_updates_one_row_and_final_result_replaces_it() {
+        let mut t = Tui::new();
+        t.push_tool("execute_command", r#"{"cmd":"printf first; sleep 2"}"#);
+        let before = t.chat.len();
+        t.push_tool_progress(&crate::tools::ToolProgress {
+            output: "first".into(),
+            elapsed_secs: 1,
+            total_lines: 1,
+            total_bytes: 5,
+        });
+        assert_eq!(t.chat.len(), before + 1);
+        let progress_index = t.tool_progress_index.unwrap();
+        assert!(t.chat[progress_index].text.contains("first"));
+        assert!(t.chat[progress_index].text.contains("Running… 1s"));
+        t.push_tool_progress(&crate::tools::ToolProgress {
+            output: "first\nsecond".into(),
+            elapsed_secs: 2,
+            total_lines: 2,
+            total_bytes: 12,
+        });
+        assert_eq!(t.chat.len(), before + 1, "progress must update instead of appending rows");
+        assert!(t.chat[progress_index].text.contains("second"));
+        t.push_tool_result("exit code: 0\nfirst\nsecond\n");
+        assert_eq!(t.chat.len(), before + 1);
+        assert!(t.tool_progress_index.is_none());
+        assert!(!t.chat[progress_index].pending);
+        assert!(t.chat[progress_index].text.contains("exit code: 0"));
     }
     #[test]
     fn fixed_welcome_header_is_identical_while_chat_scrolls() {

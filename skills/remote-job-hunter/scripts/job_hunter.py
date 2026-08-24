@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import ssl
 import sys
+import threading
 import time
 from typing import Any, Iterable
 import urllib.error
@@ -34,7 +35,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent.parent
 REFERENCES = ROOT / "references"
 USER_AGENT = "YJLCoder-RemoteJobHunter/1.0 (+https://github.com/ksk2kk/YujialeCode)"
-DEFAULT_TIMEOUT = 25
+DEFAULT_TIMEOUT = 15
 BEIJING = ZoneInfo("Asia/Shanghai")
 UTC = dt.timezone.utc
 QUERY_MATRIX = [
@@ -144,6 +145,13 @@ def parse_date(value: Any) -> str | None:
 def age_days(value: str | None) -> float | None:
     if not value:
         return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return max(0.0, (dt.datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() / 86400)
+    except ValueError:
+        return None
 
 
 def is_active(job: dict[str, Any], freshness_days: int) -> bool:
@@ -157,13 +165,6 @@ def is_active(job: dict[str, Any], freshness_days: int) -> bool:
             pass
     age = age_days(job.get("published_at"))
     return age is None or age <= max(1, freshness_days)
-    try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return max(0.0, (dt.datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() / 86400)
-    except ValueError:
-        return None
 
 
 def canonical_url(url: str) -> str:
@@ -187,6 +188,17 @@ class HttpClient:
         self.timeout = timeout
         self.host_last: dict[str, float] = {}
         self.context = ssl.create_default_context()
+        self.thread_state = threading.local()
+
+    def set_deadline(self, deadline: float) -> None:
+        self.thread_state.deadline = deadline
+
+    def clear_deadline(self) -> None:
+        self.thread_state.deadline = None
+
+    def remaining(self) -> float | None:
+        deadline = getattr(self.thread_state, "deadline", None)
+        return None if deadline is None else deadline - time.monotonic()
 
     def get(self, url: str, headers: dict[str, str] | None = None, force: bool = False) -> bytes:
         key = hashlib.sha256((url + json.dumps(headers or {}, sort_keys=True)).encode()).hexdigest()
@@ -207,10 +219,14 @@ class HttpClient:
         req_headers.update(headers or {})
         request = urllib.request.Request(url, headers=req_headers)
         error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
+                remaining = self.remaining()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("该来源超过抓取时间预算")
                 self.host_last[host] = time.monotonic()
-                with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as response:
+                request_timeout = self.timeout if remaining is None else max(1.0, min(self.timeout, remaining))
+                with urllib.request.urlopen(request, timeout=request_timeout, context=self.context) as response:
                     data = response.read(12_000_000)
                     if not data:
                         raise RuntimeError("空响应")
@@ -1181,7 +1197,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if selected: sources = [s for s in sources if s["id"] in selected]
     cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "yjlcoder" / "remote-job-hunter"
     client = HttpClient(cache, ttl=args.cache_ttl)
-    rates, rate_source = fetch_rates(client)
+    print(f"[准备] 将检查 {len(sources)} 个来源；单来源最多 {args.source_timeout}s", flush=True)
+    client.set_deadline(time.monotonic() + min(30, args.source_timeout))
+    try:
+        rates, rate_source = fetch_rates(client)
+    finally:
+        client.clear_deadline()
+    print(f"[准备] 汇率数据：{rate_source}", flush=True)
     raw_jobs: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
     failed: set[str] = set()
@@ -1189,19 +1211,27 @@ def cmd_scan(args: argparse.Namespace) -> int:
     def run(source: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         source_feed_defaults(source)
         started = time.monotonic()
+        client.set_deadline(started + args.source_timeout)
         try:
             jobs = CONNECTORS[source["connector"]](source, client, args.max_per_source)
             status = "ok" if jobs else "empty"
             error = "" if jobs else "公开通道返回 0 条；已生成搜索降级任务"
         except Exception as exc:
             jobs, status, error = [], "failed", str(exc)[:500]
+        finally:
+            client.clear_deadline()
         return jobs, {"source_id": source["id"], "source": source["name"], "access": source["access"], "priority": source.get("priority", 0),
                       "status": status, "count": len(jobs), "elapsed_ms": round((time.monotonic() - started) * 1000), "error": error}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.workers, 8))) as pool:
         futures = {pool.submit(run, source): source for source in automated}
-        for future in concurrent.futures.as_completed(futures):
+        for completed, future in enumerate(concurrent.futures.as_completed(futures), 1):
             jobs, status = future.result(); raw_jobs.extend(jobs); reports.append(status)
             if status["status"] != "ok": failed.add(status["source_id"])
+            print(
+                f"[{completed}/{len(automated)}] {status['source']}: {status['status']} · "
+                f"{status['count']} 条 · {status['elapsed_ms'] / 1000:.1f}s",
+                flush=True,
+            )
     for source in sources:
         if source not in automated:
             reports.append({"source_id": source["id"], "source": source["name"], "access": source["access"], "priority": source.get("priority", 0),
@@ -1229,6 +1259,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     coverage = {"generated_at": now_iso(), "sources_selected": len(sources), "automated_attempted": len(automated), "successful": sum(r["status"] == "ok" for r in reports),
                 "failed_or_empty": len(failed), "raw_jobs": len(raw_jobs), "deduplicated_jobs": len(jobs), "search_tasks": len(tasks)}
     atomic_write(out / "coverage.json", json.dumps(coverage, ensure_ascii=False, indent=2))
+    print(f"[完成] 报告已写入 {out}", flush=True)
     print(json.dumps(coverage, ensure_ascii=False, indent=2))
     return 0 if jobs or tasks else 2
 
@@ -1268,7 +1299,9 @@ def parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="抓取所有可自动化来源并生成报告")
     scan.add_argument("--profile", default=str(REFERENCES / "profile.json")); scan.add_argument("--output", default="remote-jobs")
     scan.add_argument("--sources", help="逗号分隔的 source id；空值表示全部"); scan.add_argument("--max-per-source", type=int, default=100)
-    scan.add_argument("--workers", type=int, default=6); scan.add_argument("--cache-ttl", type=int, default=1800); scan.set_defaults(func=cmd_scan)
+    scan.add_argument("--workers", type=int, default=6); scan.add_argument("--cache-ttl", type=int, default=1800)
+    scan.add_argument("--source-timeout", type=int, default=60, help="每个招聘来源的最长抓取秒数")
+    scan.set_defaults(func=cmd_scan)
     analyze = sub.add_parser("analyze", help="只分析已有 JSONL")
     analyze.add_argument("--input", required=True); analyze.add_argument("--profile", default=str(REFERENCES / "profile.json")); analyze.add_argument("--output", default="remote-jobs"); analyze.set_defaults(func=cmd_analyze)
     imp = sub.add_parser("import", help="合并网页搜索补充 JSONL 后重新分析")

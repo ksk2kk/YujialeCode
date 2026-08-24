@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use crate::config::Config;
 use crate::llm::Llm;
 use crate::registry::{list_categories_text, list_category_text};
@@ -79,6 +81,13 @@ pub struct PermHandle<'a> {
     pub auto: &'a AtomicBool,
     pub allowed: &'a Mutex<HashSet<String>>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolProgress {
+    pub output: String,
+    pub elapsed_secs: u64,
+    pub total_lines: usize,
+    pub total_bytes: usize,
+}
 pub struct ToolCtx<'a> {
     pub cfg: &'a Config,
     pub store: &'a mut SessionStore,
@@ -88,6 +97,7 @@ pub struct ToolCtx<'a> {
     pub mem_dir: Option<std::path::PathBuf>,
     pub ask: Option<AskHandle<'a>>,
     pub perm: Option<PermHandle<'a>>,
+    pub event_tx: Option<&'a Sender<crate::agent::AgentEvent>>,
 }
 pub const KNOWN_OPS: &[&str] = &[
     "execute_command",
@@ -369,66 +379,309 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
             }
         }
     }
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&cmd)
         .current_dir(cwd)
+        // The TUI owns the terminal. Giving the child the same stdin makes both
+        // readers race for keystrokes and can freeze either side. Commands are
+        // deliberately non-interactive; ask_user supplies any required values.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("PYTHONUNBUFFERED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("PAGER", "cat");
+    configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("启动命令失败: {e}"))?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
-    loop {
+    let process_group = child.id();
+    let stdout = child.stdout.take().ok_or("无法连接命令 stdout")?;
+    let stderr = child.stderr.take().ok_or("无法连接命令 stderr")?;
+    // Bounded readers drain both pipes while the process is alive. The old code
+    // waited for exit before reading; once either OS pipe filled, child and
+    // parent waited on each other forever.
+    let (pipe_tx, pipe_rx) = sync_channel(64);
+    spawn_pipe_reader(stdout, PipeKind::Stdout, pipe_tx.clone());
+    spawn_pipe_reader(stderr, PipeKind::Stderr, pipe_tx);
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(timeout);
+    let mut capture = CommandCapture::default();
+    let mut last_progress = started.checked_sub(Duration::from_secs(2)).unwrap_or(started);
+    let mut last_heartbeat = started;
+    let (status, stop) = loop {
+        while let Ok(chunk) = pipe_rx.try_recv() {
+            capture.accept(chunk);
+        }
+        let now = std::time::Instant::now();
+        if capture.too_large {
+            break (None, CommandStop::OutputLimit);
+        }
+        if ctx.cancel.load(Ordering::Relaxed) {
+            break (None, CommandStop::Cancelled);
+        }
+        if now >= deadline {
+            break (None, CommandStop::Timeout);
+        }
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_string(&mut out);
-                }
-                if let Some(mut se) = child.stderr.take() {
-                    let mut e = String::new();
-                    let _ = se.read_to_string(&mut e);
-                    if !e.is_empty() {
-                        out.push_str(&format!("\n[stderr]\n{e}"));
-                    }
-                }
-                let code = status.code().unwrap_or(-1);
-                return Ok(format!("exit code: {code}\n{out}"));
+            Ok(Some(status)) => break (Some(status), CommandStop::Completed),
+            Ok(None) => {}
+            Err(e) => {
+                terminate_process_tree(&mut child, process_group);
+                return Err(format!("等待命令失败: {e}"));
             }
-            Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let mut out = String::new();
-                    if let Some(mut so) = child.stdout.take() {
-                        let _ = so.read_to_string(&mut out);
-                    }
-                    if let Some(mut se) = child.stderr.take() {
-                        let mut e = String::new();
-                        let _ = se.read_to_string(&mut e);
-                        if !e.is_empty() {
-                            out.push_str(&format!("\n[stderr]\n{e}"));
-                        }
-                    }
-                    let hint = format!(
-                        "命令超过 {timeout}s 未结束，已被终止。若需要更长的执行时间，\
-                         请在 execute_command 参数中传入 \"timeout\": 秒数，例如 \
-                         {{\"cmd\":\"{cmd}\",\"timeout\":900}}"
-                    );
-                    if out.trim().is_empty() {
-                        return Ok(format!(
-                            "命令超时（>{timeout}s）已终止，且没有产生任何输出（进程一直在安静等待）。{hint}"
-                        ));
-                    }
-                    return Ok(format!(
-                        "命令超时（>{timeout}s）已终止。以下是终止前已产生的输出：\n{out}\n{hint}"
-                    ));
+        }
+        let output_due = capture.progress_dirty
+            && now.duration_since(last_progress) >= Duration::from_millis(500);
+        let heartbeat_due = now.duration_since(last_heartbeat) >= Duration::from_secs(1);
+        if output_due || heartbeat_due {
+            send_command_progress(ctx, &mut capture, started);
+            last_progress = now;
+            last_heartbeat = now;
+        }
+        match pipe_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => capture.accept(chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {}
+        }
+    };
+
+    if stop == CommandStop::Completed {
+        // A shell can exit while a background grandchild still owns its pipes.
+        // YJLcoder has no background-task contract yet, so clean that group up
+        // instead of leaking it into future sessions.
+        terminate_process_group(process_group);
+    } else {
+        terminate_process_tree(&mut child, process_group);
+    }
+    drain_pipe_readers(&pipe_rx, &mut capture);
+    send_command_progress(ctx, &mut capture, started);
+
+    let code = match stop {
+        CommandStop::Completed => status.as_ref().map(exit_code).unwrap_or(-1),
+        CommandStop::Cancelled => 130,
+        CommandStop::Timeout => 124,
+        CommandStop::OutputLimit => 125,
+    };
+    let mut out = capture.finish();
+    match stop {
+        CommandStop::Completed => {}
+        CommandStop::Cancelled => out.push_str("\n[系统] 用户按 Esc 中断，已终止整个命令进程树。\n"),
+        CommandStop::Timeout => out.push_str(&format!(
+            "\n[系统] 命令超过 {timeout}s，已终止整个命令进程树。需要更久时给 execute_command 传入 timeout。\n"
+        )),
+        CommandStop::OutputLimit => out.push_str(&format!(
+            "\n[系统] 命令输出超过 {} MiB，为防止 TUI 内存耗尽，已终止整个命令进程树。\n",
+            COMMAND_MAX_CAPTURE_BYTES / 1024 / 1024
+        )),
+    }
+    Ok(format!("exit code: {code}\n{out}"))
+}
+
+const COMMAND_MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+const COMMAND_PROGRESS_TAIL_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeKind {
+    Stdout,
+    Stderr,
+}
+
+enum PipeChunk {
+    Data(PipeKind, Vec<u8>),
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStop {
+    Completed,
+    Cancelled,
+    Timeout,
+    OutputLimit,
+}
+
+#[derive(Default)]
+struct CommandCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    tail: Vec<u8>,
+    total_bytes: usize,
+    newline_count: usize,
+    last_byte: Option<u8>,
+    readers_done: usize,
+    too_large: bool,
+    progress_dirty: bool,
+}
+
+impl CommandCapture {
+    fn accept(&mut self, chunk: PipeChunk) {
+        match chunk {
+            PipeChunk::Done => self.readers_done += 1,
+            PipeChunk::Data(kind, data) => {
+                self.total_bytes = self.total_bytes.saturating_add(data.len());
+                self.newline_count = self
+                    .newline_count
+                    .saturating_add(data.iter().filter(|byte| **byte == b'\n').count());
+                self.last_byte = data.last().copied().or(self.last_byte);
+                self.progress_dirty = true;
+
+                if kind == PipeKind::Stderr && !data.is_empty() {
+                    self.push_tail(b"[stderr] ");
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                self.push_tail(&data);
+
+                let captured = self.stdout.len().saturating_add(self.stderr.len());
+                let remaining = COMMAND_MAX_CAPTURE_BYTES.saturating_sub(captured);
+                let take = remaining.min(data.len());
+                match kind {
+                    PipeKind::Stdout => self.stdout.extend_from_slice(&data[..take]),
+                    PipeKind::Stderr => self.stderr.extend_from_slice(&data[..take]),
+                }
+                if take < data.len() || self.total_bytes > COMMAND_MAX_CAPTURE_BYTES {
+                    self.too_large = true;
+                }
             }
-            Err(e) => return Err(format!("等待命令失败: {e}")),
         }
     }
+
+    fn push_tail(&mut self, data: &[u8]) {
+        self.tail.extend_from_slice(data);
+        if self.tail.len() > COMMAND_PROGRESS_TAIL_BYTES {
+            let remove = self.tail.len() - COMMAND_PROGRESS_TAIL_BYTES;
+            self.tail.drain(..remove);
+        }
+    }
+
+    fn total_lines(&self) -> usize {
+        self.newline_count
+            + usize::from(self.total_bytes > 0 && self.last_byte != Some(b'\n'))
+    }
+
+    fn live_output(&self) -> String {
+        String::from_utf8_lossy(&self.tail).trim_end().to_string()
+    }
+
+    fn finish(self) -> String {
+        let mut output = String::from_utf8_lossy(&self.stdout).into_owned();
+        if !self.stderr.is_empty() {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str("[stderr]\n");
+            output.push_str(&String::from_utf8_lossy(&self.stderr));
+        }
+        output
+    }
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    kind: PipeKind,
+    tx: SyncSender<PipeChunk>,
+) {
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(PipeChunk::Data(kind, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(PipeChunk::Done);
+    });
+}
+
+fn send_command_progress(ctx: &ToolCtx<'_>, capture: &mut CommandCapture, started: std::time::Instant) {
+    let Some(tx) = ctx.event_tx else {
+        capture.progress_dirty = false;
+        return;
+    };
+    let _ = tx.send(crate::agent::AgentEvent::ToolProgress(ToolProgress {
+        output: capture.live_output(),
+        elapsed_secs: started.elapsed().as_secs(),
+        total_lines: capture.total_lines(),
+        total_bytes: capture.total_bytes,
+    }));
+    capture.progress_dirty = false;
+}
+
+fn drain_pipe_readers(rx: &Receiver<PipeChunk>, capture: &mut CommandCapture) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while capture.readers_done < 2 && std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(chunk) => capture.accept(chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    while let Ok(chunk) = rx.try_recv() {
+        capture.accept(chunk);
+    }
+}
+
+fn exit_code(status: &ExitStatus) -> i32 {
+    status.code().unwrap_or(-1)
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group: u32) {
+    unsafe {
+        libc::kill(-(process_group as i32), libc::SIGTERM);
+        libc::kill(-(process_group as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_group: u32) {}
+
+fn terminate_process_tree(child: &mut Child, process_group: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(process_group as i32), libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+
+    for _ in 0..6 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                terminate_process_group(process_group);
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(process_group as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 fn execute_dynamic_tool(
     tool: &crate::dynamic_tools::DynamicTool,
@@ -1711,6 +1964,7 @@ mod tests {
         perm_seq: AtomicU64,
         perm_auto: AtomicBool,
         perm_allowed: Mutex<HashSet<String>>,
+        event_tx: Option<Sender<crate::agent::AgentEvent>>,
         _marker: std::marker::PhantomData<&'a ()>,
     }
     impl<'a> TestCtx<'a> {
@@ -1728,6 +1982,7 @@ mod tests {
                 perm_seq: AtomicU64::new(0),
                 perm_auto: AtomicBool::new(false),
                 perm_allowed: Mutex::new(HashSet::new()),
+                event_tx: None,
                 _marker: std::marker::PhantomData,
             }
         }
@@ -1761,6 +2016,7 @@ mod tests {
                         auto: &self.perm_auto,
                         allowed: &self.perm_allowed,
                     }),
+                event_tx: self.event_tx.as_ref(),
             }
         }
         fn ctx_with_mem(&mut self, mem_dir: std::path::PathBuf) -> ToolCtx<'_> {
@@ -1775,6 +2031,9 @@ mod tests {
         fn with_perm(&mut self, tx: Sender<PermRequest>, rx: Receiver<PermDecision>) {
             self.perm_tx = Some(tx);
             self.perm_rx = Some(rx);
+        }
+        fn with_events(&mut self, tx: Sender<crate::agent::AgentEvent>) {
+            self.event_tx = Some(tx);
         }
     }
     #[test]
@@ -2301,6 +2560,79 @@ mod tests {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_store"));
         let r = execute("execute_command", &json!({"cmd": "echo yjlcoder-test"}), &mut t.ctx()).unwrap();
         assert!(r.contains("yjlcoder-test"));
+    }
+    #[test]
+    fn execute_command_drains_large_output_without_pipe_deadlock() {
+        let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_large_output"));
+        let started = std::time::Instant::now();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "yes 0123456789 | head -c 1048576", "timeout": 5}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "large pipe output deadlocked");
+        assert!(r.starts_with("exit code: 0\n"), "r: {}", &r[..r.len().min(200)]);
+        assert!(r.len() >= 1_000_000);
+    }
+    #[test]
+    fn execute_command_emits_live_progress_before_exit() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_progress"));
+            t.with_events(event_tx);
+            execute(
+                "execute_command",
+                &json!({"cmd": "printf 'first\\n'; sleep 2; printf 'last\\n'", "timeout": 5}),
+                &mut t.ctx(),
+            )
+            .unwrap()
+        });
+        let progress = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match progress {
+            crate::agent::AgentEvent::ToolProgress(progress) => {
+                assert!(progress.output.contains("first"));
+                assert!(progress.total_bytes >= 6);
+            }
+            _ => panic!("expected live tool progress"),
+        }
+        let result = handle.join().unwrap();
+        assert!(result.contains("last"));
+    }
+    #[test]
+    fn execute_command_is_noninteractive_in_tui_context() {
+        let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_stdin"));
+        let started = std::time::Instant::now();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "if read value; then echo unexpected; else echo stdin-closed; fi", "timeout": 3}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(r.contains("stdin-closed"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn execute_command_timeout_kills_the_process_group() {
+        let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_tree"));
+        let started = std::time::Instant::now();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "sleep 30 & echo child=$!; wait", "timeout": 1}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "timeout did not return promptly");
+        assert!(r.starts_with("exit code: 124\n"), "r: {r}");
+        let pid = r
+            .lines()
+            .find_map(|line| line.strip_prefix("child="))
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .expect("child pid");
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "grandchild {pid} survived command timeout");
     }
     #[test]
     fn execute_command_never_runs_cat_for_file_reads() {
