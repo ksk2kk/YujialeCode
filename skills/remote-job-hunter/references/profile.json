@@ -27,5 +27,6 @@
   "worldwide_only": false,
   "freshness_days": 45,
   "preferred_weekly_hours": null,
-  "notes": "所有能带来合法收入的雇佣形式都纳入；优先全球可申请、报酬高、时区友好和匹配度高的岗位。"
+  "priority_focus": "early_career_supported",
+  "notes": "所有能带来合法收入的雇佣形式都纳入；最高优先福利较好、实习/校招/Junior、明确培训或有人带、经验要求低且人在中国可申请的岗位。"
 }

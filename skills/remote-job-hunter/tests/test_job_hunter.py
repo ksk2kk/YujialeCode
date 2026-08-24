@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -185,6 +186,74 @@ class LearningRoadmapTests(unittest.TestCase):
         job_hunter.score_job(mentioned, profile, job_hunter.profile_skill_set(profile))
         job_hunter.score_job(required, profile, job_hunter.profile_skill_set(profile))
         self.assertGreater(required["score_breakdown"]["skill"], mentioned["score_breakdown"]["skill"])
+
+
+class EarlyCareerPriorityTests(unittest.TestCase):
+    def setUp(self):
+        self.source = {"id": "fixture", "name": "Fixture", "homepage": "https://example.test", "priority": 100}
+        self.profile = job_hunter.load_json(HERE.parent / "references" / "profile.json")
+        self.taxonomy = job_hunter.load_json(HERE.parent / "references" / "tech-taxonomy.json")["technologies"]
+
+    def normalized(self, title, description, path):
+        job = job_hunter.blank_job(self.source, f"https://example.test/jobs/{path}")
+        job.update({"title": title, "description": description, "location": "Worldwide", "remote": True})
+        return job_hunter.normalize_job(job, self.profile, self.taxonomy, job_hunter.default_rates())
+
+    def test_supported_graduate_job_outranks_senior_lead(self):
+        junior = self.normalized(
+            "Graduate Rust Engineer",
+            "This role is fully remote worldwide. Requirements: 0-2 years of experience with Rust and Linux. "
+            "You receive a mentor and structured training program. Benefits include medical insurance and paid time off.",
+            "graduate",
+        )
+        senior = self.normalized(
+            "Rust Engineering Lead",
+            "This role is fully remote worldwide. Requirements: 6+ years of experience with Rust and Linux.",
+            "lead",
+        )
+        self.assertEqual(junior["priority_tier"], "S 培养型低门槛")
+        self.assertEqual(junior["career_stage"], "graduate")
+        self.assertIn("明确导师/mentorship", junior["growth_signals"])
+        self.assertIn("医疗保险", junior["benefit_signals"])
+        self.assertGreater(junior["score"], senior["score"])
+        self.assertEqual(senior["priority_tier"], "C 高门槛/不符合")
+
+    def test_learning_budget_is_benefit_but_not_salary(self):
+        job = self.normalized(
+            "Junior Go Engineer",
+            "Remote worldwide. Entry-level role with a mentor. We provide a $2,000 learning budget per year and health insurance.",
+            "learning-budget",
+        )
+        self.assertIn("学习预算", job["benefit_signals"])
+        self.assertIsNone(job["salary_usd_annual_min"])
+
+    def test_application_queue_stops_at_profile_gate_by_default(self):
+        job = self.normalized(
+            "Rust Intern",
+            "Remote worldwide internship. Mentorship and paid training. Health insurance and paid time off.",
+            "intern",
+        )
+        policy = job_hunter.load_application_policy()
+        queue = job_hunter.build_application_queue([job], policy)
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["state"], "blocked_profile")
+        self.assertIn("resume_path", queue[0]["missing_requirements"])
+
+    def test_complete_dry_run_policy_never_enters_live_queue(self):
+        job = self.normalized(
+            "Junior C++ Engineer",
+            "Remote worldwide. Junior role with structured onboarding and coaching. Dental insurance and paid holidays.",
+            "cpp-junior",
+        )
+        policy = job_hunter.load_application_policy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            resume = Path(temp_dir) / "resume.pdf"
+            resume.write_bytes(b"fixture")
+            policy.update({"enabled": True, "dry_run": True, "resume_path": str(resume)})
+            policy["contact"] = {"full_name": "Test User", "email": "test@example.test", "country": "CN"}
+            queue = job_hunter.build_application_queue([job], policy)
+        self.assertEqual(queue[0]["state"], "dry_run_ready")
+        self.assertEqual(queue[0]["adapter"], "generic_browser")
 
 
 if __name__ == "__main__":

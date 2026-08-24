@@ -89,6 +89,62 @@ TZ_ALIASES = {
     "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles", "pt": "America/Los_Angeles",
     "apac": "Asia/Singapore", "asia": "Asia/Singapore", "aest": "Australia/Sydney",
 }
+CAREER_STAGE_PATTERNS = {
+    "internship": re.compile(r"(?i)\b(?:intern(?:ship)?|co[ -]?op)\b"),
+    "trainee": re.compile(r"(?i)\b(?:trainee|apprentice(?:ship)?|returnship)\b"),
+    "graduate": re.compile(r"(?i)\b(?:new\s+grad(?:uate)?|graduate|campus\s+hire|early\s+career)\b"),
+    "junior": re.compile(r"\bjunior\b|(?:^|\W)jr\.(?:\W|$)", re.I),
+    "entry": re.compile(r"(?i)\bentry[ -]?level\b|\bcareer\s+starter\b|\bno\s+(?:prior\s+)?experience\b"),
+}
+SENIOR_STAGE_PATTERN = re.compile(r"\bsenior\b|(?:^|\W)sr\.(?:\W|$)", re.I)
+LEAD_STAGE_PATTERN = re.compile(r"(?i)\b(?:staff|principal|lead|architect|manager|director|head|cto|vp)\b")
+MENTORSHIP_SIGNALS = {
+    "明确导师/mentorship": re.compile(r"(?i)\bmentor(?:ship|ed|ing|s)?\b"),
+    "伙伴/buddy 制度": re.compile(r"(?i)\bbuddy\s+(?:program|system|scheme)\b"),
+    "资深同事带教": re.compile(r"(?i)(?:work|pair)\s+(?:closely\s+)?with\s+(?:a\s+)?(?:senior|experienced)\b|\bguidance\s+from\b|\bguided\s+by\b"),
+    "教练/监督支持": re.compile(r"(?i)\bcoaching\b|\bsupervis(?:ed|ion)\b|\bstructured\s+support\b"),
+}
+TRAINING_SIGNALS = {
+    "结构化培训": re.compile(r"(?i)\bstructured\s+training\b|\btraining\s+program(?:me)?\b|\bon[ -]?the[ -]?job\s+training\b"),
+    "轮岗培养": re.compile(r"(?i)\brotat(?:ion|ional)\s+program(?:me)?\b"),
+    "入职培养": re.compile(r"(?i)\b(?:guided|structured)\s+onboarding\b|\bonboarding\s+program(?:me)?\b"),
+    "付费学习/认证": re.compile(r"(?i)\bpaid\s+training\b|\bcertification\s+(?:budget|support|reimbursement)\b|\btuition\s+(?:support|reimbursement)\b"),
+    "学习与职业发展": re.compile(r"(?i)\b(?:learning|professional|career)\s+(?:and\s+)?development\s+(?:budget|program(?:me)?|plan|opportunit)"),
+}
+BENEFIT_SIGNALS = {
+    "医疗保险": re.compile(r"(?i)\b(?:health|medical|dental|vision)\s+(?:insurance|coverage|plan|benefit)"),
+    "带薪休假": re.compile(r"(?i)\b(?:paid\s+time\s+off|PTO|paid\s+(?:annual\s+)?leave|paid\s+holiday)\b"),
+    "育儿假": re.compile(r"(?i)\b(?:paid\s+)?parental\s+leave\b|\bmaternity\s+leave\b|\bpaternity\s+leave\b"),
+    "学习预算": re.compile(r"(?i)(?:learning|development|education)\s+budget|conference\s+budget|book\s+budget"),
+    "设备/居家办公": re.compile(r"(?i)\b(?:home[ -]?office|equipment)\s+(?:budget|allowance|stipend|provided)|\bcompany\s+laptop\b"),
+    "退休金": re.compile(r"(?i)\b401\s*\(?k\)?\b|\bpension\s+(?:plan|scheme|contribution)|\bretirement\s+(?:plan|contribution)"),
+    "奖金/股权": re.compile(r"(?i)\b(?:annual\s+)?bonus\b|\bequity\b|\bstock\s+options?\b|\bRSUs?\b"),
+    "弹性工时": re.compile(r"(?i)\bflexible\s+(?:working\s+)?hours\b|\bflexitime\b|\basync(?:hronous)?\s+work"),
+    "签证/搬迁支持": re.compile(r"(?i)\bvisa\s+sponsorship\b|\brelocation\s+(?:support|package|assistance)\b"),
+}
+PRIORITY_TIER_RANK = {
+    "S 培养型低门槛": 4,
+    "A 初级/培训/福利": 3,
+    "A 待核验培养型": 3,
+    "B 常规匹配": 2,
+    "C 高门槛/不符合": 1,
+}
+APPLICATION_TRANSITIONS = {
+    "blocked_eligibility": {"verified", "withdrawn"},
+    "verified": {"materials_ready", "blocked_profile", "withdrawn"},
+    "blocked_profile": {"materials_ready", "withdrawn"},
+    "prepared_disabled": {"materials_ready", "queued", "withdrawn"},
+    "dry_run_ready": {"queued", "withdrawn"},
+    "materials_ready": {"queued", "withdrawn"},
+    "queued": {"submitting", "withdrawn", "blocked"},
+    "submitting": {"submitted", "blocked", "queued"},
+    "submitted": {"response", "interview", "rejected", "withdrawn"},
+    "response": {"interview", "rejected", "withdrawn"},
+    "interview": {"offer", "rejected", "withdrawn"},
+    "blocked": {"queued", "withdrawn"},
+    "offer": {"accepted", "withdrawn"},
+    "rejected": set(), "accepted": set(), "withdrawn": set(),
+}
 
 
 def load_json(path: Path) -> Any:
@@ -355,6 +411,10 @@ def blank_job(source: dict[str, Any], url: str = "") -> dict[str, Any]:
         "published_at": None, "expires_at": None, "fetched_at": now_iso(), "skills": [],
         "missing_skills": [], "eligibility": "unknown", "eligibility_reason": "未发现明确全球可申请说明",
         "difficulty": None, "difficulty_label": "未知", "score": 0.0, "score_breakdown": {},
+        "career_stage": "unspecified", "entry_level_score": 0.0, "mentorship_score": 0.0,
+        "training_score": 0.0, "benefits_score": 0.0, "barrier_score": 0.0,
+        "entry_signals": [], "growth_signals": [], "benefit_signals": [], "barrier_signals": [],
+        "priority_tier": "B 常规匹配",
         "confidence": "medium", "warnings": [],
     }
 
@@ -759,6 +819,107 @@ def classify_skill_requirements(text: str, title: str, skills: list[str], taxono
     return levels
 
 
+def matching_signal_labels(text: str, patterns: dict[str, re.Pattern[str]]) -> list[str]:
+    """返回命中的规范化标签；同一福利写十遍也只计一次。"""
+    return [label for label, pattern in patterns.items() if pattern.search(text)]
+
+
+def classify_career_support(job: dict[str, Any]) -> None:
+    """从招聘正文提取早期职业、带教、培训、福利与门槛证据。
+
+    这些字段是确定性的审计证据。它们既不依赖模型，也不会因为一段公司宣传
+    反复出现同一个词而灌分。职级优先看标题；福利和培养机制才读取正文。
+    """
+    title = job.get("title", "")
+    employment = as_text(job.get("employment_type", ""))
+    description = job.get("description", "")[:40000]
+    stage_text = " ".join((title, employment))
+    stage = "unspecified"
+    for candidate in ("internship", "trainee", "graduate", "junior", "entry"):
+        if CAREER_STAGE_PATTERNS[candidate].search(stage_text):
+            stage = candidate
+            break
+    if LEAD_STAGE_PATTERN.search(title):
+        stage = "lead"
+    elif SENIOR_STAGE_PATTERN.search(title):
+        stage = "senior"
+
+    stage_labels = {
+        "internship": "实习/Co-op", "trainee": "培训生/学徒", "graduate": "校招/毕业生",
+        "junior": "Junior", "entry": "Entry-level",
+    }
+    entry_signals = [stage_labels[stage]] if stage in stage_labels else []
+    exp = job.get("experience_min_years")
+    if exp is not None and exp <= 2:
+        entry_signals.append(f"最低经验 {exp:g} 年")
+    if re.search(r"(?i)\b(?:0\s*(?:-|–|to)\s*2|0\+?|1\+?|2\+?)\s*years?\b", description):
+        entry_signals.append("正文明确 0–2 年经验")
+
+    growth_signals = matching_signal_labels(description, MENTORSHIP_SIGNALS)
+    training_signals = matching_signal_labels(description, TRAINING_SIGNALS)
+    benefit_signals = matching_signal_labels(description, BENEFIT_SIGNALS)
+    barriers: list[str] = []
+    barrier_score = 0.0
+    if stage == "senior":
+        barriers.append("Senior 职级")
+        barrier_score += 10
+    elif stage == "lead":
+        barriers.append("Lead/Staff/管理职级")
+        barrier_score += 14
+    if exp is not None and exp >= 5:
+        barriers.append(f"最低 {exp:g} 年经验")
+        barrier_score += 6
+    elif exp is not None and exp >= 3:
+        barriers.append(f"最低 {exp:g} 年经验")
+        barrier_score += 3
+    if re.search(r"(?i)(?:bachelor|master|degree).{0,35}(?:required|must)|(?:required|must).{0,35}(?:bachelor|master|degree)", description):
+        barriers.append("硬性学历要求")
+        barrier_score += 2
+    if re.search(r"(?i)\b(?:security\s+clearance|top\s+secret|active\s+clearance)\b", description):
+        barriers.append("安全审查要求")
+        barrier_score += 5
+    if job.get("eligibility") == "ineligible":
+        barriers.append("人在中国不符合公开资格")
+        barrier_score += 8
+
+    entry_score = {"internship": 13, "trainee": 13, "graduate": 12, "junior": 11, "entry": 10}.get(stage, 0)
+    if exp is not None and exp <= 1:
+        entry_score += 3
+    elif exp is not None and exp <= 2:
+        entry_score += 2
+    mentorship_score = min(8.0, len(growth_signals) * 4.0)
+    training_score = min(7.0, len(training_signals) * 3.5)
+    benefits_score = min(7.0, len(benefit_signals) * 1.4)
+
+    low_entry = stage in {"internship", "trainee", "graduate", "junior", "entry"} or (exp is not None and exp <= 2)
+    has_support = mentorship_score > 0 or training_score > 0
+    good_benefits = benefits_score >= 2.8
+    if job.get("eligibility") == "ineligible" or stage in {"senior", "lead"} or barrier_score >= 10:
+        tier = "C 高门槛/不符合"
+    elif job.get("eligibility") == "eligible" and low_entry and (has_support or good_benefits) and barrier_score < 6:
+        tier = "S 培养型低门槛"
+    elif job.get("eligibility") == "unknown" and low_entry and (has_support or good_benefits):
+        tier = "A 待核验培养型"
+    elif low_entry or has_support or good_benefits:
+        tier = "A 初级/培训/福利"
+    else:
+        tier = "B 常规匹配"
+
+    job.update({
+        "career_stage": stage,
+        "entry_level_score": round(entry_score, 1),
+        "mentorship_score": round(mentorship_score, 1),
+        "training_score": round(training_score, 1),
+        "benefits_score": round(benefits_score, 1),
+        "barrier_score": round(min(20.0, barrier_score), 1),
+        "entry_signals": list(dict.fromkeys(entry_signals)),
+        "growth_signals": growth_signals + training_signals,
+        "benefit_signals": benefit_signals,
+        "barrier_signals": barriers,
+        "priority_tier": tier,
+    })
+
+
 def normalize_job(job: dict[str, Any], profile: dict[str, Any], taxonomy: dict[str, list[str]], rates: dict[str, float]) -> dict[str, Any]:
     job["title"] = clean_html(job.get("title"))[:500]
     job["company"] = clean_html(job.get("company"))[:300] or "未公开"
@@ -787,6 +948,7 @@ def normalize_job(job: dict[str, Any], profile: dict[str, Any], taxonomy: dict[s
     job["missing_skills"] = [s for s in job["skills"] if s not in profile_skills]
     annualize_salary(job, rates)
     eligibility(job, profile)
+    classify_career_support(job)
     score_job(job, profile, profile_skills)
     return job
 
@@ -855,9 +1017,10 @@ def score_job(job: dict[str, Any], profile: dict[str, Any], profile_skills: set[
     freshness = 4 if age is None else max(0, 8 * (1 - age / max(1, profile.get("freshness_days", 45))))
     difficulty = 3.0
     text = (job["title"] + " " + job["description"]).lower()
-    if re.search(r"\b(staff|principal|lead|architect|director|head|cto|manager)\b", text): difficulty += 3
-    elif re.search(r"\bsenior\b", text): difficulty += 2
-    elif re.search(r"\b(junior|entry.level|intern)\b", text): difficulty -= 1.5
+    stage = job.get("career_stage", "unspecified")
+    if stage == "lead": difficulty += 3
+    elif stage == "senior": difficulty += 2
+    elif stage in {"internship", "trainee", "graduate", "junior", "entry"}: difficulty -= 1.5
     if job.get("experience_min_years") is not None: difficulty += min(2.5, job["experience_min_years"] / 3)
     if re.search(r"ph\.?d|doctorate|security clearance|top secret", text): difficulty += 1.5
     difficulty = max(1, min(10, difficulty))
@@ -865,13 +1028,22 @@ def score_job(job: dict[str, Any], profile: dict[str, Any], profile_skills: set[
     job["difficulty_label"] = "低" if difficulty < 3.5 else ("中" if difficulty < 6.5 else "高")
     inverse_difficulty = 7 * (10 - difficulty) / 9
     source_bonus = min(2.0, max(0, (float(job.get("source_priority", 50)) - 50) / 25))
-    total = skill_score + eligibility_score + income_score + timezone_score + freshness + inverse_difficulty + source_bonus
+    career_bonus = min(35.0, float(job.get("entry_level_score", 0)) + float(job.get("mentorship_score", 0))
+                       + float(job.get("training_score", 0)) + float(job.get("benefits_score", 0)))
+    barrier_penalty = min(20.0, float(job.get("barrier_score", 0)))
+    total = (skill_score + eligibility_score + income_score + timezone_score + freshness
+             + inverse_difficulty + source_bonus + career_bonus - barrier_penalty)
     if job["eligibility"] == "ineligible": total = min(total, 25)
-    job["score"] = round(min(100, total), 1)
+    job["score"] = round(max(0, min(100, total)), 1)
     job["score_breakdown"] = {"skill": round(skill_score, 1), "eligibility": eligibility_score,
                               "income": round(income_score, 1), "timezone": timezone_score,
                               "freshness": round(freshness, 1), "difficulty": round(inverse_difficulty, 1),
                               "source": round(source_bonus, 1),
+                              "early_career": job.get("entry_level_score", 0),
+                              "mentorship": job.get("mentorship_score", 0),
+                              "training": job.get("training_score", 0),
+                              "benefits": job.get("benefits_score", 0),
+                              "barrier_penalty": -barrier_penalty,
                               "salary_provenance": job.get("salary_kind", "unknown")}
 
 
@@ -1300,6 +1472,222 @@ def salary_display(job: dict[str, Any]) -> str:
     return value + f"（{label}）"
 
 
+def priority_code(job: dict[str, Any]) -> str:
+    return as_text(job.get("priority_tier", "B"))[:1] or "B"
+
+
+def career_stage_display(stage: str) -> str:
+    return {"internship": "实习", "trainee": "培训生/学徒", "graduate": "校招/毕业生",
+            "junior": "Junior", "entry": "Entry-level", "senior": "Senior",
+            "lead": "Lead/Staff/管理", "unspecified": "职级未公开"}.get(stage, stage or "职级未公开")
+
+
+def job_sort_key(job: dict[str, Any]) -> tuple[Any, ...]:
+    eligibility_rank = {"eligible": 2, "unknown": 1, "ineligible": 0}.get(job.get("eligibility"), 0)
+    tier_rank = PRIORITY_TIER_RANK.get(job.get("priority_tier", "B 常规匹配"), 0)
+    return (eligibility_rank, tier_rank, job.get("score", 0),
+            job.get("salary_kind") in {"explicit_structured", "explicit_text"},
+            job.get("salary_usd_annual_max") or 0)
+
+
+def load_application_policy(path: str | Path | None = None) -> dict[str, Any]:
+    policy_path = Path(path).expanduser() if path else REFERENCES / "application-policy.json"
+    policy = load_json(policy_path)
+    if not isinstance(policy, dict):
+        raise ValueError(f"申请策略必须是 JSON 对象：{policy_path}")
+    return policy
+
+
+def application_id(job: dict[str, Any]) -> str:
+    identity = canonical_url(job.get("apply_url") or job.get("url", ""))
+    if not identity:
+        identity = "|".join((job.get("company", ""), job.get("title", ""), job.get("source", "")))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def application_adapter(url: str) -> str:
+    host = urllib.parse.urlsplit(url).netloc.lower()
+    if "greenhouse.io" in host:
+        return "greenhouse"
+    if "lever.co" in host:
+        return "lever"
+    if "ashbyhq.com" in host:
+        return "ashby"
+    if "myworkdayjobs.com" in host or "workday.com" in host:
+        return "workday"
+    if "smartrecruiters.com" in host:
+        return "smartrecruiters"
+    if "workable.com" in host:
+        return "workable"
+    return "generic_browser"
+
+
+def build_application_queue(jobs: list[dict[str, Any]], policy: dict[str, Any],
+                            previous: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """把最高优先岗位变成可恢复队列；这里只准备，不偷偷对外提交。"""
+    previous_by_id = {row.get("application_id"): row for row in (previous or []) if row.get("application_id")}
+    allowed = {as_text(value).upper()[:1] for value in policy.get("allowed_priority_tiers", ["S", "A"])}
+    excluded_companies = {as_text(value).casefold() for value in policy.get("excluded_companies", [])}
+    excluded_sources = {as_text(value).casefold() for value in policy.get("excluded_sources", [])}
+    minimum_score = float(policy.get("minimum_score", 0))
+    contact = policy.get("contact", {}) if isinstance(policy.get("contact"), dict) else {}
+    queue: list[dict[str, Any]] = []
+    generated_at = now_iso()
+    terminal_or_active = {"queued", "submitting", "submitted", "response", "interview", "offer",
+                          "accepted", "rejected", "withdrawn", "blocked"}
+
+    for job in sorted(jobs, key=job_sort_key, reverse=True):
+        if job.get("eligibility") == "ineligible" or priority_code(job) not in allowed:
+            continue
+        if float(job.get("score", 0)) < minimum_score:
+            continue
+        if as_text(job.get("company")).casefold() in excluded_companies:
+            continue
+        if as_text(job.get("source_id") or job.get("source")).casefold() in excluded_sources:
+            continue
+        item_id = application_id(job)
+        old = previous_by_id.get(item_id, {})
+        apply_url = canonical_url(job.get("apply_url") or job.get("url", ""))
+        missing: list[str] = []
+        resume_path = as_text(policy.get("resume_path")).strip()
+        if not resume_path:
+            missing.append("resume_path")
+        elif not Path(resume_path).expanduser().is_file():
+            missing.append("resume_path_not_found")
+        for key in ("full_name", "email"):
+            if not as_text(contact.get(key)).strip():
+                missing.append(f"contact.{key}")
+        if not apply_url:
+            missing.append("apply_url")
+
+        if old.get("state") in terminal_or_active:
+            state = old["state"]
+        elif policy.get("require_verified_eligibility", True) and job.get("eligibility") != "eligible":
+            state = "blocked_eligibility"
+        elif missing:
+            state = "blocked_profile"
+        elif not policy.get("enabled", False):
+            state = "prepared_disabled"
+        elif policy.get("dry_run", True):
+            state = "dry_run_ready"
+        else:
+            state = "queued"
+        next_actions = {
+            "blocked_eligibility": "打开原招聘页，确认人在中国可受雇、付款方式和合同主体",
+            "blocked_profile": "补全申请策略中的简历路径、姓名和邮箱",
+            "prepared_disabled": "人工复核材料；确认后再开启 enabled",
+            "dry_run_ready": "运行浏览器试填，只预览不点击最终提交",
+            "queued": "交给对应 ATS 适配器；提交前再次检查页面与岗位仍有效",
+        }
+        history = list(old.get("state_history", []))
+        if not history or history[-1].get("state") != state:
+            history.append({"at": generated_at, "state": state, "note": "扫描后自动归类"})
+        queue.append({
+            "application_id": item_id, "job_url": job.get("url", ""), "apply_url": apply_url,
+            "title": job.get("title", ""), "company": job.get("company", ""),
+            "priority_tier": job.get("priority_tier", "B 常规匹配"), "score": job.get("score", 0),
+            "career_stage": job.get("career_stage", "unspecified"),
+            "entry_evidence": job.get("entry_signals", []),
+            "eligibility": job.get("eligibility", "unknown"), "eligibility_reason": job.get("eligibility_reason", ""),
+            "mentorship_training": job.get("growth_signals", []), "benefits": job.get("benefit_signals", []),
+            "barriers": job.get("barrier_signals", []), "salary": salary_display(job),
+            "adapter": application_adapter(apply_url), "state": state,
+            "missing_requirements": missing,
+            "requires_review": list(policy.get("require_user_review_for", [])),
+            "next_action": next_actions.get(state, "按状态机继续处理"),
+            "attempt_count": int(old.get("attempt_count", 0)),
+            "created_at": old.get("created_at", generated_at), "updated_at": generated_at,
+            "state_history": history,
+        })
+    return queue
+
+
+def build_application_plan(queue: list[dict[str, Any]], policy: dict[str, Any]) -> str:
+    states: dict[str, int] = {}
+    tiers: dict[str, int] = {}
+    missing: dict[str, int] = {}
+    for item in queue:
+        states[item["state"]] = states.get(item["state"], 0) + 1
+        tiers[item["priority_tier"]] = tiers.get(item["priority_tier"], 0) + 1
+        for field in item.get("missing_requirements", []):
+            missing[field] = missing.get(field, 0) + 1
+    mode = "关闭（只准备队列）" if not policy.get("enabled", False) else ("试填预览" if policy.get("dry_run", True) else "允许进入提交队列")
+    lines = [
+        "# 自动申请计划", "", f"生成时间：{now_iso()}。当前模式：**{mode}**；每日上限：**{int(policy.get('daily_limit', 5))}**。", "",
+        "> 排名、材料生成和表单状态可以自动化；涉及法律声明、签证、薪资期望、人口统计等问题仍必须按策略停下复核。默认配置不会点击最终提交。", "",
+        "## 队列概况", "", "|类别|数量|", "|---|---:|",
+    ]
+    for name, count in sorted(tiers.items(), key=lambda x: (-PRIORITY_TIER_RANK.get(x[0], 0), x[0])):
+        lines.append(f"|{name}|{count}|")
+    for name, count in sorted(states.items()):
+        lines.append(f"|状态：`{name}`|{count}|")
+    lines += ["", "## 当前最高优先队列", "", "|优先级|岗位 / 公司|入门证据|培养证据|福利|状态|下一步|", "|---|---|---|---|---|---|---|"]
+    if not queue:
+        lines.append("|—|暂无达到策略门槛的岗位|—|—|—|—|等待下一轮扫描|")
+    for item in queue[:30]:
+        entry = "、".join(item.get("entry_evidence", [])) or career_stage_display(item.get("career_stage", "unspecified"))
+        growth = "、".join(item.get("mentorship_training", [])) or "未公开"
+        benefits = "、".join(item.get("benefits", [])[:5]) or "未公开"
+        title = item["title"].replace("|", "/"); company = item["company"].replace("|", "/")
+        lines.append(f"|{item['priority_tier']}|[{title}]({item['apply_url']}) / {company}|{entry}|{growth}|{benefits}|`{item['state']}`|{item['next_action']}|")
+    lines += ["", "## 安全闸门", ""]
+    if missing:
+        lines.append("尚缺少：" + "；".join(f"`{name}`（{count} 岗）" for name, count in sorted(missing.items())) + "。")
+    else:
+        lines.append("基础联系资料和简历路径已就绪。")
+    lines += [
+        "", "状态流：`blocked_* / prepared_disabled / dry_run_ready → queued → submitting → submitted → response → interview → offer`。失败会进入 `blocked`，修复后可回到 `queued`，不会丢掉历史。", "",
+        "只有同时满足以下条件才可进入 `queued`：资格已经证实、材料完整、优先级获准、超过分数门槛、`enabled=true` 且 `dry_run=false`。", "",
+    ]
+    return "\n".join(lines)
+
+
+def build_application_tasks(queue: list[dict[str, Any]], policy: dict[str, Any]) -> list[dict[str, Any]]:
+    action_by_state = {
+        "blocked_eligibility": ("verify_eligibility", True),
+        "blocked_profile": ("collect_profile", True),
+        "prepared_disabled": ("review_application", True),
+        "dry_run_ready": ("browser_fill_preview", False),
+        "materials_ready": ("review_application", True),
+        "queued": ("submit_application", False),
+        "submitting": ("resume_submission", False),
+        "blocked": ("repair_submission", True),
+    }
+    daily_limit = max(0, int(policy.get("daily_limit", 5)))
+    live_seen = 0
+    tasks: list[dict[str, Any]] = []
+    for rank, item in enumerate(queue, 1):
+        action, needs_user = action_by_state.get(item.get("state"), ("monitor_application", False))
+        if action == "submit_application":
+            live_seen += 1
+            if live_seen > daily_limit:
+                action = "wait_daily_limit"
+        tasks.append({
+            "task_id": f"application:{item['application_id']}:{action}",
+            "rank": rank, "application_id": item["application_id"], "action": action,
+            "requires_user_input": needs_user, "state": item.get("state"),
+            "adapter": item.get("adapter"), "apply_url": item.get("apply_url"),
+            "title": item.get("title"), "company": item.get("company"),
+            "priority_tier": item.get("priority_tier"), "missing_requirements": item.get("missing_requirements", []),
+            "review_fields": item.get("requires_review", []), "next_action": item.get("next_action", ""),
+        })
+    return tasks
+
+
+def refresh_application_artifacts(queue: list[dict[str, Any]], out: Path, policy: dict[str, Any]) -> None:
+    write_jsonl(out / "application_queue.jsonl", queue)
+    write_jsonl(out / "application_tasks.jsonl", build_application_tasks(queue, policy))
+    atomic_write(out / "application-plan.md", build_application_plan(queue, policy) + "\n")
+
+
+def write_application_outputs(jobs: list[dict[str, Any]], out: Path, policy: dict[str, Any]) -> list[dict[str, Any]]:
+    queue_path = out / "application_queue.jsonl"
+    previous = read_jsonl(queue_path) if queue_path.exists() and queue_path.stat().st_size else []
+    queue = build_application_queue(jobs, policy, previous)
+    refresh_application_artifacts(queue, out, policy)
+    return queue
+
+
 FOCUS_ROLE = re.compile(
     r"(?i)software|engineer|developer|backend|systems?|platform|infrastructure|devops|sre|"
     r"reliability|security|quant|compiler|database|network|embedded|blockchain|protocol|kernel"
@@ -1484,20 +1872,24 @@ def build_quality_report(jobs: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def report_outputs(jobs: list[dict[str, Any]], out: Path, profile: dict[str, Any], source_reports: list[dict[str, Any]], rate_source: str) -> None:
-    jobs.sort(key=lambda j: (j.get("eligibility") == "eligible", j.get("score", 0),
-                             j.get("salary_kind") in {"explicit_structured", "explicit_text"},
-                             j.get("salary_usd_annual_max") or 0), reverse=True)
+def report_outputs(jobs: list[dict[str, Any]], out: Path, profile: dict[str, Any], source_reports: list[dict[str, Any]],
+                   rate_source: str, application_policy: dict[str, Any] | None = None) -> None:
+    jobs.sort(key=job_sort_key, reverse=True)
     write_jsonl(out / "jobs.jsonl", jobs)
-    columns = ["score", "eligibility", "title", "company", "source", "location", "remote_scope", "experience_min_years",
+    columns = ["priority_tier", "score", "career_stage", "entry_level_score", "mentorship_score", "training_score",
+               "benefits_score", "barrier_score", "eligibility", "title", "company", "source", "location", "remote_scope", "experience_min_years",
                "weekly_hours", "contract_duration", "timezone_original", "beijing_hours", "salary_original",
                "salary_kind", "salary_confidence", "salary_evidence", "salary_rejected_reason",
-               "salary_usd_annual_min", "salary_usd_annual_max", "difficulty_label", "skills", "missing_skills", "published_at", "url"]
+               "salary_usd_annual_min", "salary_usd_annual_max", "difficulty_label", "entry_signals", "growth_signals",
+               "benefit_signals", "barrier_signals", "skills", "missing_skills", "published_at", "url"]
     with (out / "ranked.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         for job in jobs:
-            row = dict(job); row["skills"] = ", ".join(job.get("skills", [])); row["missing_skills"] = ", ".join(job.get("missing_skills", [])); writer.writerow(row)
+            row = dict(job)
+            for name in ("entry_signals", "growth_signals", "benefit_signals", "barrier_signals", "skills", "missing_skills"):
+                row[name] = ", ".join(job.get(name, []))
+            writer.writerow(row)
     counts: dict[str, dict[str, int]] = {}
     eligible = [j for j in jobs if j.get("eligibility") != "ineligible"]
     for job in eligible:
@@ -1526,18 +1918,34 @@ def report_outputs(jobs: list[dict[str, Any]], out: Path, profile: dict[str, Any
                              "cooccurs": row["cooccurs"], "examples": "；".join(row["examples"])})
     atomic_write(out / "learning-roadmap.md", build_learning_roadmap(jobs, profile) + "\n")
     atomic_write(out / "quality-report.md", build_quality_report(jobs) + "\n")
+    policy = application_policy or load_application_policy()
+    application_queue = write_application_outputs(jobs, out, policy)
     recommended = [job for job in jobs if job.get("eligibility") == "eligible"]
     pending = [job for job in jobs if job.get("eligibility") == "unknown"]
+    priority_jobs = [job for job in recommended if priority_code(job) in {"S", "A"}]
     lines = ["# 全球远程岗位报告", "", f"生成时间：{now_iso()} ；画像：{profile.get('profile_name', 'default')}；汇率：{rate_source}。",
              "", "> 未写明的薪资、经验、工时、期限和时区均显示为“未公开”。聚合站估算薪资不参与收入评分；可从中国受雇必须有正文证据。", "",
              f"共保留 **{len(jobs)}** 个去重岗位；其中可从中国申请 {sum(j.get('eligibility') == 'eligible' for j in jobs)} 个，待确认 {sum(j.get('eligibility') == 'unknown' for j in jobs)} 个，明确不符合 {sum(j.get('eligibility') == 'ineligible' for j in jobs)} 个。", "",
-             "## 优先岗位", "", "|分数|岗位 / 公司|资格|薪资折算|经验|北京时间|难度|来源|", "|---:|---|---|---|---|---|---|---|"]
-    if not recommended:
-        lines.append("|—|本轮没有确认可从中国申请的岗位|—|—|—|—|—|—|")
-    for job in recommended[:40]:
+             "## 最高优先：福利好、有人带、低门槛", "", "这里先列 S/A 级岗位。S 级必须确认可从中国申请，并有实习/校招/Junior/0–2 年证据，同时出现带教、培训或至少两类福利。", "",
+             "|等级|分数|岗位 / 公司|入门证据|带教/培训|福利|经验|难度|", "|---|---:|---|---|---|---|---|---|"]
+    if not priority_jobs:
+        lines.append("|—|—|本轮没有同时满足资格与培养条件的岗位|—|—|—|—|—|")
+    for job in priority_jobs[:30]:
         title = job["title"].replace("|", "/"); company = job["company"].replace("|", "/")
         exp = "未公开" if job.get("experience_min_years") is None else f"{job['experience_min_years']:g}+ 年"
-        lines.append(f"|{job['score']:.1f}|[{title}]({job['url']}) / {company}|{job['eligibility']}：{job['eligibility_reason']}|{salary_display(job)}|{exp}|{job['beijing_hours']}|{job['difficulty_label']}|{job['source']}|")
+        entry = "、".join(job.get("entry_signals", [])) or career_stage_display(job.get("career_stage", "unspecified"))
+        growth = "、".join(job.get("growth_signals", [])) or "未公开"
+        benefits = "、".join(job.get("benefit_signals", [])[:5]) or "未公开"
+        lines.append(f"|{job['priority_tier']}|{job['score']:.1f}|[{title}]({job['url']}) / {company}|{entry}|{growth}|{benefits}|{exp}|{job['difficulty_label']}|")
+    lines += ["", f"自动申请队列已生成 **{len(application_queue)}** 条；当前开关和阻塞原因见 `application-plan.md`，机器可读状态见 `application_queue.jsonl`。", "",
+              "## 其余可申请岗位", "", "|等级|分数|岗位 / 公司|资格|薪资折算|经验|北京时间|难度|来源|", "|---|---:|---|---|---|---|---|---|---|"]
+    other_recommended = [job for job in recommended if job not in priority_jobs]
+    if not other_recommended:
+        lines.append("|—|—|没有其余可申请岗位|—|—|—|—|—|—|")
+    for job in other_recommended[:40]:
+        title = job["title"].replace("|", "/"); company = job["company"].replace("|", "/")
+        exp = "未公开" if job.get("experience_min_years") is None else f"{job['experience_min_years']:g}+ 年"
+        lines.append(f"|{job['priority_tier']}|{job['score']:.1f}|[{title}]({job['url']}) / {company}|{job['eligibility']}：{job['eligibility_reason']}|{salary_display(job)}|{exp}|{job['beijing_hours']}|{job['difficulty_label']}|{job['source']}|")
     lines += ["", "## 远程范围待确认", "", "这些岗位看起来支持远程，但公开信息没有证明人在中国可以受雇。确认前不进入优先推荐。", "",
               "|分数|岗位 / 公司|薪资折算|地点/范围|经验|北京时间|来源|", "|---:|---|---|---|---|---|---|"]
     if not pending:
@@ -1701,7 +2109,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             status["status"] = "filtered"
             status["error"] = "抓到的记录均为现场、过期或无法形成有效岗位；已生成搜索降级任务"
             failed.add(status["source_id"])
-    report_outputs(jobs, out, profile, reports, rate_source)
+    report_outputs(jobs, out, profile, reports, rate_source, load_application_policy(args.application_policy))
     tasks = build_search_tasks(sources, failed)
     atomic_write(out / "search_tasks.json", json.dumps(tasks, ensure_ascii=False, indent=2))
     coverage = {"generated_at": now_iso(), "sources_selected": len(sources), "automated_attempted": len(automated), "successful": sum(r["status"] == "ok" for r in reports),
@@ -1734,7 +2142,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         except (ValueError, TypeError, KeyError): continue
     source_status_path = input_path.parent / "source_status.jsonl"
     source_reports = read_jsonl(source_status_path) if source_status_path.exists() and source_status_path.stat().st_size else []
-    report_outputs(dedupe_jobs(normalized), out, profile, source_reports, rate_source)
+    report_outputs(dedupe_jobs(normalized), out, profile, source_reports, rate_source,
+                   load_application_policy(args.application_policy))
     for name in ("coverage.json", "search_tasks.json"):
         source_file = input_path.parent / name
         if source_file.exists() and source_file.resolve() != (out / name).resolve():
@@ -1748,8 +2157,39 @@ def cmd_import(args: argparse.Namespace) -> int:
     incoming = read_jsonl(Path(args.import_file))
     merged = existing + incoming
     write_jsonl(Path(args.input), merged)
-    analyze_args = argparse.Namespace(input=args.input, profile=args.profile, output=args.output)
+    analyze_args = argparse.Namespace(input=args.input, profile=args.profile, output=args.output,
+                                      application_policy=args.application_policy)
     return cmd_analyze(analyze_args)
+
+
+def cmd_applications(args: argparse.Namespace) -> int:
+    jobs = read_jsonl(Path(args.input).resolve())
+    out = Path(args.output).resolve(); out.mkdir(parents=True, exist_ok=True)
+    queue = write_application_outputs(jobs, out, load_application_policy(args.application_policy))
+    print(f"已准备 {len(queue)} 条申请队列；计划位于 {out / 'application-plan.md'}")
+    return 0
+
+
+def cmd_application_state(args: argparse.Namespace) -> int:
+    queue_path = Path(args.queue).resolve()
+    queue = read_jsonl(queue_path)
+    item = next((row for row in queue if row.get("application_id") == args.application_id), None)
+    if item is None:
+        raise ValueError(f"队列中没有 application_id={args.application_id}")
+    old_state = item.get("state", "")
+    allowed = APPLICATION_TRANSITIONS.get(old_state, set())
+    if args.state not in allowed:
+        raise ValueError(f"不允许从 {old_state} 跳到 {args.state}；允许：{', '.join(sorted(allowed)) or '无'}")
+    changed_at = now_iso()
+    item["state"] = args.state
+    item["updated_at"] = changed_at
+    if args.state == "submitting":
+        item["attempt_count"] = int(item.get("attempt_count", 0)) + 1
+    item.setdefault("state_history", []).append({"at": changed_at, "state": args.state,
+                                                   "note": args.note or "人工/适配器更新"})
+    refresh_application_artifacts(queue, queue_path.parent, load_application_policy(args.application_policy))
+    print(f"{args.application_id}: {old_state} -> {args.state}")
+    return 0
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1758,14 +2198,25 @@ def parser() -> argparse.ArgumentParser:
     catalog = sub.add_parser("catalog", help="统计已审计站点"); catalog.set_defaults(func=cmd_catalog)
     scan = sub.add_parser("scan", help="抓取所有可自动化来源并生成报告")
     scan.add_argument("--profile", default=str(REFERENCES / "profile.json")); scan.add_argument("--output", default="remote-jobs")
+    scan.add_argument("--application-policy", default=str(REFERENCES / "application-policy.json"))
     scan.add_argument("--sources", help="逗号分隔的 source id；空值表示全部"); scan.add_argument("--max-per-source", type=int, default=100)
     scan.add_argument("--workers", type=int, default=6); scan.add_argument("--cache-ttl", type=int, default=1800)
     scan.add_argument("--source-timeout", type=int, default=60, help="每个招聘来源的最长抓取秒数")
     scan.set_defaults(func=cmd_scan)
     analyze = sub.add_parser("analyze", help="只分析已有 JSONL")
-    analyze.add_argument("--input", required=True); analyze.add_argument("--profile", default=str(REFERENCES / "profile.json")); analyze.add_argument("--output", default="remote-jobs"); analyze.set_defaults(func=cmd_analyze)
+    analyze.add_argument("--input", required=True); analyze.add_argument("--profile", default=str(REFERENCES / "profile.json")); analyze.add_argument("--output", default="remote-jobs")
+    analyze.add_argument("--application-policy", default=str(REFERENCES / "application-policy.json")); analyze.set_defaults(func=cmd_analyze)
     imp = sub.add_parser("import", help="合并网页搜索补充 JSONL 后重新分析")
-    imp.add_argument("--input", required=True); imp.add_argument("--import-file", required=True); imp.add_argument("--profile", default=str(REFERENCES / "profile.json")); imp.add_argument("--output", default="remote-jobs"); imp.set_defaults(func=cmd_import)
+    imp.add_argument("--input", required=True); imp.add_argument("--import-file", required=True); imp.add_argument("--profile", default=str(REFERENCES / "profile.json")); imp.add_argument("--output", default="remote-jobs")
+    imp.add_argument("--application-policy", default=str(REFERENCES / "application-policy.json")); imp.set_defaults(func=cmd_import)
+    applications = sub.add_parser("applications", help="从已评分岗位生成可审计申请队列，不直接提交")
+    applications.add_argument("--input", required=True); applications.add_argument("--output", default="remote-jobs")
+    applications.add_argument("--application-policy", default=str(REFERENCES / "application-policy.json")); applications.set_defaults(func=cmd_applications)
+    app_state = sub.add_parser("application-state", help="按状态机更新一条申请记录")
+    app_state.add_argument("--queue", required=True); app_state.add_argument("--application-id", required=True)
+    app_state.add_argument("--state", required=True, choices=sorted(APPLICATION_TRANSITIONS)); app_state.add_argument("--note")
+    app_state.add_argument("--application-policy", default=str(REFERENCES / "application-policy.json"))
+    app_state.set_defaults(func=cmd_application_state)
     worker = sub.add_parser("_source", help=argparse.SUPPRESS)
     worker.add_argument("--source-id", required=True); worker.add_argument("--max-per-source", type=int, default=100)
     worker.add_argument("--cache-ttl", type=int, default=1800); worker.add_argument("--source-timeout", type=int, default=60)

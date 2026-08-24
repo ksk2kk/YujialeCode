@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "dry_run": true,
+  "daily_limit": 5,
+  "max_active_applications": 30,
+  "allowed_priority_tiers": ["S", "A"],
+  "minimum_score": 0,
+  "require_verified_eligibility": true,
+  "allow_unknown_salary": true,
+  "resume_path": "",
+  "cover_letter_mode": "generate_draft",
+  "contact": {
+    "full_name": "",
+    "email": "",
+    "phone": "",
+    "country": "CN",
+    "timezone": "Asia/Shanghai"
+  },
+  "answers": {},
+  "require_user_review_for": [
+    "salary_expectation",
+    "visa_sponsorship",
+    "relocation",
+    "legal_attestation",
+    "background_check",
+    "voluntary_demographics"
+  ],
+  "excluded_companies": [],
+  "excluded_sources": []
+}
