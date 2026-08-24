@@ -1714,12 +1714,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_analyze(args: argparse.Namespace) -> int:
     out = Path(args.output).resolve(); out.mkdir(parents=True, exist_ok=True)
+    input_path = Path(args.input).resolve()
     profile, taxonomy = prepare(args.profile)
     source_index = {item["id"]: item for item in load_json(REFERENCES / "sources.json")["sources"]}
     client = HttpClient(Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "yjlcoder" / "remote-job-hunter")
     rates, rate_source = fetch_rates(client)
     normalized = []
-    for raw in read_jsonl(Path(args.input)):
+    for raw in read_jsonl(input_path):
         source_id = raw.get("source_id", "imported")
         source = dict(source_index.get(source_id, {}))
         source.update({"id": source_id, "name": raw.get("source", source.get("name", "imported")),
@@ -1731,7 +1732,13 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             if item.get("remote") and is_active(item, int(profile.get("freshness_days", 45))):
                 normalized.append(item)
         except (ValueError, TypeError, KeyError): continue
-    report_outputs(dedupe_jobs(normalized), out, profile, [], rate_source)
+    source_status_path = input_path.parent / "source_status.jsonl"
+    source_reports = read_jsonl(source_status_path) if source_status_path.exists() and source_status_path.stat().st_size else []
+    report_outputs(dedupe_jobs(normalized), out, profile, source_reports, rate_source)
+    for name in ("coverage.json", "search_tasks.json"):
+        source_file = input_path.parent / name
+        if source_file.exists() and source_file.resolve() != (out / name).resolve():
+            atomic_write(out / name, source_file.read_text(encoding="utf-8"))
     print(f"已分析 {len(normalized)} 条，结果位于 {out}")
     return 0
 
