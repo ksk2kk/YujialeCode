@@ -1,91 +1,146 @@
-#!/bin/bash
-# YJLcoder QQ 扫码弹窗助手（systemd 用户服务）
-#
-# 作用：NapCat 未登录（二维码循环）时，自动在浏览器打开 NapCat WebUI 扫码页，
-# 用户用手机 QQ 扫码即可登录；登录成功后弹通知并退出。
-#
-# 判定信号（2026-08-13 二改，弃用 docker logs 与文件存在性）：
-#   - v1 用 docker logs grep "请扫描...|ErrCode"：登录后 ErrCode 可能持续出现在
-#     无关日志行，导致"已登录"永不成立，服务挂死（生产实测 34 分钟不退出）。
-#   - v2 用 docker cp 成功/失败（文件存在性）：登录成功后 NapCat 并不删除
-#     qrcode.png，文件残留导致已登录状态误判为未登录、误弹浏览器（生产实测）。
-#   - v3（本版）用文件内容哈希：未登录时二维码每 ~2 分钟刷新一次（内容变化）；
-#     登录成功后内容冻结。连续 10 轮（200s，> 刷新周期 120s）无变化 = 已登录。
-#     只有「内容变化」能区分扫码循环与已登录，静态检查任何单一时刻都无法区分。
+#!/usr/bin/env bash
+# NapCat 扫码监听器。所有机器相关值来自 deploy.env，不保存真实 token、用户名或仓库路径。
+set -Eeuo pipefail
+umask 077
 
-# 固定部署参数：脚本整个进程期间不变。WEBUI_URL 是浏览器入口，CONTAINER 是 docker 名。
-WEBUI_URL="http://127.0.0.1:6099/webui?token=0ef70d38-c0ab-41e5-b209-300f8bba8ca3"
-CONTAINER="napcat"
-# 派生路径：QR_FILE 永远位于 QR_DIR 下，保存从容器复制出的当前二维码快照。
-QR_DIR="$HOME/.yjlcoder/qq-qr"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+
+config_file=""
+if [[ "${1:-}" == "--config" ]]; then
+    [[ $# -ge 2 ]] || { printf '%s\n' '--config 缺少文件路径' >&2; exit 2; }
+    config_file="$2"
+elif [[ $# -gt 0 ]]; then
+    printf '未知参数: %s\n' "$1" >&2
+    exit 2
+fi
+yjlcoder_load_config "$config_file"
+
+CONTAINER="${NAPCAT_CONTAINER_NAME:-napcat}"
+QR_SOURCE="${NAPCAT_QR_SOURCE:-/app/napcat/cache/qrcode.png}"
+if [[ -n "${YJLCODER_QR_DIR:-}" ]]; then
+    QR_DIR="$(yjlcoder_resolve_config_path "$YJLCODER_QR_DIR")"
+else
+    QR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/yjlcoder/qq-qr"
+fi
 QR_FILE="$QR_DIR/qrcode.png"
+POLL_SECONDS="${YJLCODER_QR_POLL_SECONDS:-20}"
+STABLE_ROUNDS="${YJLCODER_QR_STABLE_ROUNDS:-10}"
+STARTUP_ROUNDS="${YJLCODER_QR_STARTUP_ROUNDS:-30}"
+STARTUP_INTERVAL="${YJLCODER_QR_STARTUP_INTERVAL:-10}"
+OPEN_BIN="${YJLCODER_OPEN_BIN:-xdg-open}"
+NOTIFY_BIN="${YJLCODER_NOTIFY_BIN:-notify-send}"
 
-# 桌面环境变量（systemd 用户服务不继承，从登录会话获取）
-export DISPLAY="${DISPLAY:-:0}"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
-
-log() { echo "[qq-qr] $(date +%H:%M:%S) $*"; }
-notify() { notify-send -a yjlcoder "$1" "$2" 2>/dev/null || true; }
-
-# 状态机变量只活到脚本退出：opened 记录本轮是否已经弹过页面，避免每 20 秒重复弹窗。
-opened=0
-# unchanged_rounds 是二维码内容连续不变的轮数；内容变化时清零。
-unchanged_rounds=0
-# prev_hash 是上一轮 SHA-256；空字符串表示还没有建立比较基线。
-prev_hash=""
-
-# 等待容器存在
-for _ in $(seq 1 30); do
-    if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
-        break
+for value_name in POLL_SECONDS STABLE_ROUNDS STARTUP_ROUNDS STARTUP_INTERVAL; do
+    value="${!value_name}"
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s 必须是正整数，当前值: %s\n' "$value_name" "$value" >&2
+        exit 2
     fi
-    sleep 10
+done
+
+# systemd 用户服务通常已有这些变量；没有时只补可由 uid 推导的通用值。
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+urlencode() {
+    local input="$1" output="" char hex index
+    local LC_ALL=C
+    for ((index = 0; index < ${#input}; index++)); do
+        char="${input:index:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-]) output+="$char" ;;
+            *)
+                printf -v hex '%%%02X' "'$char"
+                output+="$hex"
+                ;;
+        esac
+    done
+    printf '%s' "$output"
+}
+
+if [[ -n "${NAPCAT_WEBUI_URL:-}" ]]; then
+    WEBUI_BASE_URL="$NAPCAT_WEBUI_URL"
+else
+    WEBUI_BASE_URL="${NAPCAT_WEBUI_SCHEME:-http}://${NAPCAT_WEBUI_HOST:-127.0.0.1}:${NAPCAT_WEBUI_PORT:-6099}${NAPCAT_WEBUI_PATH:-/webui}"
+fi
+WEBUI_URL="$WEBUI_BASE_URL"
+if [[ -n "${NAPCAT_WEBUI_TOKEN:-}" ]]; then
+    separator='?'
+    [[ "$WEBUI_URL" == *\?* ]] && separator='&'
+    WEBUI_URL+="${separator}token=$(urlencode "$NAPCAT_WEBUI_TOKEN")"
+fi
+
+log() { printf '[qq-qr] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
+notify() {
+    command -v "$NOTIFY_BIN" >/dev/null 2>&1 || return 0
+    "$NOTIFY_BIN" -a yjlcoder "$1" "$2" 2>/dev/null || true
+}
+open_webui() {
+    command -v "$OPEN_BIN" >/dev/null 2>&1 || return 1
+    "$OPEN_BIN" "$WEBUI_URL" >/dev/null 2>&1
+}
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        printf '%s\n' '缺少 sha256sum/shasum，无法比较二维码内容' >&2
+        return 1
+    fi
+}
+container_running() {
+    [[ "$(yjlcoder_docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == "true" ]]
+}
+
+for ((attempt = 1; attempt <= STARTUP_ROUNDS; attempt++)); do
+    container_running && break
+    if ((attempt == STARTUP_ROUNDS)); then
+        log "等待容器 $CONTAINER 超时"
+        exit 1
+    fi
+    sleep "$STARTUP_INTERVAL"
 done
 
 mkdir -p "$QR_DIR"
-log "开始监听 $CONTAINER 登录状态（未登录时自动打开浏览器）"
+log "开始监听 $CONTAINER 登录状态；WebUI 地址和 token 来自 $YJLCODER_DEPLOY_CONFIG"
+
+opened=0
+unchanged_rounds=0
+prev_hash=""
 
 while true; do
-    sleep 20
-
-    if sudo docker cp "$CONTAINER:/app/napcat/cache/qrcode.png" "$QR_FILE" 2>/dev/null; then
-        # cur_hash 只代表本轮文件内容；循环尾部赋给 prev_hash，成为下一轮基线。
-        cur_hash=$(sha256sum "$QR_FILE" 2>/dev/null | awk '{print $1}')
-        if [ -n "$prev_hash" ] && [ "$cur_hash" = "$prev_hash" ]; then
-            # 二维码内容与上一轮相同
+    if yjlcoder_docker cp "$CONTAINER:$QR_SOURCE" "$QR_FILE" 2>/dev/null; then
+        cur_hash="$(hash_file "$QR_FILE")"
+        if [[ -n "$prev_hash" && "$cur_hash" == "$prev_hash" ]]; then
             unchanged_rounds=$((unchanged_rounds + 1))
-            if [ "$opened" = "1" ] && [ "$unchanged_rounds" -ge 10 ]; then
-                log "登录成功（二维码内容连续 10 轮未变），退出"
-                notify "QQ 登录成功" "机器人已上线，可关闭扫码页面"
-                exit 0
-            elif [ "$opened" = "0" ] && [ "$unchanged_rounds" -ge 10 ]; then
-                # 从未出现过扫码循环：开机时登录态已有效，无需扫码，静默退出
-                log "未检测到扫码循环（登录态有效），静默退出"
+            if ((unchanged_rounds >= STABLE_ROUNDS)); then
+                if [[ "$opened" == "1" ]]; then
+                    log "二维码内容稳定，判定登录成功"
+                    notify "QQ 登录成功" "机器人已上线，可关闭扫码页面"
+                else
+                    log "未检测到扫码循环，登录态仍有效"
+                fi
                 exit 0
             fi
         else
-            # 内容变化 = 二维码刷新中 = 未登录，需要扫码（首轮 prev_hash 为空只记录基线，不判定）
-            if [ -n "$prev_hash" ]; then
+            if [[ -n "$prev_hash" ]]; then
                 unchanged_rounds=0
-                if [ "$opened" = "0" ]; then
-                    log "检测到二维码循环，打开浏览器扫码页"
-                    xdg-open "$WEBUI_URL" >/dev/null 2>&1 || notify "QQ 需要扫码" "浏览器打不开，请手动打开: $WEBUI_URL"
-                    notify "QQ 需要扫码登录" "手机 QQ 扫码登录（二维码在浏览器里，或 $QR_DIR/qrcode.png）"
+                if [[ "$opened" == "0" ]]; then
+                    log "检测到二维码刷新，打开 NapCat WebUI"
+                    open_webui || notify "QQ 需要扫码" "请打开 $WEBUI_BASE_URL；token 保存在部署配置中"
+                    notify "QQ 需要扫码登录" "二维码快照位于 $QR_FILE"
                     opened=1
                 fi
             fi
         fi
         prev_hash="$cur_hash"
-    else
-        # 容器内无二维码文件（cp 失败）
-        if [ "$opened" = "1" ]; then
-            # 曾经有二维码、现在文件消失 = 登录成功
-            log "登录成功（二维码文件已消失），退出"
-            notify "QQ 登录成功" "机器人已上线，可关闭扫码页面"
-            exit 0
-        fi
-        # 从未见过二维码：容器刚启动尚未生成，继续等待
+    elif [[ "$opened" == "1" ]]; then
+        log "二维码文件消失，判定登录成功"
+        notify "QQ 登录成功" "机器人已上线，可关闭扫码页面"
+        exit 0
     fi
+    sleep "$POLL_SECONDS"
 done

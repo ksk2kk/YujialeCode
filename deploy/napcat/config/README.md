@@ -18,10 +18,14 @@
 ## OneBot 连接数据怎样流动
 
 NapCat 读取 `onebot11_<QQ>.json`，作为 WebSocket 客户端连接
-`ws://127.0.0.1:6701/onebot/v11/ws`。收到 QQ 消息后发出 OneBot JSON event；
+`deploy.env` 中的 `YJLCODER_ONEBOT_WS_URL`。收到 QQ 消息后发出 OneBot JSON event；
 `src/qq.rs` 过滤白名单并创建 Agent。Agent 回复后，qq 模块把正文包装成
 `send_group_msg` 或 `send_private_msg` action，经同一条 WebSocket 发回 NapCat。
 
 配置对象的寿命通常等于 NapCat 进程；文件修改是否热加载由 NapCat 决定，可靠做法是
 修改后重启容器。账号 id、token、passkey 都属于部署数据，不应作为理解 Rust Agent
 主循环的前置知识。
+
+公开仓库只保存 `onebot11.example.json`。实际账号文件、WebUI token、登录态和二维码
+均由 `.gitignore` 排除；通用部署参数放在 `~/.config/yjlcoder/deploy.env`，可从
+`deploy/deploy.env.example` 复制。所有启动脚本也支持 `--config FILE` 指向其他位置。

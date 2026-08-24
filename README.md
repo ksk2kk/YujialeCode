@@ -97,13 +97,16 @@ yjlcoder --model deepseek-v4-flash
 ### Docker 部署 NapCat（推荐，一键脚本在 `deploy/napcat/`）
 
 ```bash
-cd deploy/napcat && ./start.sh
+mkdir -p ~/.config/yjlcoder
+install -m 600 deploy/deploy.env.example ~/.config/yjlcoder/deploy.env
+# 编辑 deploy.env，填写自己的 token；QQ 号可以留空后扫码
+deploy/napcat/start.sh --no-follow
 ```
 
-1. 浏览器打开 http://127.0.0.1:6099（NapCat WebUI），输入 `WEBUI_TOKEN`（见 `deploy/napcat/start.sh`），用手机 QQ 扫码登录机器人账号。
-2. 容器以 `host` 网络运行，登录后 NapCat 按 `onebot11_<QQ>.json`（参照 `deploy/napcat/config/onebot11.example.json` 配置，`deploy/napcat/config/` 另有已配好的文件）以反向 WebSocket 连上宿主机 `ws://127.0.0.1:6701/onebot/v11/ws`。
-3. 运行 `yjlcoder --qq`（TUI + 桥接）或 `yjlcoder --qq-only`（守护）。
-4. `ACCOUNT` 已填机器人 QQ 号，登录过一次后重启自动快速登录。
+1. `deploy.env` 是唯一的机器私有配置：二进制路径、QQ 号、WebUI token、容器名、数据目录、端口和 OneBot 地址都可修改，也可给脚本传 `--config FILE`。
+2. 浏览器打开配置中的 NapCat WebUI 地址，用手机 QQ 扫码登录；真实 token 不进入仓库和脚本。
+3. 登录后 NapCat 按 `YJLCODER_ONEBOT_WS_URL` 反向连接 YJLcoder；手工配置可参考 `deploy/napcat/config/onebot11.example.json`。
+4. 运行 `deploy/install-user-services.sh --enable` 可安装无用户名、无仓库路径依赖的 systemd 用户服务。
 5. 默认触发方式：群里发 `yjlcoder 你好`，或 `@机器人 你好`（`need_at`）。
 
 手工接入（已有 NapCat/Lagrange）：在 NapCat 中新建反向 WebSocket 连接，地址填 `ws://127.0.0.1:6701/onebot/v11/ws`。

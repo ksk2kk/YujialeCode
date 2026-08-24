@@ -7,7 +7,7 @@
       {
         "enable": true,
         "name": "yjlcoder",
-        "url": "ws://127.0.0.1:6701/onebot/v11/ws",
+        "url": "ws://YOUR_YJLCODER_HOST:6701/onebot/v11/ws",
         "messagePostFormat": "array",
         "reportSelfMessage": false,
         "reconnectInterval": 5000,

@@ -4,8 +4,13 @@ __pycache__/
 *.py[cod]
 
 # NapCat 敏感配置（QQ 号 / 登录令牌 / 二维码）
+/deploy/deploy.env
 /deploy/napcat/docker-compose.yml
 /deploy/napcat/qrcode*.png
-/deploy/napcat/config/*_3503963415.json
+/deploy/napcat/.config/
+/deploy/napcat/logs/
+/deploy/napcat/config/napcat_*.json
+/deploy/napcat/config/napcat_protocol_*.json
+/deploy/napcat/config/onebot11_*.json
 /deploy/napcat/config/passkey.json
 /deploy/napcat/config/webui.json

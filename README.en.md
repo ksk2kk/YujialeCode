@@ -91,13 +91,16 @@ On first run, `~/.yjlcoder/config.json` is generated automatically. The `YJLCODE
 ### Docker Deployment with NapCat (recommended; one-click scripts in `deploy/napcat/`)
 
 ```bash
-cd deploy/napcat && ./start.sh
+mkdir -p ~/.config/yjlcoder
+install -m 600 deploy/deploy.env.example ~/.config/yjlcoder/deploy.env
+# Edit deploy.env and set your own token; the QQ account may stay empty for QR login
+deploy/napcat/start.sh --no-follow
 ```
 
-1. Open http://127.0.0.1:6099 (NapCat WebUI) in a browser, enter `WEBUI_TOKEN` (see `deploy/napcat/start.sh`), and scan the QR code with the phone QQ of the bot account.
-2. The container runs with `host` networking; after login, NapCat connects to the host's `ws://127.0.0.1:6701/onebot/v11/ws` via reverse WebSocket (configure per `deploy/napcat/config/onebot11.example.json`).
-3. Run `yjlcoder --qq` (TUI + bridge) or `yjlcoder --qq-only` (daemon).
-4. `ACCOUNT` holds the bot QQ; after the first login, restarts log in automatically.
+1. `deploy.env` is the only machine-private configuration. Binary path, QQ account, WebUI token, container name, data directories, ports, and OneBot URL are all configurable; every script also accepts `--config FILE`.
+2. Open the configured NapCat WebUI address and scan the QR code. Real tokens never belong in repository files or scripts.
+3. NapCat connects to `YJLCODER_ONEBOT_WS_URL` after login; use `deploy/napcat/config/onebot11.example.json` for a manual setup.
+4. `deploy/install-user-services.sh --enable` installs systemd user services without embedding a username or repository path.
 5. Default trigger: send `yjlcoder hi` in a group, or `@bot hi` (with `need_at`).
 
 Manual setup (existing NapCat/Lagrange): create a reverse WebSocket connection in NapCat and point it at `ws://127.0.0.1:6701/onebot/v11/ws`.

@@ -1,0 +1,19 @@
+services:
+  napcat:
+    image: "${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}"
+    container_name: "${NAPCAT_CONTAINER_NAME:-napcat}"
+    network_mode: "${NAPCAT_NETWORK_MODE:-host}"
+    restart: "${NAPCAT_RESTART_POLICY:-unless-stopped}"
+    environment:
+      ACCOUNT: "${NAPCAT_ACCOUNT:-}"
+      WSR_ENABLE: "true"
+      WS_URLS: '["${YJLCODER_ONEBOT_WS_URL:-ws://127.0.0.1:6701/onebot/v11/ws}"]'
+      MESSAGE_POST_FORMAT: "array"
+      WEBUI_TOKEN: "${NAPCAT_WEBUI_TOKEN:?请在 deploy.env 设置 NAPCAT_WEBUI_TOKEN}"
+      NAPCAT_UID: "${NAPCAT_UID}"
+      NAPCAT_GID: "${NAPCAT_GID}"
+      TZ: "${NAPCAT_TIMEZONE:-UTC}"
+    volumes:
+      - "${NAPCAT_CONFIG_DIR}:/app/napcat/config"
+      - "${NAPCAT_QQ_DATA_DIR}:/app/.config/QQ"
+      - "${NAPCAT_LOG_DIR}:/app/napcat/logs"

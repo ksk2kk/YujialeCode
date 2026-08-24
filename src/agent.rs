@@ -1440,10 +1440,10 @@ mod tests {
     }
     #[test]
     fn parse_atem_calls_handles_mixed_and_pure() {
-        let mixed = "2 + 3 = 5\n\n现在查看目录：\n<|eom|><|start|>assistant to=listdir<|message|><atem:function_calls>\n<atem:invoke name=\"listdir\">\n<atem:parameter name=\"path\">/home/ksk2kk/YJLcoder/src</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        let mixed = "2 + 3 = 5\n\n现在查看目录：\n<|eom|><|start|>assistant to=listdir<|message|><atem:function_calls>\n<atem:invoke name=\"listdir\">\n<atem:parameter name=\"path\">/workspace/yjlcoder/src</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
         let (op, args) = parse_atem_calls(mixed).expect("应解析出 atem 工具");
         assert_eq!(op, "listdir");
-        assert_eq!(args.get("path").and_then(|v| v.as_str()), Some("/home/ksk2kk/YJLcoder/src"));
+        assert_eq!(args.get("path").and_then(|v| v.as_str()), Some("/workspace/yjlcoder/src"));
         let clean = strip_atem_block(mixed);
         assert!(!clean.contains("<atem:"), "剥离后不应含 atem 标签: {clean}");
         assert!(clean.contains("2 + 3 = 5"));
