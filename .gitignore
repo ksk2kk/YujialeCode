@@ -1,4 +1,7 @@
 /target
+.DS_Store
+__pycache__/
+*.py[cod]
 
 # NapCat 敏感配置（QQ 号 / 登录令牌 / 二维码）
 /deploy/napcat/docker-compose.yml
