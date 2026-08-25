@@ -13,6 +13,11 @@ const TAIL_REPEAT_MIN: usize = 3;
 pub struct Msg {
     pub role: String,
     pub content: String,
+    /// Local screenshot path. It is persisted as a small path rather than a
+    /// base64 blob; only the newest still-relevant frame is encoded for a
+    /// vision-capable backend when the request is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +200,23 @@ impl Llm {
     pub fn is_llamacpp(&self) -> bool {
         match self {
             Llm::Remote(c) => c.server_caps.lock().unwrap().is_llamacpp(),
+            Llm::Mock(_) => false,
+        }
+    }
+    pub fn supports_vision(&self) -> bool {
+        match self {
+            Llm::Remote(c) => c
+                .server_caps
+                .lock()
+                .map(|caps| {
+                    caps.modalities.iter().any(|modality| {
+                        matches!(
+                            modality.to_ascii_lowercase().as_str(),
+                            "vision" | "image" | "images" | "image_url"
+                        )
+                    })
+                })
+                .unwrap_or(false),
             Llm::Mock(_) => false,
         }
     }
@@ -615,7 +637,19 @@ impl RemoteClient {
         } else {
             chat_url(&self.base_url)
         };
-        let openai_messages: Vec<Value> = req.messages.iter().map(to_openai_msg).collect();
+        let vision_available = self
+            .server_caps
+            .lock()
+            .map(|caps| {
+                caps.modalities.iter().any(|modality| {
+                    matches!(
+                        modality.to_ascii_lowercase().as_str(),
+                        "vision" | "image" | "images" | "image_url"
+                    )
+                })
+            })
+            .unwrap_or(false);
+        let openai_messages = to_openai_messages(&req.messages, vision_available);
         let cache_observation = self
             .cache_tracker
             .lock()
@@ -1083,6 +1117,48 @@ fn to_openai_msg(m: &Msg) -> Value {
     }
     v
 }
+
+fn to_openai_messages(messages: &[Msg], vision_available: bool) -> Vec<Value> {
+    let mut out: Vec<Value> = messages.iter().map(to_openai_msg).collect();
+    if !vision_available {
+        return out;
+    }
+
+    // An old screenshot must not unexpectedly reappear on a later user turn.
+    // Keep it live only while no later assistant/user message has superseded
+    // the tool result. Trailing native tool responses are allowed.
+    let Some((index, path)) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| message.image_path.as_deref().map(|path| (index, path)))
+    else {
+        return out;
+    };
+    if messages[index + 1..]
+        .iter()
+        .any(|message| matches!(message.role.as_str(), "assistant" | "user"))
+    {
+        return out;
+    }
+
+    if let Ok(data_url) = crate::computer_use::image_data_url(path) {
+        out.push(json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "这是 computer_use 刚返回的最新 Wayland 截图。动作坐标使用工具结果里的 frame_id 和截图像素坐标。"
+                },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": data_url }
+                }
+            ]
+        }));
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,6 +1311,41 @@ mod tests {
         });
         let v = to_openai_msg(&m);
         assert_eq!(v["tool_calls"][0]["function"]["name"], "execute_command");
+    }
+    #[test]
+    fn old_session_without_image_path_still_deserializes() {
+        let message: Msg = serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(message.content, "hello");
+        assert!(message.image_path.is_none());
+    }
+    #[test]
+    fn newest_live_screenshot_is_attached_once_for_vision() {
+        let path = std::env::temp_dir().join(format!(
+            "yjlcoder_llm_image_{}_{}.png",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, b"png-bytes").unwrap();
+        let mut tool = Msg::new("tool", "frame ready");
+        tool.image_path = Some(path.to_string_lossy().into_owned());
+        tool.tool_call_id = Some("call-1".into());
+        let messages = vec![Msg::new("assistant", ""), tool];
+
+        let plain = to_openai_messages(&messages, false);
+        assert_eq!(plain.len(), 2, "纯文本模型不应收到图片消息");
+
+        let vision = to_openai_messages(&messages, true);
+        assert_eq!(vision.len(), 3);
+        assert_eq!(vision[2]["content"][1]["type"], "image_url");
+        assert!(vision[2]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        let mut superseded = messages;
+        superseded.push(Msg::new("assistant", "已经看过"));
+        assert_eq!(to_openai_messages(&superseded, true).len(), 3);
+        let _ = std::fs::remove_file(path);
     }
     fn serve_sse(chunks: Vec<String>) -> u16 {
         use std::io::{Read, Write};

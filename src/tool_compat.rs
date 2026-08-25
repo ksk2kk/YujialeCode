@@ -129,6 +129,7 @@ fn alias_name(name: &str) -> Option<&'static str> {
         "recall" => "memory_search",
         "ask" | "clarify" | "ask_user_question" | "askuserquestion" => "ask_user",
         "fuckmaster" | "proactive_goal" | "goal_reminder" => "fuck_master",
+        "computer" | "computeruse" | "computer-use" | "computer_control" | "gui" => "computer_use",
         "tools" | "help_tools" => "list_tools",
         _ => return None,
     })

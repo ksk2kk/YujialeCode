@@ -120,6 +120,17 @@ pub const CATEGORIES: &[Category] = &[
         ],
     },
     Category {
+        id: "computer",
+        title: "Linux Wayland 电脑操作（截图后使用 frame_id 和图中像素坐标）",
+        tools: &[
+            ToolDef {
+                name: "computer_use",
+                desc: "Wayland 原生观察和操作：自动探测 Niri/输出布局，grim 以逻辑缩放截图，虚拟指针精确点击，wtype 输入；每次动作后自动返回新截图，所有子进程有硬超时",
+                args: "{\"action\":\"capabilities|observe|list_outputs|list_windows|focus_window|click|double_click|move|drag|scroll|type_text|press_key|wait\",\"target\":\"focused_output|output|all|region\",\"frame_id\":\"f...\",\"x\":123,\"y\":456,\"text\":\"...\",\"keys\":\"CTRL+L\"}",
+            },
+        ],
+    },
+    Category {
         id: "goal",
         title: "持续目标",
         tools: &[
@@ -200,6 +211,7 @@ mod tests {
         assert!(names.contains(&"install_skill"));
         assert!(names.contains(&"qq_send"));
         assert!(names.contains(&"fuck_master"));
+        assert!(names.contains(&"computer_use"));
     }
     #[test]
     fn list_outputs() {
@@ -209,6 +221,7 @@ mod tests {
         let file = list_category_text("file").unwrap();
         assert!(file.contains("readline"));
         assert!(list_category_text("goal").unwrap().contains("fuck_master"));
+        assert!(list_category_text("computer").unwrap().contains("computer_use"));
         assert!(list_category_text("nope").is_none());
     }
     #[test]

@@ -419,7 +419,7 @@ impl Agent {
                 "【工具结果】{op} 已返回（系统已直接执行，根据结果回答，不要再重复调用该工具）:\n{}",
                 self.prepare_tool_output(op, &args, &output)
             );
-            self.store.append(&Msg::new("user", result_msg));
+            self.store.append(&message_with_tool_image("user", result_msg, None));
             if self.cfg.fuckloop && op == "readline" {
                 if let Some(answer) = deterministic_read_line_answer(user_input, &output) {
                     self.store.append(&Msg::new("assistant", answer.clone()));
@@ -543,7 +543,7 @@ impl Agent {
                             self.prepare_tool_output(&op, &args, &output)
                         );
                         traced(AgentEvent::ToolResult(output.clone()));
-                        self.store.append(&Msg::new("user", result_msg));
+                        self.store.append(&message_with_tool_image("user", result_msg, None));
                     }
                     interrupts = 0;                                          
                     continue;
@@ -687,12 +687,11 @@ impl Agent {
                     if guard_reason.is_none() {
                         guard_reason = tool_guard.after_result(&output);
                     }
-                    self.store.append(&Msg {
-                        role: "tool".into(),
-                        content: output,
-                        tool_call_id: Some(call.id.clone()),
-                        ..Default::default()
-                    });
+                    self.store.append(&message_with_tool_image(
+                        "tool",
+                        output,
+                        Some(call.id.clone()),
+                    ));
                 }
                 if let Some(reason) = guard_reason {
                     final_text = self.finalize_without_tools(&reason, &mut traced);
@@ -730,7 +729,7 @@ impl Agent {
                 let result_msg =
                     format!("【工具结果】{op} 返回:\n{}", self.prepare_tool_output(&op, &args, &output));
                 traced(AgentEvent::ToolResult(output.clone()));
-                self.store.append(&Msg::new("user", result_msg));
+                self.store.append(&message_with_tool_image("user", result_msg, None));
                 if let Some(reason) = tool_guard.after_result(&output) {
                     final_text = self.finalize_without_tools(&reason, &mut traced);
                     self.store.append(&Msg::new("assistant", final_text.clone()));
@@ -757,7 +756,7 @@ impl Agent {
                 let result_msg =
                     format!("【工具结果】{op} 返回:\n{}", self.prepare_tool_output(&op, &args, &output));
                 traced(AgentEvent::ToolResult(output.clone()));
-                self.store.append(&Msg::new("user", result_msg));
+                self.store.append(&message_with_tool_image("user", result_msg, None));
                 if let Some(reason) = tool_guard.after_result(&output) {
                     final_text = self.finalize_without_tools(&reason, &mut traced);
                     self.store.append(&Msg::new("assistant", final_text.clone()));
@@ -784,7 +783,7 @@ impl Agent {
                 let result_msg =
                     format!("【工具结果】{op} 返回:\n{}", self.prepare_tool_output(op, &args, &output));
                 traced(AgentEvent::ToolResult(output.clone()));
-                self.store.append(&Msg::new("user", result_msg));
+                self.store.append(&message_with_tool_image("user", result_msg, None));
                 if let Some(reason) = tool_guard.after_result(&output) {
                     final_text = self.finalize_without_tools(&reason, &mut traced);
                     self.store.append(&Msg::new("assistant", final_text.clone()));
@@ -955,6 +954,12 @@ impl Agent {
     }
     fn prepare_tool_output(&self, op: &str, args: &Value, output: &str) -> String {
         let semantic_op = crate::tool_compat::normalize_call(op, args).op;
+        if semantic_op == "computer_use" {
+            // The output is small, and its private marker connects the frame
+            // to the next multimodal request. Generic preview storage would
+            // separate or truncate that marker and make the screenshot blind.
+            return output.to_string();
+        }
         crate::tool_output::store_or_preview_for_tool(
             &self.cfg.data_dir(),
             self.store.current_id(),
@@ -962,6 +967,17 @@ impl Agent {
             output,
             self.cfg.tui.tool_result_max_tokens,
         )
+    }
+}
+
+fn message_with_tool_image(role: &str, content: String, tool_call_id: Option<String>) -> Msg {
+    let (content, image_path) = crate::computer_use::split_image_marker(&content);
+    Msg {
+        role: role.into(),
+        content,
+        image_path,
+        tool_call_id,
+        ..Default::default()
     }
 }
 fn output_looks_broken(result: &crate::llm::ChatResult) -> bool {

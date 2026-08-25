@@ -2,6 +2,7 @@ pub mod agent;
 pub mod backend;
 pub mod clipboard_copy;
 pub mod compress;
+pub mod computer_use;
 pub mod config;
 pub mod dynamic_tools;
 pub mod fuck_master;

@@ -2060,6 +2060,8 @@ dependencies = [
  "tungstenite",
  "unicode-width",
  "ureq",
+ "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]

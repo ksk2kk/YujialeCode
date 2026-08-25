@@ -134,6 +134,7 @@ pub const KNOWN_OPS: &[&str] = &[
     "ask_user",
     "goal",
     "fuck_master",
+    "computer_use",
 ];
 pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     if op.eq_ignore_ascii_case("make_tools") || op.eq_ignore_ascii_case("make-tools") {
@@ -279,6 +280,13 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "ask_user" => ask_user(args, ctx),
         "goal" => crate::goal::execute_tool(ctx.cfg, ctx.store.current_id(), args),
         "fuck_master" => crate::fuck_master::execute_tool(ctx.cfg, ctx.store.current_id(), args),
+        "computer_use" => crate::computer_use::execute(
+            ctx.cfg,
+            ctx.store.current_id(),
+            args,
+            ctx.cancel,
+            ctx.llm.supports_vision(),
+        ),
         _ => match crate::dynamic_tools::load(ctx.cfg, op) {
             Some(tool) => execute_dynamic_tool(&tool, args, ctx),
             None => Err(format!("未知工具: {op}（list_tools 查看可用工具）")),

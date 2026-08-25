@@ -2,6 +2,7 @@ mod agent;
 mod backend;
 mod clipboard_copy;
 mod compress;
+mod computer_use;
 mod config;
 mod dynamic_tools;
 mod fuck_master;
