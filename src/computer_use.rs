@@ -20,6 +20,7 @@ const MAX_CAPTURE_BYTES: u64 = 24 * 1024 * 1024;
 const INTER_ACTION_DELAY: Duration = Duration::from_millis(120);
 const BATCH_EXECUTION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ACTIONS_PER_BATCH: usize = 50;
+const MAX_RAW_ACTIONS_PER_BATCH: usize = 200;
 static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "macos")]
@@ -46,6 +47,10 @@ struct FrameMeta {
     layout_height: f64,
     clickable: bool,
     captured_unix_ms: u128,
+    /// 只有真正改变桌面状态的动作才递增。单纯多截一张图不会让旧图失效，
+    /// 因此模型可以先看全屏、再看局部，最后仍用全屏 frame_id 点击。
+    #[serde(default)]
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,10 +86,19 @@ pub fn execute(
     cancel: &AtomicBool,
     vision_available: bool,
 ) -> Result<String, String> {
-    if args.get("actions").is_some() {
-        return execute_batch(cfg, session, args, cancel, vision_available);
+    let normalized = normalize_computer_args(args)?;
+    if normalized.get("actions").is_some() {
+        return execute_batch(cfg, session, &normalized, cancel, vision_available);
     }
-    execute_single(cfg, session, args, cancel, vision_available, true, None)
+    execute_single(
+        cfg,
+        session,
+        &normalized,
+        cancel,
+        vision_available,
+        true,
+        None,
+    )
 }
 
 fn execute_single(
@@ -111,6 +125,7 @@ fn execute_single(
         "focus_window" | "focus" => {
             let id = required_u64(args, "window_id")?;
             platform_focus_window(id, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "已聚焦窗口", || {
                 capture(cfg, session, &json!({"target":"focused_output"}), cancel, vision_available)
             })
@@ -122,6 +137,7 @@ fn execute_single(
             let button = pointer_button(args.get("button").and_then(Value::as_str).unwrap_or("left"))?;
             let count = if action.starts_with("double") { 2 } else { 1 };
             pointer_click(&meta, desktop_x, desktop_y, button, count, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "点击完成", || {
                 recapture(cfg, session, &meta, cancel, vision_available)
             })
@@ -131,6 +147,7 @@ fn execute_single(
             let (x, y) = required_point(args)?;
             let (desktop_x, desktop_y) = map_frame_point(&meta, x, y)?;
             pointer_move(&meta, desktop_x, desktop_y, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "移动完成", || {
                 recapture(cfg, session, &meta, cancel, vision_available)
             })
@@ -145,6 +162,7 @@ fn execute_single(
             let to = map_frame_point(&meta, to_x, to_y)?;
             let button = pointer_button(args.get("button").and_then(Value::as_str).unwrap_or("left"))?;
             pointer_drag(&meta, from, to, button, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "拖拽完成", || {
                 recapture(cfg, session, &meta, cancel, vision_available)
             })
@@ -161,6 +179,7 @@ fn execute_single(
                 _ => return Err("scroll 的 x 和 y 必须同时提供".into()),
             };
             pointer_scroll(&meta, point, steps, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "滚动完成", || {
                 recapture(cfg, session, &meta, cancel, vision_available)
             })
@@ -174,6 +193,7 @@ fn execute_single(
                 return Err("单次输入最多 20000 字节".into());
             }
             platform_type_text(text, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "文字输入完成", || {
                 recapture_latest_or_focused(cfg, session, cancel, vision_available)
             })
@@ -185,8 +205,33 @@ fn execute_single(
                 .and_then(Value::as_str)
                 .ok_or("press_key 缺少 keys，例如 CTRL+L 或 Return")?;
             platform_press_key(keys, cancel)?;
+            advance_ui_generation(cfg, session)?;
             action_result_or_capture(capture_after, "按键完成", || {
                 recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            })
+        }
+        "open_url" => {
+            let url = args
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or("open_url 缺少 url")?;
+            validate_web_url(url)?;
+            platform_open_url(url, cancel)?;
+            advance_ui_generation(cfg, session)?;
+            let wait_ms = args
+                .get("wait_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(800)
+                .min(10_000);
+            cancellable_sleep(Duration::from_millis(wait_ms), cancel)?;
+            action_result_or_capture(capture_after, "网址已打开", || {
+                capture(
+                    cfg,
+                    session,
+                    &json!({"target":"focused_output"}),
+                    cancel,
+                    vision_available,
+                )
             })
         }
         "wait" => {
@@ -197,8 +242,158 @@ fn execute_single(
             })
         }
         _ => Err(format!(
-            "未知 computer_use action: {action}。可用：capabilities, observe, list_outputs, list_windows, focus_window, click, double_click, move, drag, scroll, type_text, press_key, wait；也可传 actions 数组批量执行"
+            "未知 computer_use action: {action}。可用：capabilities, observe, list_outputs, list_windows, focus_window, open_url, click, double_click, move, drag, scroll, type_text, press_key, wait；也可传 actions 数组批量执行"
         )),
+    }
+}
+
+/// 把不同模型常见的 CUA 方言收敛为内部唯一格式。兼容发生在代码层，
+/// 不需要把一大页“如果 A 失败再改成 B”的说明塞进系统提示词。
+fn normalize_computer_args(args: &Value) -> Result<Value, String> {
+    let mut normalized = args.clone();
+    let object = normalized
+        .as_object_mut()
+        .ok_or("computer_use 参数必须是 JSON 对象")?;
+    normalize_action_object(object)?;
+
+    if let Some(actions) = object.get_mut("actions") {
+        let actions = actions.as_array_mut().ok_or("actions 必须是 JSON 数组")?;
+        for (index, action) in actions.iter_mut().enumerate() {
+            let child = action
+                .as_object_mut()
+                .ok_or_else(|| format!("actions[{index}] 必须是对象"))?;
+            if child.contains_key("actions") {
+                return Err("禁止嵌套 actions 批次".into());
+            }
+            normalize_action_object(child)?;
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_action_object(object: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    if !object.contains_key("action") {
+        if let Some(value) = object.get("type").cloned() {
+            object.insert("action".into(), value);
+        }
+    }
+    if let Some(action) = object.get("action").and_then(Value::as_str) {
+        object.insert("action".into(), Value::String(canonical_action(action)));
+    }
+
+    copy_alias(object, "window_id", &["id", "window", "target_id"]);
+    copy_alias(object, "text", &["value", "input", "content"]);
+    copy_alias(object, "keys", &["key", "hotkey"]);
+    copy_alias(object, "url", &["uri", "href"]);
+    copy_alias(object, "from_x", &["start_x"]);
+    copy_alias(object, "from_y", &["start_y"]);
+    copy_alias(object, "to_x", &["end_x"]);
+    copy_alias(object, "to_y", &["end_y"]);
+
+    if object.get("action").and_then(Value::as_str) == Some("drag") {
+        copy_alias(object, "from_x", &["x"]);
+        copy_alias(object, "from_y", &["y"]);
+    }
+
+    let target = object
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if target == "region" && !object.contains_key("region") {
+        let x = compatible_f64(object.get("x"));
+        let y = compatible_f64(object.get("y"));
+        let width = compatible_f64(object.get("width").or_else(|| object.get("w")));
+        let height = compatible_f64(object.get("height").or_else(|| object.get("h")));
+        if let (Some(x), Some(y), Some(width), Some(height)) = (x, y, width, height) {
+            object.insert(
+                "region".into(),
+                Value::String(format!(
+                    "{},{} {}x{}",
+                    compact_number(x),
+                    compact_number(y),
+                    compact_number(width),
+                    compact_number(height)
+                )),
+            );
+        }
+    }
+
+    if object.get("action").and_then(Value::as_str) == Some("scroll")
+        && !object.contains_key("steps")
+    {
+        let delta = ["scroll_y", "delta_y", "dy", "amount"]
+            .iter()
+            .find_map(|key| compatible_f64(object.get(*key)));
+        if let Some(delta) = delta {
+            let steps = if delta == 0.0 {
+                0
+            } else {
+                (delta.abs() / 100.0).ceil().clamp(1.0, 50.0) as i64 * delta.signum() as i64
+            };
+            object.insert("steps".into(), Value::from(steps));
+        }
+    }
+
+    for key in [
+        "x", "y", "from_x", "from_y", "to_x", "to_y", "width", "height",
+    ] {
+        if let Some(number) = compatible_f64(object.get(key)) {
+            if object.get(key).is_some_and(Value::is_string) {
+                if let Some(number) = serde_json::Number::from_f64(number) {
+                    object.insert(key.into(), Value::Number(number));
+                }
+            }
+        }
+    }
+    for key in ["window_id", "ms", "wait_ms", "steps"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            if let Ok(number) = value.parse::<i64>() {
+                object.insert(key.into(), Value::from(number));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_action(action: &str) -> String {
+    let normalized = action.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "screenshot" | "screen_shot" | "capture" => "observe".into(),
+        "click_element" | "click_at" | "tap" => "click".into(),
+        "doubleclick" | "double_click_element" | "double_click_at" => "double_click".into(),
+        "mousemove" | "mouse_move" | "move_mouse" | "move_pointer" => "move".into(),
+        "keypress" | "key_press" | "hotkey" => "press_key".into(),
+        "type" | "input_text" | "write_text" => "type_text".into(),
+        "sleep" | "pause" | "delay" => "wait".into(),
+        "navigate" | "goto" | "open" | "open_url" => "open_url".into(),
+        "batch" | "multi_action" => "actions".into(),
+        _ => normalized,
+    }
+}
+
+fn copy_alias(object: &mut serde_json::Map<String, Value>, canonical: &str, aliases: &[&str]) {
+    if object.contains_key(canonical) {
+        return;
+    }
+    if let Some(value) = aliases.iter().find_map(|key| object.get(*key).cloned()) {
+        object.insert(canonical.into(), value);
+    }
+}
+
+fn compatible_f64(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })
+}
+
+fn compact_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
     }
 }
 
@@ -212,13 +407,22 @@ fn execute_batch(
     cancel: &AtomicBool,
     vision_available: bool,
 ) -> Result<String, String> {
-    let actions = args
+    let raw_actions = args
         .get("actions")
         .and_then(Value::as_array)
         .ok_or("actions 必须是 JSON 数组")?;
-    if actions.is_empty() || actions.len() > MAX_ACTIONS_PER_BATCH {
+    if raw_actions.is_empty() || raw_actions.len() > MAX_RAW_ACTIONS_PER_BATCH {
         return Err(format!(
-            "actions 数量必须在 1..={MAX_ACTIONS_PER_BATCH} 之间"
+            "actions 原始数量必须在 1..={MAX_RAW_ACTIONS_PER_BATCH} 之间；当前 {} 项",
+            raw_actions.len()
+        ));
+    }
+    let actions = compact_batch_actions(raw_actions);
+    if actions.len() > MAX_ACTIONS_PER_BATCH {
+        return Err(format!(
+            "actions 归一化后仍有 {} 项，执行上限 {MAX_ACTIONS_PER_BATCH}，超出 {} 项；连续 move/wait 会自动合并，其余请拆批",
+            actions.len(),
+            actions.len() - MAX_ACTIONS_PER_BATCH
         ));
     }
     let needs_frame = actions.iter().any(action_uses_frame);
@@ -241,38 +445,21 @@ fn execute_batch(
                 index + 1
             ));
         }
-        let object = action
-            .as_object()
-            .ok_or_else(|| format!("actions[{}] 必须是对象", index))?;
-        if object.contains_key("actions") {
-            return Err("禁止嵌套 actions 批次".into());
-        }
         let name = action
             .get("action")
-            .or_else(|| action.get("type"))
             .and_then(Value::as_str)
             .ok_or_else(|| format!("actions[{}] 缺少 action/type", index))?;
         let normalized_name = name.trim().to_ascii_lowercase();
-        if matches!(normalized_name.as_str(), "screenshot" | "observe") {
-            // OpenAI 协议允许显式 screenshot 动作；我们的批次结尾必定生成一张完整新图，
-            // 因此这里合并掉重复截图，避免白白消耗本地视觉模型上下文。
-            names.push("screenshot(final)".into());
-            continue;
-        }
         if matches!(
             normalized_name.as_str(),
             "capabilities" | "status" | "list_outputs" | "outputs" | "list_windows" | "windows"
         ) {
             return Err(format!("批量动作中不能混入只读查询 {name}；请单独调用"));
         }
-        let mut normalized = action.clone();
-        if normalized.get("action").is_none() {
-            normalized["action"] = Value::String(name.to_string());
-        }
         execute_single(
             cfg,
             session,
-            &normalized,
+            action,
             cancel,
             vision_available,
             false,
@@ -285,7 +472,12 @@ fn execute_batch(
         }
     }
     let result = match batch_frame.as_ref() {
-        Some(meta) if meta.clickable => recapture(cfg, session, meta, cancel, vision_available),
+        Some(meta)
+            if meta.clickable
+                && (needs_frame || matches!(meta.target.as_str(), "output" | "all")) =>
+        {
+            recapture(cfg, session, meta, cancel, vision_available)
+        }
         _ => capture(
             cfg,
             session,
@@ -294,13 +486,80 @@ fn execute_batch(
             vision_available,
         ),
     }?;
+    let summary = summarize_action_names(&names);
+    let compacted = raw_actions.len().saturating_sub(actions.len());
     Ok(format!(
-        "批量动作成功: {}（{} 项，{}ms）\n{}",
-        names.join(" -> "),
+        "批量成功: {}（执行 {} 项，合并 {} 项，{}ms）\n{}",
+        summary,
         names.len(),
+        compacted,
         started.elapsed().as_millis(),
         result
     ))
+}
+
+/// 鼠标轨迹通常只是模型在“画动画”，真正有意义的是最后落点。
+/// 相邻等待也可安全合并；批次内截图统一折叠成结尾那一张。
+fn compact_batch_actions(actions: &[Value]) -> Vec<Value> {
+    let mut result: Vec<Value> = Vec::with_capacity(actions.len());
+    for action in actions {
+        let name = action.get("action").and_then(Value::as_str).unwrap_or("");
+        if name == "observe" {
+            continue;
+        }
+        if name == "move"
+            && result
+                .last()
+                .and_then(|last| last.get("action"))
+                .and_then(Value::as_str)
+                == Some("move")
+        {
+            *result.last_mut().expect("last 已检查") = action.clone();
+            continue;
+        }
+        if name == "wait"
+            && result
+                .last()
+                .and_then(|last| last.get("action"))
+                .and_then(Value::as_str)
+                == Some("wait")
+        {
+            let previous = result
+                .last()
+                .and_then(|last| last.get("ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(500);
+            let current = action.get("ms").and_then(Value::as_u64).unwrap_or(500);
+            if let Some(last) = result.last_mut() {
+                last["ms"] = Value::from(previous.saturating_add(current).min(10_000));
+            }
+            continue;
+        }
+        result.push(action.clone());
+    }
+    result
+}
+
+fn summarize_action_names(names: &[String]) -> String {
+    if names.is_empty() {
+        return "observe(final)".into();
+    }
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < names.len() {
+        let mut end = start + 1;
+        while end < names.len() && names[end] == names[start] {
+            end += 1;
+        }
+        let count = end - start;
+        runs.push(if count == 1 {
+            names[start].clone()
+        } else {
+            format!("{}×{count}", names[start])
+        });
+        start = end;
+    }
+    runs.join(" → ")
 }
 
 fn action_uses_frame(action: &Value) -> bool {
@@ -542,12 +801,42 @@ fn capture(
                 grim_args.extend(["-g".into(), geometry.to_string()]);
                 ("region".to_string(), None, rect, true)
             }
-            "window" | "foreign_toplevel" | "foreign-toplevel" => {
+            "window" => {
+                if let Some(id) = args.get("window_id").and_then(Value::as_u64) {
+                    // Niri 的数字 window_id 不是 grim 的 foreign-toplevel identifier。
+                    // 最稳妥的兼容方式是先精确聚焦，再截取它所在的输出；截图可直接点击。
+                    platform_focus_window(id, cancel)?;
+                    advance_ui_generation(cfg, session)?;
+                    let (name, rect) = niri_focused_output(cancel)?
+                        .ok_or("窗口已聚焦，但 Niri 没有返回 focused-output")?;
+                    grim_args.extend(["-o".into(), name.clone()]);
+                    ("output".to_string(), Some(name), rect, true)
+                } else {
+                    let identifier = args
+                        .get("window_identifier")
+                        .or_else(|| args.get("identifier"))
+                        .and_then(Value::as_str)
+                        .ok_or("target=window 需要 window_id（来自 list_windows）")?;
+                    grim_args.extend(["-T".into(), identifier.to_string()]);
+                    (
+                        "foreign_toplevel".to_string(),
+                        None,
+                        Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1.0,
+                            height: 1.0,
+                        },
+                        false,
+                    )
+                }
+            }
+            "foreign_toplevel" | "foreign-toplevel" => {
                 let identifier = args
                     .get("window_identifier")
                     .or_else(|| args.get("identifier"))
                     .and_then(Value::as_str)
-                    .ok_or("窗口直截需要 Wayland foreign-toplevel identifier；Niri 数字 window_id 不能代替。点击前请改用 focused_output 截图")?;
+                    .ok_or("target=foreign_toplevel 需要 window_identifier")?;
                 grim_args.extend(["-T".into(), identifier.to_string()]);
                 (
                     "foreign_toplevel".to_string(),
@@ -614,6 +903,7 @@ fn capture(
             layout_height: effective_bounds.height,
             clickable,
             captured_unix_ms: unix_ms(),
+            generation: current_ui_generation(cfg, session),
         };
         save_latest_meta(cfg, session, &meta)?;
         prune_old_frames(&dir, 8);
@@ -648,7 +938,11 @@ fn recapture_latest_or_focused(
     vision_available: bool,
 ) -> Result<String, String> {
     match load_latest_meta(cfg, session) {
-        Ok(meta) if meta.clickable => recapture(cfg, session, &meta, cancel, vision_available),
+        // 局部截图是一次性放大镜。打字、按键、等待后继续截同一小块会让模型误以为
+        // 整个桌面只有这一块；窗口裁剪也可能在窗口移动后失去可靠原点。
+        Ok(meta) if meta.clickable && matches!(meta.target.as_str(), "output" | "all") => {
+            recapture(cfg, session, &meta, cancel, vision_available)
+        }
         _ => capture(
             cfg,
             session,
@@ -661,14 +955,13 @@ fn recapture_latest_or_focused(
 
 fn frame_result(meta: &FrameMeta, vision_available: bool) -> String {
     let image_note = if vision_available {
-        "截图已作为视觉输入附加到下一次模型请求"
+        "image=attached".to_string()
     } else {
-        "本地模型未声明 vision，截图已保存但不会强塞给文本模型"
+        format!("image={}", meta.image_path)
     };
     format!(
-        "截图成功\nframe_id: {}\nimage: {}\nimage_size_px: {}x{}\ntarget: {}\noutput: {}\nlogical_rect: {},{} {}x{}\nclickable: {}\n坐标规则: click/move/drag 直接使用这张截图里的像素坐标，并携带 frame_id；工具会处理分数缩放和多屏偏移。\n{}\n{}{}{}",
+        "frame_id={} size={}x{} target={} output={} rect={},{} {}x{} clickable={} {}\n坐标=本图像素；后续动作携带 frame_id\n{}{}{}",
         meta.frame_id,
-        meta.image_path,
         meta.pixel_width,
         meta.pixel_height,
         meta.target,
@@ -686,20 +979,24 @@ fn frame_result(meta: &FrameMeta, vision_available: bool) -> String {
 }
 
 fn checked_frame(cfg: &Config, session: &str, args: &Value) -> Result<FrameMeta, String> {
-    let meta = load_latest_meta(cfg, session)?;
-    if let Some(requested) = args.get("frame_id").and_then(Value::as_str) {
-        if requested != meta.frame_id {
-            return Err(format!(
-                "frame_id 已过期：请求 {requested}，最新是 {}。请依据最新截图重新定位",
-                meta.frame_id
-            ));
-        }
+    let latest = load_latest_meta(cfg, session)?;
+    let meta = match args.get("frame_id").and_then(Value::as_str) {
+        Some(requested) if requested != latest.frame_id => load_frame_meta(cfg, session, requested)
+            .map_err(|_| format!("找不到 frame_id {requested}；请重新 observe"))?,
+        _ => latest,
+    };
+    let generation = current_ui_generation(cfg, session);
+    if meta.generation != generation {
+        return Err(format!(
+            "frame_id {} 已过期（画面代次 {}，当前 {}）；请依据最新截图重新定位",
+            meta.frame_id, meta.generation, generation
+        ));
     }
     if !meta.clickable {
         return Err("这张窗口直截图没有可靠桌面原点，禁止猜坐标点击；请 observe target=focused_output 后再点击".into());
     }
     if !Path::new(&meta.image_path).exists() {
-        return Err("最新截图文件已不存在，请重新 observe".into());
+        return Err("截图文件已不存在，请重新 observe".into());
     }
     Ok(meta)
 }
@@ -856,10 +1153,61 @@ fn platform_press_key(keys: &str, cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
+fn validate_web_url(url: &str) -> Result<(), String> {
+    if url.len() > 4096
+        || url
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_whitespace())
+        || !(url.starts_with("https://") || url.starts_with("http://"))
+    {
+        return Err("url 必须是长度不超过 4096 的 http:// 或 https:// 地址，且不能含空白".into());
+    }
+    Ok(())
+}
+
+fn platform_open_url(url: &str, cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        install_desktop_env(cancel);
+        if !command_exists("xdg-open") {
+            return Err("缺少 xdg-open，无法打开网址".into());
+        }
+        return command_success(
+            "xdg-open",
+            run_bounded("xdg-open", &[url], Duration::from_secs(5), cancel, false)?,
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return command_success(
+            "open",
+            run_bounded("open", &[url], Duration::from_secs(5), cancel, false)?,
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return command_success(
+            "rundll32",
+            run_bounded(
+                "rundll32.exe",
+                &["url.dll,FileProtocolHandler", url],
+                Duration::from_secs(5),
+                cancel,
+                false,
+            )?,
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (url, cancel);
+        Err("当前操作系统不受支持".into())
+    }
+}
+
 fn platform_list_outputs(cancel: &AtomicBool) -> Result<String, String> {
     let _ = cancel;
     #[cfg(target_os = "linux")]
-    return niri_query("outputs", cancel);
+    return summarize_niri_outputs(&niri_query("outputs", cancel)?);
     #[cfg(target_os = "macos")]
     return macos::list_outputs();
     #[cfg(target_os = "windows")]
@@ -873,7 +1221,7 @@ fn platform_list_outputs(cancel: &AtomicBool) -> Result<String, String> {
 
 fn platform_list_windows(cancel: &AtomicBool) -> Result<String, String> {
     #[cfg(target_os = "linux")]
-    return niri_query("windows", cancel);
+    return summarize_niri_windows(&niri_query("windows", cancel)?);
     #[cfg(target_os = "macos")]
     return macos::list_windows(cancel);
     #[cfg(target_os = "windows")]
@@ -887,7 +1235,19 @@ fn platform_list_windows(cancel: &AtomicBool) -> Result<String, String> {
 
 fn platform_focus_window(id: u64, cancel: &AtomicBool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
-    return run_niri_action(&["focus-window", "--id", &id.to_string()], cancel);
+    {
+        run_niri_action(&["focus-window", "--id", &id.to_string()], cancel)?;
+        cancellable_sleep(Duration::from_millis(60), cancel)?;
+        let raw = niri_query("focused-window", cancel)?;
+        let focused: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("解析 Niri focused-window 失败: {e}"))?;
+        let actual = focused.get("id").and_then(Value::as_u64);
+        return match actual {
+            Some(actual) if actual == id => Ok(()),
+            Some(actual) => Err(format!("Niri 未聚焦窗口 {id}，当前仍是 {actual}")),
+            None => Err(format!("Niri 没有找到或无法聚焦窗口 {id}")),
+        };
+    }
     #[cfg(target_os = "macos")]
     return macos::focus_window(id, cancel);
     #[cfg(target_os = "windows")]
@@ -985,7 +1345,6 @@ fn run_niri_action(args: &[&str], cancel: &AtomicBool) -> Result<(), String> {
     command_success("niri", out)
 }
 
-#[cfg(target_os = "linux")]
 fn command_success(name: &str, output: ProcessOutput) -> Result<(), String> {
     if output.code == 0 {
         Ok(())
@@ -1125,6 +1484,71 @@ fn niri_outputs(cancel: &AtomicBool) -> Result<BTreeMap<String, Rect>, String> {
     Ok(outputs)
 }
 
+fn summarize_niri_outputs(raw: &str) -> Result<String, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("解析 Niri outputs 失败: {e}"))?;
+    let mut concise = Vec::new();
+    for (name, output) in value.as_object().into_iter().flatten() {
+        let current_mode = output
+            .get("current_mode")
+            .and_then(Value::as_u64)
+            .and_then(|index| output.get("modes")?.get(index as usize))
+            .map(|mode| {
+                json!({
+                    "width": mode.get("width"),
+                    "height": mode.get("height"),
+                    "refresh_hz": mode.get("refresh_rate").and_then(Value::as_f64).map(|v| v / 1000.0)
+                })
+            });
+        let logical = output.get("logical").map(|logical| {
+            json!({
+                "x": logical.get("x"),
+                "y": logical.get("y"),
+                "width": logical.get("width"),
+                "height": logical.get("height"),
+                "scale": logical.get("scale")
+            })
+        });
+        concise.push(json!({
+            "name": name,
+            "make": output.get("make"),
+            "model": output.get("model"),
+            "physical_size_mm": output.get("physical_size"),
+            "current_mode": current_mode,
+            "logical": logical
+        }));
+    }
+    serde_json::to_string(&concise).map_err(|e| e.to_string())
+}
+
+fn summarize_niri_windows(raw: &str) -> Result<String, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("解析 Niri windows 失败: {e}"))?;
+    let mut concise: Vec<Value> = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|window| {
+            json!({
+                "window_id": window.get("id"),
+                "title": window.get("title"),
+                "app_id": window.get("app_id"),
+                "pid": window.get("pid"),
+                "workspace_id": window.get("workspace_id"),
+                "focused": window.get("is_focused").and_then(Value::as_bool).unwrap_or(false),
+                "floating": window.get("is_floating").and_then(Value::as_bool).unwrap_or(false)
+            })
+        })
+        .collect();
+    concise.sort_by_key(|window| {
+        !window
+            .get("focused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    serde_json::to_string(&concise).map_err(|e| e.to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn niri_focused_output(cancel: &AtomicBool) -> Result<Option<(String, Rect)>, String> {
     if !command_exists("niri") || std::env::var_os("NIRI_SOCKET").is_none() {
@@ -1235,12 +1659,22 @@ fn latest_meta_path(cfg: &Config, session: &str) -> PathBuf {
     frame_dir(cfg, session).join("latest.json")
 }
 
+fn frame_meta_path(cfg: &Config, session: &str, frame_id: &str) -> PathBuf {
+    frame_dir(cfg, session).join(format!("{frame_id}.json"))
+}
+
+fn generation_path(cfg: &Config, session: &str) -> PathBuf {
+    frame_dir(cfg, session).join("ui-generation")
+}
+
 fn save_latest_meta(cfg: &Config, session: &str, meta: &FrameMeta) -> Result<(), String> {
     let path = latest_meta_path(cfg, session);
     let temp = path.with_extension("json.tmp");
     let data = serde_json::to_vec_pretty(meta).map_err(|e| format!("序列化截图坐标失败: {e}"))?;
-    fs::write(&temp, data).map_err(|e| format!("保存截图坐标失败: {e}"))?;
-    fs::rename(&temp, &path).map_err(|e| format!("替换截图坐标失败: {e}"))
+    fs::write(&temp, &data).map_err(|e| format!("保存截图坐标失败: {e}"))?;
+    fs::rename(&temp, &path).map_err(|e| format!("替换截图坐标失败: {e}"))?;
+    fs::write(frame_meta_path(cfg, session, &meta.frame_id), data)
+        .map_err(|e| format!("保存 frame_id 索引失败: {e}"))
 }
 
 fn load_latest_meta(cfg: &Config, session: &str) -> Result<FrameMeta, String> {
@@ -1248,6 +1682,37 @@ fn load_latest_meta(cfg: &Config, session: &str) -> Result<FrameMeta, String> {
     let data = fs::read(&path)
         .map_err(|_| "还没有截图；先调用 computer_use action=observe".to_string())?;
     serde_json::from_slice(&data).map_err(|e| format!("截图坐标记录损坏: {e}"))
+}
+
+fn load_frame_meta(cfg: &Config, session: &str, frame_id: &str) -> Result<FrameMeta, String> {
+    if frame_id.is_empty()
+        || !frame_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("frame_id 格式错误".into());
+    }
+    let data = fs::read(frame_meta_path(cfg, session, frame_id))
+        .map_err(|_| "frame_id 不存在".to_string())?;
+    serde_json::from_slice(&data).map_err(|e| format!("frame_id 坐标记录损坏: {e}"))
+}
+
+fn current_ui_generation(cfg: &Config, session: &str) -> u64 {
+    fs::read_to_string(generation_path(cfg, session))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn advance_ui_generation(cfg: &Config, session: &str) -> Result<u64, String> {
+    let dir = frame_dir(cfg, session);
+    fs::create_dir_all(&dir).map_err(|e| format!("创建 Computer Use 状态目录失败: {e}"))?;
+    let next = current_ui_generation(cfg, session).saturating_add(1);
+    let path = generation_path(cfg, session);
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, next.to_string()).map_err(|e| format!("保存画面代次失败: {e}"))?;
+    fs::rename(&temp, &path).map_err(|e| format!("更新画面代次失败: {e}"))?;
+    Ok(next)
 }
 
 fn prune_old_frames(dir: &Path, keep: usize) {
@@ -1262,6 +1727,9 @@ fn prune_old_frames(dir: &Path, keep: usize) {
     images.sort();
     let remove_count = images.len().saturating_sub(keep);
     for path in images.into_iter().take(remove_count) {
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            let _ = fs::remove_file(path.with_file_name(format!("{stem}.json")));
+        }
         let _ = fs::remove_file(path);
     }
 }
@@ -1566,6 +2034,7 @@ mod tests {
             layout_height: 1440.0,
             clickable: true,
             captured_unix_ms: 0,
+            generation: 0,
         };
         let mapped = map_frame_point(&meta, 0.0, 0.0).unwrap();
         assert!((mapped.0 - 2560.5).abs() < 0.001);
@@ -1618,12 +2087,137 @@ mod tests {
     }
 
     #[test]
+    fn weak_model_aliases_are_normalized_without_retry() {
+        let region = normalize_computer_args(&json!({
+            "action":"screenshot", "target":"region",
+            "x":"10", "y":20, "width":"300", "height":200
+        }))
+        .unwrap();
+        assert_eq!(region["action"], "observe");
+        assert_eq!(region["region"], "10,20 300x200");
+
+        let drag = normalize_computer_args(&json!({
+            "action":"drag", "x":"1", "y":"2", "to_x":"30", "to_y":40
+        }))
+        .unwrap();
+        assert_eq!(drag["from_x"], 1.0);
+        assert_eq!(drag["from_y"], 2.0);
+        assert_eq!(drag["to_x"], 30.0);
+
+        let scroll = normalize_computer_args(&json!({"action":"scroll", "delta_y":-600})).unwrap();
+        assert_eq!(scroll["steps"], -6);
+
+        let click = normalize_computer_args(&json!({"action":"click_element", "id":"5"})).unwrap();
+        assert_eq!(click["action"], "click");
+        assert_eq!(click["window_id"], 5);
+    }
+
+    #[test]
+    fn batch_compacts_model_generated_mouse_tracks_and_waits() {
+        let mut actions = Vec::new();
+        for x in 0..51 {
+            actions.push(json!({"action":"move", "x":x, "y":10}));
+        }
+        actions.push(json!({"action":"wait", "ms":400}));
+        actions.push(json!({"action":"wait", "ms":700}));
+        actions.push(json!({"action":"observe"}));
+        let compacted = compact_batch_actions(&actions);
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0]["x"], 50);
+        assert_eq!(compacted[1]["ms"], 1100);
+        assert_eq!(summarize_action_names(&vec!["move".into(); 50]), "move×50");
+    }
+
+    #[test]
+    fn observe_does_not_expire_another_frame_but_ui_change_does() {
+        let root = std::env::temp_dir().join(format!("yjlcoder_generation_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.clone());
+        fs::create_dir_all(frame_dir(&cfg, "generation-test")).unwrap();
+        let image = frame_dir(&cfg, "generation-test").join("f-old.png");
+        fs::write(&image, b"test").unwrap();
+        let meta = FrameMeta {
+            frame_id: "f-old".into(),
+            image_path: image.to_string_lossy().into_owned(),
+            target: "output".into(),
+            output: Some("screen".into()),
+            pixel_width: 100,
+            pixel_height: 100,
+            logical_x: 0.0,
+            logical_y: 0.0,
+            logical_width: 100.0,
+            logical_height: 100.0,
+            layout_min_x: 0.0,
+            layout_min_y: 0.0,
+            layout_width: 100.0,
+            layout_height: 100.0,
+            clickable: true,
+            captured_unix_ms: 0,
+            generation: 0,
+        };
+        save_latest_meta(&cfg, "generation-test", &meta).unwrap();
+        let newer = FrameMeta {
+            frame_id: "f-region".into(),
+            target: "region".into(),
+            ..meta.clone()
+        };
+        save_latest_meta(&cfg, "generation-test", &newer).unwrap();
+        assert!(checked_frame(&cfg, "generation-test", &json!({"frame_id":"f-old"})).is_ok());
+        advance_ui_generation(&cfg, "generation-test").unwrap();
+        assert!(checked_frame(&cfg, "generation-test", &json!({"frame_id":"f-old"})).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn screenshot_result_is_concise_when_image_is_attached() {
+        let meta = FrameMeta {
+            frame_id: "f1".into(),
+            image_path: "/a/very/long/private/path.png".into(),
+            target: "output".into(),
+            output: Some("eDP-1".into()),
+            pixel_width: 100,
+            pixel_height: 80,
+            logical_x: 0.0,
+            logical_y: 0.0,
+            logical_width: 100.0,
+            logical_height: 80.0,
+            layout_min_x: 0.0,
+            layout_min_y: 0.0,
+            layout_width: 100.0,
+            layout_height: 80.0,
+            clickable: true,
+            captured_unix_ms: 0,
+            generation: 0,
+        };
+        let result = frame_result(&meta, true);
+        let (clean, image) = split_image_marker(&result);
+        assert!(clean.len() < 220, "{clean}");
+        assert!(!clean.contains("private/path"));
+        assert_eq!(image.as_deref(), Some("/a/very/long/private/path.png"));
+    }
+
+    #[test]
+    fn niri_queries_drop_large_layout_and_mode_histories() {
+        let outputs = r#"{"eDP-1":{"make":"Tianma","model":"Panel","physical_size":[290,180],"modes":[{"width":2560,"height":1600,"refresh_rate":180000},{"width":640,"height":480,"refresh_rate":60000}],"current_mode":0,"logical":{"x":0,"y":0,"width":1462,"height":914,"scale":1.75}}}"#;
+        let concise = summarize_niri_outputs(outputs).unwrap();
+        assert!(concise.contains("180.0"));
+        assert!(!concise.contains("640"));
+
+        let windows = r#"[{"id":5,"title":"Firefox","app_id":"firefox","pid":12,"workspace_id":1,"is_focused":true,"is_floating":false,"layout":{"tile_size":[700,800]},"focus_timestamp":{"secs":999}}]"#;
+        let concise = summarize_niri_windows(windows).unwrap();
+        assert!(concise.contains("\"window_id\":5"));
+        assert!(!concise.contains("tile_size"));
+        assert!(!concise.contains("focus_timestamp"));
+    }
+
+    #[test]
     fn batch_rejects_empty_and_read_only_queries_before_touching_desktop() {
         let cfg = Config::default();
         let cancel = AtomicBool::new(false);
         let empty =
             execute(&cfg, "batch-test", &json!({"actions":[]}), &cancel, false).unwrap_err();
-        assert!(empty.contains("1..=50"));
+        assert!(empty.contains("1..=200"));
         let query = execute(
             &cfg,
             "batch-test",

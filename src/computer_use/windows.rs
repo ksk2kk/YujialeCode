@@ -207,6 +207,7 @@ pub(super) fn capture(
         layout_height: bounds.height,
         clickable: true,
         captured_unix_ms: unix_ms(),
+        generation: current_ui_generation(cfg, session),
     };
     save_latest_meta(cfg, session, &meta)?;
     prune_old_frames(&dir, 8);

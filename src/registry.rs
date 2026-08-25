@@ -125,8 +125,8 @@ pub const CATEGORIES: &[Category] = &[
         tools: &[
             ToolDef {
                 name: "computer_use",
-                desc: "Linux Wayland、macOS、Windows 原生观察与操作；自动处理 Retina/DPI、多屏偏移、过期 frame，动作后回传完整新截图。可用 actions 数组顺序执行最多 50 项并只截图一次，适合本地模型稳定完成连续操作",
-                args: "{\"action\":\"capabilities|observe|list_outputs|list_windows|focus_window|click|double_click|move|drag|scroll|type_text|press_key|wait\",\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"x\":123,\"y\":456,\"text\":\"...\",\"keys\":\"CTRL+L\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20},{\"type\":\"type_text\",\"text\":\"hello\"}]}",
+                desc: "Linux Wayland、macOS、Windows 原生观察与操作；自动兼容常见 CUA 参数别名、Retina/DPI、多屏偏移和过期 frame。actions 批量只截图一次并自动压缩重复移动，降低本地模型调用成本",
+                args: "{\"action\":\"observe|list_outputs|list_windows|focus_window|open_url|click|double_click|move|drag|scroll|type_text|press_key|wait\",\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"window_id\":5,\"x\":123,\"y\":456,\"from_x\":10,\"from_y\":20,\"to_x\":30,\"to_y\":40,\"steps\":3,\"text\":\"...\",\"keys\":\"CTRL+L\",\"url\":\"https://...\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20}]}",
             },
         ],
     },
