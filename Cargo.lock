@@ -2052,6 +2052,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "base64",
+ "image",
  "libc",
  "reqwest",
  "serde",
@@ -2062,6 +2063,7 @@ dependencies = [
  "ureq",
  "wayland-client",
  "wayland-protocols-wlr",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

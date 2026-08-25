@@ -18,6 +18,8 @@
 
 - 短系统提示词：native 模式不复述函数 schema，只说明角色、工具入口与停止条件；text 模式只补充工具格式和一个 Read 示例。详细参数由 `list_tools` 按需返回。
 - 双协议工具调用：text 模式解析 ```` ```tool {...} ```` 代码块；native 模式直接注册 `readline`、`execute_command`、`list_tools`、`ask_user` 四个核心入口，其余工具动态发现。
+- 跨平台 Computer Use：Linux Wayland、macOS 和 Windows 都有原生截图、窗口枚举、鼠标、键盘与滚动后端；自动处理 Retina/DPI、多显示器偏移和过期截图。连续动作可一次提交、顺序执行，最后只送一张最新完整截图给本地视觉模型。
+- 主动推进目标：`/FuckMaster` 可创建定时跟进；Agent 忙碌时提醒进入等待队列，空闲后再通过 TUI/QQ 主动询问进度。QQ 输出在代码层统一转成无 Markdown、无 emoji 的纯文本。
 - 脚本不再像“黑盒”：命令先显示，运行时原位刷新最近输出、耗时、行数和体积；Esc 或超时会清理整棵进程树，脚本也不会和输入框抢键盘。
 - 弱模型兼容路由：工具名、参数名、嵌套层级、字符串 JSON、字符串数字/布尔/数组写错时自动纠正；工具选错但参数意图明确时强制改道。
 - 聚合网络研究：`web_search` 并发聚合 DuckDuckGo、Bing 和已配置的 Brave/SearXNG，自动规范 URL、跨源去重、质量排序和域名过滤；`web_research` 一次调用自动做互补查询并抓取精选正文。

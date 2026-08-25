@@ -121,12 +121,12 @@ pub const CATEGORIES: &[Category] = &[
     },
     Category {
         id: "computer",
-        title: "Linux Wayland 电脑操作（截图后使用 frame_id 和图中像素坐标）",
+        title: "跨平台电脑操作（Linux Wayland / macOS / Windows）",
         tools: &[
             ToolDef {
                 name: "computer_use",
-                desc: "Wayland 原生观察和操作：自动探测 Niri/输出布局，grim 以逻辑缩放截图，虚拟指针精确点击，wtype 输入；每次动作后自动返回新截图，所有子进程有硬超时",
-                args: "{\"action\":\"capabilities|observe|list_outputs|list_windows|focus_window|click|double_click|move|drag|scroll|type_text|press_key|wait\",\"target\":\"focused_output|output|all|region\",\"frame_id\":\"f...\",\"x\":123,\"y\":456,\"text\":\"...\",\"keys\":\"CTRL+L\"}",
+                desc: "Linux Wayland、macOS、Windows 原生观察与操作；自动处理 Retina/DPI、多屏偏移、过期 frame，动作后回传完整新截图。可用 actions 数组顺序执行最多 50 项并只截图一次，适合本地模型稳定完成连续操作",
+                args: "{\"action\":\"capabilities|observe|list_outputs|list_windows|focus_window|click|double_click|move|drag|scroll|type_text|press_key|wait\",\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"x\":123,\"y\":456,\"text\":\"...\",\"keys\":\"CTRL+L\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20},{\"type\":\"type_text\",\"text\":\"hello\"}]}",
             },
         ],
     },

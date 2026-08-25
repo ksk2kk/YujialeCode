@@ -14,9 +14,18 @@ use crate::config::Config;
 const IMAGE_MARKER_PREFIX: &str = "[[YJLCODER_IMAGE:";
 const IMAGE_MARKER_SUFFIX: &str = "]]";
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(target_os = "linux")]
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CAPTURE_BYTES: u64 = 24 * 1024 * 1024;
+const INTER_ACTION_DELAY: Duration = Duration::from_millis(120);
+const BATCH_EXECUTION_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_ACTIONS_PER_BATCH: usize = 50;
 static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FrameMeta {
@@ -59,6 +68,7 @@ impl Rect {
 
 #[derive(Debug)]
 struct ProcessOutput {
+    #[allow(dead_code)]
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     code: i32,
@@ -71,6 +81,21 @@ pub fn execute(
     cancel: &AtomicBool,
     vision_available: bool,
 ) -> Result<String, String> {
+    if args.get("actions").is_some() {
+        return execute_batch(cfg, session, args, cancel, vision_available);
+    }
+    execute_single(cfg, session, args, cancel, vision_available, true, None)
+}
+
+fn execute_single(
+    cfg: &Config,
+    session: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+    vision_available: bool,
+    capture_after: bool,
+    batch_frame: Option<&FrameMeta>,
+) -> Result<String, String> {
     let action = args
         .get("action")
         .and_then(Value::as_str)
@@ -81,32 +106,37 @@ pub fn execute(
     match action.as_str() {
         "capabilities" | "status" => capabilities(vision_available, cancel),
         "observe" | "screenshot" => capture(cfg, session, args, cancel, vision_available),
-        "list_outputs" | "outputs" => niri_query("outputs", cancel),
-        "list_windows" | "windows" => niri_query("windows", cancel),
+        "list_outputs" | "outputs" => platform_list_outputs(cancel),
+        "list_windows" | "windows" => platform_list_windows(cancel),
         "focus_window" | "focus" => {
             let id = required_u64(args, "window_id")?;
-            run_niri_action(&["focus-window", "--id", &id.to_string()], cancel)?;
-            std::thread::sleep(Duration::from_millis(120));
-            capture(cfg, session, &json!({"target":"focused_output"}), cancel, vision_available)
+            platform_focus_window(id, cancel)?;
+            action_result_or_capture(capture_after, "已聚焦窗口", || {
+                capture(cfg, session, &json!({"target":"focused_output"}), cancel, vision_available)
+            })
         }
         "click" | "double_click" | "double-click" => {
-            let meta = checked_frame(cfg, session, args)?;
+            let meta = frame_for_action(cfg, session, args, batch_frame)?;
             let (x, y) = required_point(args)?;
             let (desktop_x, desktop_y) = map_frame_point(&meta, x, y)?;
             let button = pointer_button(args.get("button").and_then(Value::as_str).unwrap_or("left"))?;
             let count = if action.starts_with("double") { 2 } else { 1 };
             pointer_click(&meta, desktop_x, desktop_y, button, count, cancel)?;
-            recapture(cfg, session, &meta, cancel, vision_available)
+            action_result_or_capture(capture_after, "点击完成", || {
+                recapture(cfg, session, &meta, cancel, vision_available)
+            })
         }
         "move" | "move_pointer" | "move-pointer" => {
-            let meta = checked_frame(cfg, session, args)?;
+            let meta = frame_for_action(cfg, session, args, batch_frame)?;
             let (x, y) = required_point(args)?;
             let (desktop_x, desktop_y) = map_frame_point(&meta, x, y)?;
             pointer_move(&meta, desktop_x, desktop_y, cancel)?;
-            recapture(cfg, session, &meta, cancel, vision_available)
+            action_result_or_capture(capture_after, "移动完成", || {
+                recapture(cfg, session, &meta, cancel, vision_available)
+            })
         }
         "drag" => {
-            let meta = checked_frame(cfg, session, args)?;
+            let meta = frame_for_action(cfg, session, args, batch_frame)?;
             let from_x = required_f64(args, "from_x")?;
             let from_y = required_f64(args, "from_y")?;
             let to_x = required_f64(args, "to_x")?;
@@ -115,10 +145,12 @@ pub fn execute(
             let to = map_frame_point(&meta, to_x, to_y)?;
             let button = pointer_button(args.get("button").and_then(Value::as_str).unwrap_or("left"))?;
             pointer_drag(&meta, from, to, button, cancel)?;
-            recapture(cfg, session, &meta, cancel, vision_available)
+            action_result_or_capture(capture_after, "拖拽完成", || {
+                recapture(cfg, session, &meta, cancel, vision_available)
+            })
         }
         "scroll" => {
-            let meta = checked_frame(cfg, session, args)?;
+            let meta = frame_for_action(cfg, session, args, batch_frame)?;
             let steps = args.get("steps").and_then(Value::as_i64).unwrap_or(3).clamp(-50, 50) as i32;
             if steps == 0 {
                 return Err("steps 不能为 0；正数向下，负数向上".into());
@@ -129,7 +161,9 @@ pub fn execute(
                 _ => return Err("scroll 的 x 和 y 必须同时提供".into()),
             };
             pointer_scroll(&meta, point, steps, cancel)?;
-            recapture(cfg, session, &meta, cancel, vision_available)
+            action_result_or_capture(capture_after, "滚动完成", || {
+                recapture(cfg, session, &meta, cancel, vision_available)
+            })
         }
         "type" | "type_text" | "type-text" => {
             let text = args
@@ -139,8 +173,10 @@ pub fn execute(
             if text.len() > 20_000 {
                 return Err("单次输入最多 20000 字节".into());
             }
-            wtype_text(text, cancel)?;
-            recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            platform_type_text(text, cancel)?;
+            action_result_or_capture(capture_after, "文字输入完成", || {
+                recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            })
         }
         "key" | "press_key" | "press-key" => {
             let keys = args
@@ -148,17 +184,177 @@ pub fn execute(
                 .or_else(|| args.get("key"))
                 .and_then(Value::as_str)
                 .ok_or("press_key 缺少 keys，例如 CTRL+L 或 Return")?;
-            wtype_key(keys, cancel)?;
-            recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            platform_press_key(keys, cancel)?;
+            action_result_or_capture(capture_after, "按键完成", || {
+                recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            })
         }
         "wait" => {
             let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(500).min(10_000);
             cancellable_sleep(Duration::from_millis(ms), cancel)?;
-            recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            action_result_or_capture(capture_after, "等待完成", || {
+                recapture_latest_or_focused(cfg, session, cancel, vision_available)
+            })
         }
         _ => Err(format!(
-            "未知 computer_use action: {action}。可用：capabilities, observe, list_outputs, list_windows, focus_window, click, double_click, move, drag, scroll, type_text, press_key, wait"
+            "未知 computer_use action: {action}。可用：capabilities, observe, list_outputs, list_windows, focus_window, click, double_click, move, drag, scroll, type_text, press_key, wait；也可传 actions 数组批量执行"
         )),
+    }
+}
+
+/// OpenAI CUA 的成熟执行模型：同一张画面上规划的一组动作必须顺序执行，
+/// 中间不生成新 frame_id，最后只回传一次完整新画面。这样既节省视觉 token，
+/// 也不会让批次中的第二个动作被我们自己的“旧截图保护”误伤。
+fn execute_batch(
+    cfg: &Config,
+    session: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+    vision_available: bool,
+) -> Result<String, String> {
+    let actions = args
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or("actions 必须是 JSON 数组")?;
+    if actions.is_empty() || actions.len() > MAX_ACTIONS_PER_BATCH {
+        return Err(format!(
+            "actions 数量必须在 1..={MAX_ACTIONS_PER_BATCH} 之间"
+        ));
+    }
+    let needs_frame = actions.iter().any(action_uses_frame);
+    let batch_frame = if needs_frame {
+        Some(checked_frame(cfg, session, args)?)
+    } else {
+        load_latest_meta(cfg, session).ok()
+    };
+
+    let started = std::time::Instant::now();
+    let mut names = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(format!("批量动作在第 {} 项前被 Esc 取消", index + 1));
+        }
+        if started.elapsed() >= BATCH_EXECUTION_TIMEOUT {
+            return Err(format!(
+                "批量动作超过 {} 秒，在第 {} 项前终止；请拆成更小批次",
+                BATCH_EXECUTION_TIMEOUT.as_secs(),
+                index + 1
+            ));
+        }
+        let object = action
+            .as_object()
+            .ok_or_else(|| format!("actions[{}] 必须是对象", index))?;
+        if object.contains_key("actions") {
+            return Err("禁止嵌套 actions 批次".into());
+        }
+        let name = action
+            .get("action")
+            .or_else(|| action.get("type"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("actions[{}] 缺少 action/type", index))?;
+        let normalized_name = name.trim().to_ascii_lowercase();
+        if matches!(normalized_name.as_str(), "screenshot" | "observe") {
+            // OpenAI 协议允许显式 screenshot 动作；我们的批次结尾必定生成一张完整新图，
+            // 因此这里合并掉重复截图，避免白白消耗本地视觉模型上下文。
+            names.push("screenshot(final)".into());
+            continue;
+        }
+        if matches!(
+            normalized_name.as_str(),
+            "capabilities" | "status" | "list_outputs" | "outputs" | "list_windows" | "windows"
+        ) {
+            return Err(format!("批量动作中不能混入只读查询 {name}；请单独调用"));
+        }
+        let mut normalized = action.clone();
+        if normalized.get("action").is_none() {
+            normalized["action"] = Value::String(name.to_string());
+        }
+        execute_single(
+            cfg,
+            session,
+            &normalized,
+            cancel,
+            vision_available,
+            false,
+            batch_frame.as_ref(),
+        )
+        .map_err(|e| format!("批量动作第 {} 项 {name} 失败: {e}", index + 1))?;
+        names.push(name.to_string());
+        if index + 1 < actions.len() && normalized_name != "wait" {
+            cancellable_sleep(INTER_ACTION_DELAY, cancel)?;
+        }
+    }
+    let result = match batch_frame.as_ref() {
+        Some(meta) if meta.clickable => recapture(cfg, session, meta, cancel, vision_available),
+        _ => capture(
+            cfg,
+            session,
+            &json!({"target":"focused_output"}),
+            cancel,
+            vision_available,
+        ),
+    }?;
+    Ok(format!(
+        "批量动作成功: {}（{} 项，{}ms）\n{}",
+        names.join(" -> "),
+        names.len(),
+        started.elapsed().as_millis(),
+        result
+    ))
+}
+
+fn action_uses_frame(action: &Value) -> bool {
+    matches!(
+        action
+            .get("action")
+            .or_else(|| action.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "click"
+            | "double_click"
+            | "double-click"
+            | "move"
+            | "move_pointer"
+            | "move-pointer"
+            | "drag"
+            | "scroll"
+    )
+}
+
+fn frame_for_action(
+    cfg: &Config,
+    session: &str,
+    args: &Value,
+    batch_frame: Option<&FrameMeta>,
+) -> Result<FrameMeta, String> {
+    if let Some(meta) = batch_frame {
+        if let Some(requested) = args.get("frame_id").and_then(Value::as_str) {
+            if requested != meta.frame_id {
+                return Err(format!(
+                    "动作引用 frame_id {requested}，批次画面是 {}",
+                    meta.frame_id
+                ));
+            }
+        }
+        return Ok(meta.clone());
+    }
+    checked_frame(cfg, session, args)
+}
+
+fn action_result_or_capture<F>(
+    capture_after: bool,
+    message: &str,
+    capture: F,
+) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    if capture_after {
+        capture()
+    } else {
+        Ok(message.to_string())
     }
 }
 
@@ -188,7 +384,13 @@ pub fn image_data_url(path: &str) -> Result<String, String> {
         return Err(format!("截图大小异常: {} bytes", meta.len()));
     }
     let bytes = fs::read(path).map_err(|e| format!("读取截图失败: {e}"))?;
-    let mime = match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    let mime = match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         _ => "image/png",
@@ -200,15 +402,22 @@ pub fn image_data_url(path: &str) -> Result<String, String> {
 }
 
 fn capabilities(vision_available: bool, cancel: &AtomicBool) -> Result<String, String> {
-    #[cfg(not(target_os = "linux"))]
+    let _ = cancel;
+    #[cfg(target_os = "macos")]
+    {
+        return macos::capabilities(vision_available);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows::capabilities(vision_available);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = cancel;
-        return Ok(json!({
-            "available": false,
-            "reason": "computer_use 当前仅实现 Linux Wayland 后端",
-            "vision": vision_available,
-        })
-        .to_string());
+        return Ok(
+            json!({"available":false,"reason":"当前操作系统不受支持","vision":vision_available})
+                .to_string(),
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -252,10 +461,18 @@ fn capture(
     cancel: &AtomicBool,
     vision_available: bool,
 ) -> Result<String, String> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        return macos::capture(cfg, session, args, cancel, vision_available);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows::capture(cfg, session, args, cancel, vision_available);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (cfg, session, args, cancel, vision_available);
-        return Err("computer_use 当前仅支持 Linux Wayland".into());
+        return Err("当前操作系统不受支持".into());
     }
 
     #[cfg(target_os = "linux")]
@@ -287,7 +504,12 @@ fn capture(
             height: 1.0,
         });
 
-        let mut grim_args = vec!["-s".to_string(), "1".to_string(), "-l".to_string(), "1".to_string()];
+        let mut grim_args = vec![
+            "-s".to_string(),
+            "1".to_string(),
+            "-l".to_string(),
+            "1".to_string(),
+        ];
         let (target, output, logical, clickable) = match requested.as_str() {
             "focused" | "focused_output" | "focused-output" => {
                 if let Some((name, rect)) = niri_focused_output(cancel)? {
@@ -330,7 +552,12 @@ fn capture(
                 (
                     "foreign_toplevel".to_string(),
                     None,
-                    Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+                    Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 1.0,
+                    },
                     false,
                 )
             }
@@ -422,7 +649,13 @@ fn recapture_latest_or_focused(
 ) -> Result<String, String> {
     match load_latest_meta(cfg, session) {
         Ok(meta) if meta.clickable => recapture(cfg, session, &meta, cancel, vision_available),
-        _ => capture(cfg, session, &json!({"target":"focused_output"}), cancel, vision_available),
+        _ => capture(
+            cfg,
+            session,
+            &json!({"target":"focused_output"}),
+            cancel,
+            vision_available,
+        ),
     }
 }
 
@@ -487,6 +720,7 @@ fn map_frame_point(meta: &FrameMeta, x: f64, y: f64) -> Result<(f64, f64), Strin
 }
 
 fn pointer_move(meta: &FrameMeta, x: f64, y: f64, cancel: &AtomicBool) -> Result<(), String> {
+    let _ = meta;
     if cancel.load(Ordering::Relaxed) {
         return Err("已取消".into());
     }
@@ -495,10 +729,18 @@ fn pointer_move(meta: &FrameMeta, x: f64, y: f64, cancel: &AtomicBool) -> Result
         install_desktop_env(cancel);
         linux_pointer::move_absolute(meta, x, y)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::pointer_move(x, y)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::pointer_move(meta, x, y)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (meta, x, y);
-        Err("虚拟指针仅支持 Linux Wayland".into())
+        Err("当前操作系统不受支持".into())
     }
 }
 
@@ -510,15 +752,24 @@ fn pointer_click(
     count: usize,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let _ = meta;
     #[cfg(target_os = "linux")]
     {
         install_desktop_env(cancel);
         linux_pointer::click(meta, x, y, button, count, cancel)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::pointer_click(x, y, button, count, cancel)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::pointer_click(meta, x, y, button, count, cancel)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (meta, x, y, button, count, cancel);
-        Err("虚拟指针仅支持 Linux Wayland".into())
+        Err("当前操作系统不受支持".into())
     }
 }
 
@@ -529,15 +780,24 @@ fn pointer_drag(
     button: u32,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let _ = meta;
     #[cfg(target_os = "linux")]
     {
         install_desktop_env(cancel);
         linux_pointer::drag(meta, from, to, button, cancel)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::pointer_drag(from, to, button, cancel)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::pointer_drag(meta, from, to, button, cancel)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (meta, from, to, button, cancel);
-        Err("虚拟指针仅支持 Linux Wayland".into())
+        Err("当前操作系统不受支持".into())
     }
 }
 
@@ -552,13 +812,94 @@ fn pointer_scroll(
         install_desktop_env(cancel);
         linux_pointer::scroll(meta, point, steps, cancel)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = meta;
+        macos::pointer_scroll(point, steps, cancel)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::pointer_scroll(meta, point, steps, cancel)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (meta, point, steps, cancel);
-        Err("虚拟指针仅支持 Linux Wayland".into())
+        Err("当前操作系统不受支持".into())
     }
 }
 
+fn platform_type_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return wtype_text(text, cancel);
+    #[cfg(target_os = "macos")]
+    return macos::type_text(text, cancel);
+    #[cfg(target_os = "windows")]
+    return windows::type_text(text, cancel);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (text, cancel);
+        Err("当前操作系统不受支持".into())
+    }
+}
+
+fn platform_press_key(keys: &str, cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return wtype_key(keys, cancel);
+    #[cfg(target_os = "macos")]
+    return macos::press_key(keys, cancel);
+    #[cfg(target_os = "windows")]
+    return windows::press_key(keys, cancel);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (keys, cancel);
+        Err("当前操作系统不受支持".into())
+    }
+}
+
+fn platform_list_outputs(cancel: &AtomicBool) -> Result<String, String> {
+    let _ = cancel;
+    #[cfg(target_os = "linux")]
+    return niri_query("outputs", cancel);
+    #[cfg(target_os = "macos")]
+    return macos::list_outputs();
+    #[cfg(target_os = "windows")]
+    return windows::list_outputs();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = cancel;
+        Err("当前操作系统不受支持".into())
+    }
+}
+
+fn platform_list_windows(cancel: &AtomicBool) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    return niri_query("windows", cancel);
+    #[cfg(target_os = "macos")]
+    return macos::list_windows(cancel);
+    #[cfg(target_os = "windows")]
+    return windows::list_windows();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = cancel;
+        Err("当前操作系统不受支持".into())
+    }
+}
+
+fn platform_focus_window(id: u64, cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return run_niri_action(&["focus-window", "--id", &id.to_string()], cancel);
+    #[cfg(target_os = "macos")]
+    return macos::focus_window(id, cancel);
+    #[cfg(target_os = "windows")]
+    return windows::focus_window(id);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (id, cancel);
+        Err("当前操作系统不受支持".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn wtype_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
     install_desktop_env(cancel);
     if !command_exists("wtype") {
@@ -568,12 +909,17 @@ fn wtype_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
     command_success("wtype", out)
 }
 
+#[cfg(target_os = "linux")]
 fn wtype_key(keys: &str, cancel: &AtomicBool) -> Result<(), String> {
     install_desktop_env(cancel);
     if !command_exists("wtype") {
         return Err("缺少 wtype，无法发送 Wayland 键盘事件".into());
     }
-    let parts: Vec<&str> = keys.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = keys
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.is_empty() || parts.len() > 8 {
         return Err("keys 格式错误，例如 CTRL+L、ALT+F4 或 Return".into());
     }
@@ -594,6 +940,7 @@ fn wtype_key(keys: &str, cancel: &AtomicBool) -> Result<(), String> {
     command_success("wtype", out)
 }
 
+#[cfg(target_os = "linux")]
 fn normalize_modifier(value: &str) -> Result<&'static str, String> {
     match value.to_ascii_lowercase().as_str() {
         "ctrl" | "control" => Ok("ctrl"),
@@ -604,18 +951,29 @@ fn normalize_modifier(value: &str) -> Result<&'static str, String> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn niri_query(command: &str, cancel: &AtomicBool) -> Result<String, String> {
     install_desktop_env(cancel);
     if !command_exists("niri") || std::env::var_os("NIRI_SOCKET").is_none() {
         return Err("当前桌面没有可用的 Niri IPC".into());
     }
-    let out = run_bounded("niri", &["msg", "--json", command], INPUT_TIMEOUT, cancel, false)?;
+    let out = run_bounded(
+        "niri",
+        &["msg", "--json", command],
+        INPUT_TIMEOUT,
+        cancel,
+        false,
+    )?;
     if out.code != 0 {
-        return Err(format!("niri msg {command} 失败: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "niri msg {command} 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     String::from_utf8(out.stdout).map_err(|e| format!("Niri 返回非 UTF-8: {e}"))
 }
 
+#[cfg(target_os = "linux")]
 fn run_niri_action(args: &[&str], cancel: &AtomicBool) -> Result<(), String> {
     install_desktop_env(cancel);
     if !command_exists("niri") || std::env::var_os("NIRI_SOCKET").is_none() {
@@ -627,6 +985,7 @@ fn run_niri_action(args: &[&str], cancel: &AtomicBool) -> Result<(), String> {
     command_success("niri", out)
 }
 
+#[cfg(target_os = "linux")]
 fn command_success(name: &str, output: ProcessOutput) -> Result<(), String> {
     if output.code == 0 {
         Ok(())
@@ -650,7 +1009,11 @@ fn run_bounded(
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(if quiet_stdout { Stdio::null() } else { Stdio::piped() })
+        .stdout(if quiet_stdout {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("启动 {program} 失败: {e}"))?;
@@ -673,7 +1036,10 @@ fn run_bounded(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(format!("{program} 超过 {}ms，已终止；不会阻塞 Agent", timeout.as_millis()));
+            return Err(format!(
+                "{program} 超过 {}ms，已终止；不会阻塞 Agent",
+                timeout.as_millis()
+            ));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
@@ -686,7 +1052,11 @@ fn run_bounded(
     };
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
-    Ok(ProcessOutput { stdout, stderr, code })
+    Ok(ProcessOutput {
+        stdout,
+        stderr,
+        code,
+    })
 }
 
 fn read_pipe(pipe: Option<impl Read>) -> Vec<u8> {
@@ -697,6 +1067,7 @@ fn read_pipe(pipe: Option<impl Read>) -> Vec<u8> {
     data
 }
 
+#[cfg(target_os = "linux")]
 fn install_desktop_env(cancel: &AtomicBool) {
     let wanted = [
         "WAYLAND_DISPLAY",
@@ -738,9 +1109,11 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
 fn niri_outputs(cancel: &AtomicBool) -> Result<BTreeMap<String, Rect>, String> {
     let raw = niri_query("outputs", cancel)?;
-    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("解析 Niri outputs 失败: {e}"))?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 Niri outputs 失败: {e}"))?;
     let mut outputs = BTreeMap::new();
     if let Some(map) = value.as_object() {
         for (name, output) in map {
@@ -752,20 +1125,26 @@ fn niri_outputs(cancel: &AtomicBool) -> Result<BTreeMap<String, Rect>, String> {
     Ok(outputs)
 }
 
+#[cfg(target_os = "linux")]
 fn niri_focused_output(cancel: &AtomicBool) -> Result<Option<(String, Rect)>, String> {
     if !command_exists("niri") || std::env::var_os("NIRI_SOCKET").is_none() {
         return Ok(None);
     }
     let raw = niri_query("focused-output", cancel)?;
-    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("解析 Niri focused-output 失败: {e}"))?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 Niri focused-output 失败: {e}"))?;
     if value.is_null() {
         return Ok(None);
     }
-    let name = value.get("name").and_then(Value::as_str).ok_or("Niri focused-output 缺少 name")?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("Niri focused-output 缺少 name")?;
     let rect = json_logical_rect(&value).ok_or("Niri focused-output 缺少 logical 坐标")?;
     Ok(Some((name.to_string(), rect)))
 }
 
+#[cfg(target_os = "linux")]
 fn json_logical_rect(value: &Value) -> Option<Rect> {
     let logical = value.get("logical")?;
     Some(Rect {
@@ -805,7 +1184,9 @@ fn parse_geometry(value: &str) -> Result<Rect, String> {
         return Err("region 格式应为 x,y widthxheight".into());
     }
     let (x, y) = origin.split_once(',').ok_or("region 原点格式应为 x,y")?;
-    let (width, height) = size.split_once('x').ok_or("region 尺寸格式应为 widthxheight")?;
+    let (width, height) = size
+        .split_once('x')
+        .ok_or("region 尺寸格式应为 widthxheight")?;
     let rect = Rect {
         x: x.parse().map_err(|_| "region x 不是数字")?,
         y: y.parse().map_err(|_| "region y 不是数字")?,
@@ -821,7 +1202,8 @@ fn parse_geometry(value: &str) -> Result<Rect, String> {
 fn png_size(path: &Path) -> Result<(u32, u32), String> {
     let mut header = [0u8; 24];
     let mut file = fs::File::open(path).map_err(|e| format!("打开截图失败: {e}"))?;
-    file.read_exact(&mut header).map_err(|e| format!("读取 PNG 头失败: {e}"))?;
+    file.read_exact(&mut header)
+        .map_err(|e| format!("读取 PNG 头失败: {e}"))?;
     if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
         return Err("grim 返回的文件不是有效 PNG".into());
     }
@@ -836,9 +1218,17 @@ fn png_size(path: &Path) -> Result<(u32, u32), String> {
 fn frame_dir(cfg: &Config, session: &str) -> PathBuf {
     let safe: String = session
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    cfg.data_dir().join("computer-use").join(if safe.is_empty() { "main" } else { &safe })
+    cfg.data_dir()
+        .join("computer-use")
+        .join(if safe.is_empty() { "main" } else { &safe })
 }
 
 fn latest_meta_path(cfg: &Config, session: &str) -> PathBuf {
@@ -855,7 +1245,8 @@ fn save_latest_meta(cfg: &Config, session: &str, meta: &FrameMeta) -> Result<(),
 
 fn load_latest_meta(cfg: &Config, session: &str) -> Result<FrameMeta, String> {
     let path = latest_meta_path(cfg, session);
-    let data = fs::read(&path).map_err(|_| "还没有截图；先调用 computer_use action=observe".to_string())?;
+    let data = fs::read(&path)
+        .map_err(|_| "还没有截图；先调用 computer_use action=observe".to_string())?;
     serde_json::from_slice(&data).map_err(|e| format!("截图坐标记录损坏: {e}"))
 }
 
@@ -921,7 +1312,10 @@ fn cancellable_sleep(duration: Duration, cancel: &AtomicBool) -> Result<(), Stri
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消".into());
         }
-        std::thread::sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(std::time::Instant::now())));
+        std::thread::sleep(
+            Duration::from_millis(20)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
     }
     Ok(())
 }
@@ -932,7 +1326,10 @@ mod linux_pointer {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
-    use wayland_client::protocol::{wl_pointer::{Axis, ButtonState}, wl_registry};
+    use wayland_client::protocol::{
+        wl_pointer::{Axis, ButtonState},
+        wl_registry,
+    };
     use wayland_client::{Connection, Dispatch, QueueHandle};
     use wayland_protocols_wlr::virtual_pointer::v1::client::{
         zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
@@ -966,7 +1363,8 @@ mod linux_pointer {
 
     impl PointerSession {
         fn connect() -> Result<Self, String> {
-            let connection = Connection::connect_to_env().map_err(|e| format!("连接 Wayland 失败: {e}"))?;
+            let connection =
+                Connection::connect_to_env().map_err(|e| format!("连接 Wayland 失败: {e}"))?;
             let (globals, mut queue) = registry_queue_init::<State>(&connection)
                 .map_err(|e| format!("读取 Wayland globals 失败: {e}"))?;
             let qh: QueueHandle<State> = queue.handle();
@@ -975,8 +1373,15 @@ mod linux_pointer {
                 .map_err(|e| format!("合成器没有 zwlr_virtual_pointer_manager_v1: {e}"))?;
             let pointer = manager.create_virtual_pointer(None, &qh, ());
             let mut state = State;
-            queue.roundtrip(&mut state).map_err(|e| format!("初始化虚拟指针失败: {e}"))?;
-            Ok(Self { connection, pointer, queue, state })
+            queue
+                .roundtrip(&mut state)
+                .map_err(|e| format!("初始化虚拟指针失败: {e}"))?;
+            Ok(Self {
+                connection,
+                pointer,
+                queue,
+                state,
+            })
         }
 
         fn sync(&mut self) -> Result<(), String> {
@@ -1021,11 +1426,15 @@ mod linux_pointer {
             if cancel.load(Ordering::Relaxed) {
                 return Err("已取消".into());
             }
-            session.pointer.button(event_time_ms(), button, ButtonState::Pressed);
+            session
+                .pointer
+                .button(event_time_ms(), button, ButtonState::Pressed);
             session.pointer.frame();
             session.sync()?;
             cancellable_sleep(Duration::from_millis(24), cancel)?;
-            session.pointer.button(event_time_ms(), button, ButtonState::Released);
+            session
+                .pointer
+                .button(event_time_ms(), button, ButtonState::Released);
             session.pointer.frame();
             session.sync()?;
             if index + 1 < count {
@@ -1046,12 +1455,16 @@ mod linux_pointer {
         emit_absolute(&session.pointer, meta, from.0, from.1);
         session.pointer.frame();
         session.sync()?;
-        session.pointer.button(event_time_ms(), button, ButtonState::Pressed);
+        session
+            .pointer
+            .button(event_time_ms(), button, ButtonState::Pressed);
         session.pointer.frame();
         session.sync()?;
         for step in 1..=20 {
             if cancel.load(Ordering::Relaxed) {
-                session.pointer.button(event_time_ms(), button, ButtonState::Released);
+                session
+                    .pointer
+                    .button(event_time_ms(), button, ButtonState::Released);
                 session.pointer.frame();
                 let _ = session.sync();
                 return Err("拖拽被取消，已释放鼠标键".into());
@@ -1067,7 +1480,9 @@ mod linux_pointer {
             session.sync()?;
             cancellable_sleep(Duration::from_millis(8), cancel)?;
         }
-        session.pointer.button(event_time_ms(), button, ButtonState::Released);
+        session
+            .pointer
+            .button(event_time_ms(), button, ButtonState::Released);
         session.pointer.frame();
         session.sync()
     }
@@ -1107,7 +1522,10 @@ mod linux_pointer {
     }
 
     fn event_time_ms() -> u32 {
-        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
         if result == 0 {
             (now.tv_sec as u64 * 1_000 + now.tv_nsec as u64 / 1_000_000) as u32
@@ -1158,8 +1576,24 @@ mod tests {
     #[test]
     fn layout_bounds_support_negative_origins() {
         let outputs = BTreeMap::from([
-            ("left".into(), Rect { x: -1920.0, y: 0.0, width: 1920.0, height: 1080.0 }),
-            ("main".into(), Rect { x: 0.0, y: -200.0, width: 2560.0, height: 1440.0 }),
+            (
+                "left".into(),
+                Rect {
+                    x: -1920.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+            ),
+            (
+                "main".into(),
+                Rect {
+                    x: 0.0,
+                    y: -200.0,
+                    width: 2560.0,
+                    height: 1440.0,
+                },
+            ),
         ]);
         let bounds = layout_bounds(&outputs).unwrap();
         assert_eq!(bounds.x, -1920.0);
@@ -1175,14 +1609,38 @@ mod tests {
         assert!(parse_geometry("10,20 0x600").is_err());
     }
 
+    #[test]
+    fn batch_recognizes_only_coordinate_actions_as_frame_bound() {
+        assert!(action_uses_frame(&json!({"type":"click"})));
+        assert!(action_uses_frame(&json!({"action":"scroll"})));
+        assert!(!action_uses_frame(&json!({"type":"type_text"})));
+        assert!(!action_uses_frame(&json!({"type":"wait"})));
+    }
+
+    #[test]
+    fn batch_rejects_empty_and_read_only_queries_before_touching_desktop() {
+        let cfg = Config::default();
+        let cancel = AtomicBool::new(false);
+        let empty =
+            execute(&cfg, "batch-test", &json!({"actions":[]}), &cancel, false).unwrap_err();
+        assert!(empty.contains("1..=50"));
+        let query = execute(
+            &cfg,
+            "batch-test",
+            &json!({"actions":[{"type":"capabilities"}]}),
+            &cancel,
+            false,
+        )
+        .unwrap_err();
+        assert!(query.contains("只读查询"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "需要正在运行的 Wayland/Niri 图形会话"]
     fn live_niri_capture_and_virtual_pointer_move() {
-        let root = std::env::temp_dir().join(format!(
-            "yjlcoder_computer_live_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("yjlcoder_computer_live_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut cfg = Config::default();
         cfg.set_test_data_dir(root.clone());
@@ -1197,7 +1655,9 @@ mod tests {
         )
         .unwrap();
         let (_, image) = split_image_marker(&observed);
-        assert!(image.as_deref().is_some_and(|path| Path::new(path).exists()));
+        assert!(image
+            .as_deref()
+            .is_some_and(|path| Path::new(path).exists()));
         let meta = load_latest_meta(&cfg, "live").unwrap();
         assert!(meta.pixel_width > 0 && meta.pixel_height > 0);
 
@@ -1217,9 +1677,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "手动 Wayland 实机验收：从 YJLCODER_COMPUTER_ACTION_B64 读取 JSON"]
+    #[ignore = "手动桌面实机验收：从 YJLCODER_COMPUTER_ACTION_B64 读取 JSON"]
     fn live_manual_action_from_env() {
         let encoded = std::env::var("YJLCODER_COMPUTER_ACTION_B64")
             .expect("请设置 YJLCODER_COMPUTER_ACTION_B64");
