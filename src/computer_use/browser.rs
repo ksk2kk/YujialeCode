@@ -103,7 +103,7 @@ fn run_action(
             "host_keyboard":false,
             "requires_focus":false,
             "viewport":{"width":runtime.width,"height":runtime.height},
-            "actions":["observe","open_url","click","double_click","move","drag","scroll","type_text","press_key","wait","stop"]
+            "actions":["observe","open_url","click","double_click","move","drag","scroll","type_text","send_text","press_key","wait","stop"]
         }).to_string()),
         "observe" | "screenshot" => capture(cfg, session, runtime, vision_available),
         "open_url" => {
@@ -170,6 +170,22 @@ fn run_action(
             cdp(runtime, "Input.insertText", json!({"text":text}))?;
             advance_ui_generation(cfg, session)?;
             result_or_capture(capture_after, "隔离浏览器文字输入完成", || capture(cfg, session, runtime, vision_available))
+        }
+        "send_text" | "send-text" | "submit_text" | "submit-text" => {
+            let text = args.get("text").and_then(Value::as_str).ok_or("send_text 缺少 text")?;
+            let meta = browser_frame(cfg, session, args)?;
+            let (x, y) = required_point(args).map_err(|_| {
+                "send_text 必须提供输入框 x/y 和最新 frame_id；工具会一次完成点击、输入和提交".to_string()
+            })?;
+            validate_browser_point(&meta, x, y)?;
+            cdp(runtime, "Input.dispatchMouseEvent", json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}))?;
+            cdp(runtime, "Input.dispatchMouseEvent", json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}))?;
+            cdp(runtime, "Input.insertText", json!({"text":text}))?;
+            if args.get("submit").and_then(Value::as_bool).unwrap_or(true) {
+                dispatch_key(runtime, "Return")?;
+            }
+            advance_ui_generation(cfg, session)?;
+            result_or_capture(capture_after, "隔离浏览器文字已可靠输入并提交", || capture(cfg, session, runtime, vision_available))
         }
         "key" | "press_key" | "press-key" => {
             let keys = args.get("keys").or_else(|| args.get("key")).and_then(Value::as_str).ok_or("press_key 缺少 keys")?;

@@ -26,6 +26,7 @@ This project is named after my friend [Yujiale](https://github.com/dawalishi821)
 - Automatic context compression: ported from openai/codex (see the attribution below), triggered automatically when usage exceeds the threshold, or manually via `/compress`.
 - Multiple sessions: one jsonl per session, `/new /ls /use /rm`.
 - QQ bridge: OneBot v11 reverse-WS server (NapCat reverse connection) or forward client; allowlist plus trigger-word / @ filtering, one session per chat, debounce merging, fast responses.
+- `qq_bot` system tool: an empty call starts or adopts local NapCat, generates or imports its WebUI token, opens NapCat's native WebUI login flow, and checks login without copying or refreshing the QR code; the token remains in a local mode-0600 file.
 - Skill installation: `/install pdf` pulls SKILL.md from anthropics/claude-code, or installs from any URL / local directory.
 
 ## Build and Run

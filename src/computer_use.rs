@@ -247,6 +247,31 @@ fn execute_single(
                 recapture(cfg, session, &meta, cancel, vision_available)
             })
         }
+        "send_text" | "send-text" | "submit_text" | "submit-text" => {
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("send_text 缺少 text")?;
+            if text.len() > 20_000 {
+                return Err("单次输入最多 20000 字节".into());
+            }
+            let meta = frame_for_action(cfg, session, args, batch_frame)?;
+            let (x, y) = required_point(args).map_err(|_| {
+                "send_text 必须提供输入框 x/y 和最新 frame_id；工具会先点击输入框再输入，避免发给错误控件".to_string()
+            })?;
+            let (desktop_x, desktop_y) = map_frame_point(&meta, x, y)?;
+            pointer_click(&meta, desktop_x, desktop_y, pointer_button("left")?, 1, cancel)?;
+            cancellable_sleep(Duration::from_millis(150), cancel)?;
+            platform_type_text(text, cancel)?;
+            if args.get("submit").and_then(Value::as_bool).unwrap_or(true) {
+                cancellable_sleep(Duration::from_millis(120), cancel)?;
+                platform_press_key("Return", cancel)?;
+            }
+            advance_ui_generation(cfg, session)?;
+            action_result_or_capture(capture_after, "文字已可靠输入并提交", || {
+                recapture(cfg, session, &meta, cancel, vision_available)
+            })
+        }
         "type" | "type_text" | "type-text" => {
             let text = args
                 .get("text")
@@ -440,7 +465,8 @@ fn canonical_action(action: &str) -> String {
         "doubleclick" | "double_click_element" | "double_click_at" => "double_click".into(),
         "mousemove" | "mouse_move" | "move_mouse" | "move_pointer" => "move".into(),
         "keypress" | "key_press" | "hotkey" => "press_key".into(),
-        "type" | "input_text" | "write_text" => "type_text".into(),
+        "type" | "input_text" | "write_text" | "paste_text" => "type_text".into(),
+        "send" | "send_message" | "submit_text" => "send_text".into(),
         "sleep" | "pause" | "delay" => "wait".into(),
         "navigate" | "goto" | "open" | "open_url" => "open_url".into(),
         "launch_app" | "start_app" | "open_app" | "run_program" | "start_program" => {
@@ -658,6 +684,10 @@ fn action_uses_frame(action: &Value) -> bool {
             | "move-pointer"
             | "drag"
             | "scroll"
+            | "send_text"
+            | "send-text"
+            | "submit_text"
+            | "submit-text"
     )
 }
 
@@ -2161,6 +2191,7 @@ mod tests {
     fn batch_recognizes_only_coordinate_actions_as_frame_bound() {
         assert!(action_uses_frame(&json!({"type":"click"})));
         assert!(action_uses_frame(&json!({"action":"scroll"})));
+        assert!(action_uses_frame(&json!({"action":"send_text"})));
         assert!(!action_uses_frame(&json!({"type":"type_text"})));
         assert!(!action_uses_frame(&json!({"type":"wait"})));
     }
@@ -2197,6 +2228,14 @@ mod tests {
         assert_eq!(launch["action"], "launch");
         assert_eq!(launch["program"], "firefox");
         assert_eq!(launch["backend"], "virtual");
+
+        let send = normalize_computer_args(&json!({
+            "action":"send_message", "value":"你好", "x":"10", "y":"20"
+        }))
+        .unwrap();
+        assert_eq!(send["action"], "send_text");
+        assert_eq!(send["text"], "你好");
+        assert_eq!(send["x"], 10.0);
     }
 
     #[cfg(target_os = "linux")]

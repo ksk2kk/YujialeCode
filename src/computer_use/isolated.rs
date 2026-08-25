@@ -7,6 +7,7 @@
 use super::*;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -127,7 +128,7 @@ fn capabilities(running: bool, vision_available: bool) -> Result<String, String>
         "host_keyboard":false,
         "requires_host_focus":false,
         "vision":vision_available,
-        "actions":["launch","open_url","observe","list_windows","focus_window","click","double_click","move","drag","scroll","type_text","press_key","wait","stop"],
+        "actions":["launch","open_url","observe","list_windows","focus_window","click","double_click","move","drag","scroll","type_text","send_text","press_key","wait","stop"],
         "missing": [if command_exists("sway") {Value::Null} else {json!("sway")}, if command_exists("grim") {Value::Null} else {json!("grim")}, if command_exists("wtype") {Value::Null} else {json!("wtype")}]
     })).map_err(|e| e.to_string())?)
 }
@@ -205,10 +206,50 @@ fn run_action(
         }
         "type" | "type_text" | "type-text" => {
             let text = args.get("text").and_then(Value::as_str).ok_or("type_text 缺少 text")?;
-            let output = run_in_sandbox(runtime, "wtype", &["--".into(), text.into()], INPUT_TIMEOUT, cancel)?;
-            command_success("wtype", output)?;
+            if args.get("x").is_some() || args.get("y").is_some() {
+                let meta = isolated_frame(cfg, session, args)?;
+                let (x, y) = required_point(args)?;
+                validate_point(&meta, x, y)?;
+                runtime.pointer.request(PointerAction::Click {
+                    x: x as u32,
+                    y: y as u32,
+                    width: runtime.width,
+                    height: runtime.height,
+                    button: pointer_button("left")?,
+                    count: 1,
+                })?;
+                cancellable_sleep(Duration::from_millis(120), cancel)?;
+            }
+            isolated_type_text(runtime, text, cancel)?;
             advance_ui_generation(cfg, session)?;
             result_or_capture(capture_after, "隔离桌面文字输入完成", || capture(cfg, session, runtime, cancel, vision_available))
+        }
+        "send_text" | "send-text" | "submit_text" | "submit-text" => {
+            let text = args.get("text").and_then(Value::as_str).ok_or("send_text 缺少 text")?;
+            let meta = isolated_frame(cfg, session, args)?;
+            let (x, y) = required_point(args).map_err(|_| {
+                "send_text 必须提供输入框 x/y 和最新 frame_id；工具会先聚焦输入框再粘贴，避免把文字发给错误控件".to_string()
+            })?;
+            validate_point(&meta, x, y)?;
+            runtime.pointer.request(PointerAction::Click {
+                x: x as u32,
+                y: y as u32,
+                width: runtime.width,
+                height: runtime.height,
+                button: pointer_button("left")?,
+                count: 1,
+            })?;
+            cancellable_sleep(Duration::from_millis(150), cancel)?;
+            isolated_type_text(runtime, text, cancel)?;
+            cancellable_sleep(Duration::from_millis(120), cancel)?;
+            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
+            if submit {
+                let key_args = wtype_key_args("Return")?;
+                let output = run_in_sandbox(runtime, "wtype", &key_args, INPUT_TIMEOUT, cancel)?;
+                command_success("wtype", output)?;
+            }
+            advance_ui_generation(cfg, session)?;
+            result_or_capture(capture_after, "隔离桌面文字已可靠输入并提交", || capture(cfg, session, runtime, cancel, vision_available))
         }
         "key" | "press_key" | "press-key" => {
             let keys = args.get("keys").or_else(|| args.get("key")).and_then(Value::as_str).ok_or("press_key 缺少 keys")?;
@@ -646,6 +687,89 @@ fn sandbox_command(runtime_dir: &Path, display: &str, program: &str) -> Command 
         .env_remove("DISPLAY")
         .env_remove("NIRI_SOCKET");
     command
+}
+
+/// QQ/Chromium/Electron 对 wtype 直接注入 CJK 字符的处理并不一致。尤其是 QQ，
+/// Unicode 注入序列可能被解释成导航快捷键，从而把刚打开的聊天面板清空。
+/// 隔离桌面拥有独立剪贴板，因此优先把原文写入该桌面的 clipboard，再只注入稳定的
+/// Ctrl+V。宿主剪贴板不会被修改。缺少 wl-copy 时仅允许 ASCII 直输，拒绝拿中文冒险。
+fn isolated_type_text(
+    runtime: &SandboxRuntime,
+    text: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if command_exists("wl-copy") {
+        set_isolated_clipboard(runtime, text, cancel)?;
+        let paste = wtype_key_args("CTRL+V")?;
+        let output = run_in_sandbox(runtime, "wtype", &paste, INPUT_TIMEOUT, cancel)?;
+        return command_success("wtype paste", output);
+    }
+    if !text.is_ascii() {
+        return Err(
+            "隔离桌面输入中文需要 wl-copy；请安装 wl-clipboard。已拒绝使用可能让 QQ 会话面板关闭的 wtype Unicode 直输"
+                .into(),
+        );
+    }
+    let output = run_in_sandbox(
+        runtime,
+        "wtype",
+        &["--".into(), text.into()],
+        INPUT_TIMEOUT,
+        cancel,
+    )?;
+    command_success("wtype", output)
+}
+
+fn set_isolated_clipboard(
+    runtime: &SandboxRuntime,
+    text: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let display = runtime
+        .socket
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("Wayland socket 名称无效")?;
+    let mut command = sandbox_command(&runtime.runtime_dir, display, "wl-copy");
+    command
+        .args(["--type", "text/plain;charset=utf-8"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动隔离剪贴板失败: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("无法写入隔离剪贴板")?
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("写入隔离剪贴板失败: {error}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_reader = std::thread::spawn(move || read_pipe(stdout));
+    let err_reader = std::thread::spawn(move || read_pipe(stderr));
+    let started = std::time::Instant::now();
+    let code = loop {
+        if cancel.load(Ordering::Relaxed) || started.elapsed() > INPUT_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("wl-copy 已取消或超时".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    command_success(
+        "wl-copy",
+        ProcessOutput {
+            stdout: out_reader.join().unwrap_or_default(),
+            stderr: err_reader.join().unwrap_or_default(),
+            code,
+        },
+    )
 }
 
 fn wtype_key_args(keys: &str) -> Result<Vec<String>, String> {

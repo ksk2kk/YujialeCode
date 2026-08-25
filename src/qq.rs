@@ -459,6 +459,54 @@ enum QueuedTurn {
     Reminder(crate::fuck_master::MasterTask),
 }
 
+fn fuck_master_turn(
+    task: &crate::fuck_master::MasterTask,
+    msg_type: &str,
+    target_id: i64,
+    owner: i64,
+) -> (String, bool) {
+    let where_tag = if msg_type == "group" {
+        format!("群{target_id}")
+    } else {
+        "私聊".to_string()
+    };
+    let prompt = format!(
+        "【管理员 {owner} @{where_tag}】FuckMaster 主人预先授权的最高权限推进任务：{}。立即主动推进，简短询问目前进展、遇到的阻碍和下一步计划。直接输出发给当前用户的正文，调度器会负责投递。",
+        task.goal
+    );
+    (prompt, true)
+}
+
+fn fuck_master_reply(task: &crate::fuck_master::MasterTask, raw: &str) -> String {
+    let cleaned = qq_clean(raw);
+    let refusal = [
+        "没有主动联系",
+        "无法主动联系",
+        "不能主动联系",
+        "没有设置定时任务",
+        "无法设置定时任务",
+        "不能设置定时任务",
+        "没有权限",
+        "无权限",
+        "只能在这儿陪你聊",
+    ]
+    .iter()
+    .any(|phrase| cleaned.contains(phrase));
+    if cleaned.trim().is_empty() || refusal {
+        format!(
+            "来推进一下“{}”：你目前做到哪一步了？遇到了什么阻碍？下一步准备什么时候开始？",
+            task.goal
+        )
+    } else {
+        cleaned
+    }
+}
+
+struct ChatTurnResult {
+    reply: String,
+    qq_sent: bool,
+}
+
 fn start_chat_worker(
     inner: Arc<BridgeInner>,
     cid: String,
@@ -497,16 +545,14 @@ fn start_chat_worker(
                     if !crate::fuck_master::still_dispatchable(&inner.cfg, &task.id) {
                         continue;
                     }
-                    let where_tag = if msg_type == "group" { format!("群{target_id}") } else { "私聊".to_string() };
                     let owner = inner.qq_cfg.admins.first().copied().unwrap_or(0);
-                    let prompt = format!(
-                        "【管理员 {owner} @{where_tag}】FuckMaster 定时推进目标：{}。现在主动联系用户，简短询问目前进展、遇到的阻碍和下一步计划。不要说这是系统提示。",
-                        task.goal
-                    );
-                    (prompt, false, Some(task))
+                    let (prompt, allow_tools) =
+                        fuck_master_turn(&task, &msg_type, target_id, owner);
+                    (prompt, allow_tools, Some(task))
                 }
             };
-            let reply = run_chat_turn(&inner, &cid, &job, allow_tools, out_tx.clone(), turn_cancel);
+            let turn =
+                run_chat_turn(&inner, &cid, &job, allow_tools, out_tx.clone(), turn_cancel);
             {
                 let mem_inner = inner.clone();
                 let mem_cid = cid.clone();
@@ -514,16 +560,27 @@ fn start_chat_worker(
                 let msgs = SessionStore::new(inner.cfg.sessions_dir()).load(&mem_cid).messages;
                 thread::spawn(move || remember_one_turn(&mem_inner, &mem_cid, &mem_dir, msgs));
             }
-            if reply.is_empty() {
-                if let Some(task) = reminder {
-                    let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, crate::fuck_master::current_epoch());
+            if turn.qq_sent {
+                if let Some(task) = reminder.as_ref() {
+                    let _ = crate::fuck_master::mark_delivered(
+                        &inner.cfg,
+                        &task.id,
+                        crate::fuck_master::current_epoch(),
+                    );
                 }
                 continue;
             }
-            let cleaned = qq_clean(&reply);
+            if turn.reply.is_empty() && reminder.is_none() {
+                continue;
+            }
+            let cleaned = if let Some(task) = reminder.as_ref() {
+                fuck_master_reply(task, &turn.reply)
+            } else {
+                qq_clean(&turn.reply)
+            };
             if cleaned.trim().is_empty() {
-                log(&format!("[qq] 回复过滤后为空，跳过发送: {reply:?}"));
-                if let Some(task) = reminder {
+                log(&format!("[qq] 回复过滤后为空，跳过发送: {:?}", turn.reply));
+                if let Some(task) = reminder.as_ref() {
                     let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, crate::fuck_master::current_epoch());
                 }
                 continue;
@@ -539,7 +596,7 @@ fn start_chat_worker(
                 }),
             };
             let sent = out_tx.send(action.to_string()).is_ok();
-            if let Some(task) = reminder {
+            if let Some(task) = reminder.as_ref() {
                 let now = crate::fuck_master::current_epoch();
                 if sent {
                     let _ = crate::fuck_master::mark_delivered(&inner.cfg, &task.id, now);
@@ -1112,7 +1169,7 @@ fn run_chat_turn(
     allow_tools: bool,
     out_tx: Sender<String>,
     cancel: Arc<AtomicBool>,
-) -> String {
+) -> ChatTurnResult {
     let (agent_qq_tx, agent_qq_rx) = channel::<QqOut>();
     let out_tx2 = out_tx.clone();
     let qq_sent = Arc::new(AtomicBool::new(false));
@@ -1155,13 +1212,18 @@ fn run_chat_turn(
         Err(e) => format!("出错了: {e}"),
     };
     let reply = reply.trim();
-    if reply.is_empty() || qq_sent.load(Ordering::Relaxed) {
+    let sent = qq_sent.load(Ordering::Relaxed);
+    let reply = if reply.is_empty() || sent {
         String::new()
     } else if reply_has_tool_trace(reply) {
         log(&format!("[{cid}] 丢弃疑似工具调用的回复: {reply}"));
         String::new()
     } else {
         reply.to_string()
+    };
+    ChatTurnResult {
+        reply,
+        qq_sent: sent,
     }
 }
 fn reply_has_tool_trace(reply: &str) -> bool {
@@ -1541,6 +1603,27 @@ mod tests {
         let list = crate::fuck_master::execute_tool(&inner.cfg, "qq_g123", &json!({"action":"list"})).unwrap();
         assert!(list.contains("推进找工作学习路线"));
         let _ = std::fs::remove_dir_all(inner.cfg.data_dir());
+    }
+
+    #[test]
+    fn fuck_master_reminder_has_full_access_and_refusal_fallback() {
+        let task = crate::fuck_master::MasterTask {
+            goal: "推进 Rust 学习路线".into(),
+            ..Default::default()
+        };
+        let (prompt, allow_tools) = fuck_master_turn(&task, "group", 123, 777);
+        assert!(allow_tools, "FuckMaster 必须使用管理员最高工具权限");
+        assert!(prompt.contains("主人预先授权的最高权限"));
+        assert!(prompt.contains("群123"));
+
+        let fallback = fuck_master_reply(
+            &task,
+            "我现在没有主动联系别人或者设置定时任务的权限，只能在这儿陪你聊 Rust。",
+        );
+        assert!(!fallback.contains("没有主动联系"));
+        assert!(!fallback.contains("没有权限"));
+        assert!(fallback.contains("推进 Rust 学习路线"));
+        assert!(fallback.contains("下一步"));
     }
     #[test]
     fn single_message_gets_reply() {

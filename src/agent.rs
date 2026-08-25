@@ -954,7 +954,7 @@ impl Agent {
     }
     fn prepare_tool_output(&self, op: &str, args: &Value, output: &str) -> String {
         let semantic_op = crate::tool_compat::normalize_call(op, args).op;
-        if semantic_op == "computer_use" {
+        if matches!(semantic_op.as_str(), "computer_use" | "qq_bot") {
             // The output is small, and its private marker connects the frame
             // to the next multimodal request. Generic preview storage would
             // separate or truncate that marker and make the screenshot blind.

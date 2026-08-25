@@ -34,6 +34,7 @@
 - 上下文自动压缩：移植 openai/codex 实现（见出处声明），占用超阈值自动触发，`/compress` 手动触发。
 - 多会话：每会话一个 jsonl，`/new /ls /use /rm`。
 - QQ 桥接：OneBot v11 反向 WS 服务端（NapCat 反向连接）或正向客户端；allowlist + 触发词 / @ 过滤，每 chat 独立会话，防抖合并、极速响应。
+- `qq_bot` 系统工具：模型空参数调用即可启动/接管本机 NapCat、生成或导入 WebUI 令牌、打开原生 WebUI 扫码页并判断登录状态；不会复制或刷新二维码，令牌只保存在本机权限为 0600 的文件中。
 - 技能安装：`/install pdf` 从 anthropics/claude-code 拉取 SKILL.md，或安装任意 URL / 本地目录。
 
 ## 构建与运行

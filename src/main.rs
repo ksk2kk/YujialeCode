@@ -11,6 +11,7 @@ mod llm;
 mod md;
 mod prompt;
 mod qq;
+mod qq_bot;
 mod registry;
 mod session;
 mod setup;

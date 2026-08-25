@@ -11,6 +11,7 @@ pub mod llm;
 pub mod md;
 pub mod prompt;
 pub mod qq;
+pub mod qq_bot;
 pub mod registry;
 pub mod session;
 pub mod setup;

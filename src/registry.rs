@@ -100,6 +100,7 @@ pub const CATEGORIES: &[Category] = &[
         title: "QQ 消息（桥接模式下可用）",
         tools: &[
             ToolDef { name: "qq_send", desc: "向 QQ 群/好友发送消息（处理完用户消息后用它发送回复）", args: "{\"chat\":\"group:123456\",\"text\":\"...\"}" },
+            ToolDef { name: "qq_bot", desc: "一键管理本机 QQ 机器人：默认自动启动/接管 NapCat、托管令牌并打开原生 WebUI 登录页；不复制或刷新二维码，扫码后自动判断登录态", args: "{} 等同 login；或 {\"action\":\"login|status|wait|start|restart|stop|webui\",\"wait_secs\":120}" },
             ToolDef { name: "is_admin", desc: "判断指定 QQ 号是否为管理员", args: "{\"qq\":3160168215}" },
             ToolDef { name: "add_admin", desc: "添加 QQ 管理员（重启桥接后生效）", args: "{\"qq\":3160168215}" },
         ],
@@ -126,7 +127,7 @@ pub const CATEGORIES: &[Category] = &[
             ToolDef {
                 name: "computer_use",
                 desc: "默认在独立桌面工作，不抢用户鼠标、键盘或焦点。Linux isolated 可运行任意 GUI；browser 用独立 Chromium/CDP 做低成本网页操作；只有明确 backend=host 才控制真实桌面。自动兼容常见 CUA 参数别名和批量动作",
-                args: "{\"backend\":\"isolated|browser|host\",\"action\":\"launch|observe|list_outputs|list_windows|focus_window|open_url|click|double_click|move|drag|scroll|type_text|press_key|wait|stop\",\"program\":\"firefox\",\"args\":[\"--private-window\"],\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"window_id\":5,\"x\":123,\"y\":456,\"from_x\":10,\"from_y\":20,\"to_x\":30,\"to_y\":40,\"steps\":3,\"text\":\"...\",\"keys\":\"CTRL+L\",\"url\":\"https://...\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20}]}",
+                args: "{\"backend\":\"isolated|browser|host\",\"action\":\"launch|observe|list_outputs|list_windows|focus_window|open_url|click|double_click|move|drag|scroll|type_text|send_text|press_key|wait|stop\",\"program\":\"firefox\",\"args\":[\"--private-window\"],\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"window_id\":5,\"x\":123,\"y\":456,\"from_x\":10,\"from_y\":20,\"to_x\":30,\"to_y\":40,\"steps\":3,\"text\":\"...\",\"submit\":true,\"keys\":\"CTRL+L\",\"url\":\"https://...\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20}]}；QQ/聊天框优先用 send_text + x/y，一次完成聚焦、隔离剪贴板粘贴和回车",
             },
         ],
     },
@@ -135,7 +136,7 @@ pub const CATEGORIES: &[Category] = &[
         title: "持续目标",
         tools: &[
             ToolDef { name: "goal", desc: "读取目标状态，或在严格完成审计后标记 complete；同一不可克服原因连续三轮才可 blocked", args: "{\"action\":\"get\"} 或 {\"action\":\"update\",\"status\":\"complete|blocked\",\"reason\":\"证据或阻塞原因\"}" },
-            ToolDef { name: "fuck_master", desc: "注册持久化主动推进任务；到点后模型空闲才通过 QQ 追问，忙碌时自动等待。支持查看、暂停、恢复、立即执行和删除", args: "{\"action\":\"add|list|pause|resume|now|delete\",\"goal\":\"推进找工作学习路线\",\"every\":\"1d\",\"chat\":\"private:123\",\"id\":\"fm-0001\"}" },
+            ToolDef { name: "fuck_master", desc: "注册主人授权的持久化主动推进任务；触发时拥有管理员最高工具权限，模型空闲才通过 QQ 追问，忙碌时自动等待。支持查看、暂停、恢复、立即执行和删除", args: "{\"action\":\"add|list|pause|resume|now|delete\",\"goal\":\"推进找工作学习路线\",\"every\":\"1d\",\"chat\":\"private:123\",\"id\":\"fm-0001\"}" },
         ],
     },
 ];
