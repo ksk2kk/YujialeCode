@@ -23,6 +23,9 @@ const MAX_ACTIONS_PER_BATCH: usize = 50;
 const MAX_RAW_ACTIONS_PER_BATCH: usize = 200;
 static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+mod browser;
+#[cfg(target_os = "linux")]
+mod isolated;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
@@ -87,6 +90,36 @@ pub fn execute(
     vision_available: bool,
 ) -> Result<String, String> {
     let normalized = normalize_computer_args(args)?;
+    validate_batch_shape(&normalized)?;
+    let backend = normalized
+        .get("backend")
+        .and_then(Value::as_str)
+        .unwrap_or("isolated")
+        .trim()
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "browser" | "web" | "cdp" => {
+            return browser::execute(cfg, session, &normalized, cancel, vision_available)
+        }
+        "isolated" | "background" | "virtual" => {
+            #[cfg(target_os = "linux")]
+            return isolated::execute(cfg, session, &normalized, cancel, vision_available);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let action = normalized.get("action").and_then(Value::as_str).unwrap_or("observe");
+                if normalized.get("url").is_some() || action == "open_url" {
+                    return browser::execute(cfg, session, &normalized, cancel, vision_available);
+                }
+                return Err("当前系统的完整像素级隔离桌面需要 VM worker；网页可用 backend=browser，只有明确 backend=host 才会接管真实桌面".into());
+            }
+        }
+        "host" | "desktop" | "native" => {}
+        other => {
+            return Err(format!(
+                "未知 backend {other}；默认 isolated 不影响用户，只有明确传 backend=host 才接管真实桌面"
+            ))
+        }
+    }
     if normalized.get("actions").is_some() {
         return execute_batch(cfg, session, &normalized, cancel, vision_available);
     }
@@ -99,6 +132,36 @@ pub fn execute(
         true,
         None,
     )
+}
+
+fn validate_batch_shape(args: &Value) -> Result<(), String> {
+    let Some(actions) = args.get("actions") else {
+        return Ok(());
+    };
+    let actions = actions.as_array().ok_or("actions 必须是 JSON 数组")?;
+    if actions.is_empty() || actions.len() > MAX_RAW_ACTIONS_PER_BATCH {
+        return Err("actions 数量必须为 1..=200".into());
+    }
+    for action in actions {
+        let name = action
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("observe");
+        if matches!(
+            name,
+            "capabilities"
+                | "status"
+                | "observe"
+                | "screenshot"
+                | "list_outputs"
+                | "outputs"
+                | "list_windows"
+                | "windows"
+        ) {
+            return Err("actions 批次不能混入只读查询；查询请单独调用".into());
+        }
+    }
+    Ok(())
 }
 
 fn execute_single(
@@ -282,6 +345,12 @@ fn normalize_action_object(object: &mut serde_json::Map<String, Value>) -> Resul
     }
 
     copy_alias(object, "window_id", &["id", "window", "target_id"]);
+    copy_alias(object, "backend", &["mode", "environment"]);
+    copy_alias(
+        object,
+        "program",
+        &["app", "application", "executable", "binary"],
+    );
     copy_alias(object, "text", &["value", "input", "content"]);
     copy_alias(object, "keys", &["key", "hotkey"]);
     copy_alias(object, "url", &["uri", "href"]);
@@ -289,6 +358,13 @@ fn normalize_action_object(object: &mut serde_json::Map<String, Value>) -> Resul
     copy_alias(object, "from_y", &["start_y"]);
     copy_alias(object, "to_x", &["end_x"]);
     copy_alias(object, "to_y", &["end_y"]);
+
+    if object.get("action").and_then(Value::as_str) == Some("open_url")
+        && !object.contains_key("url")
+        && object.contains_key("program")
+    {
+        object.insert("action".into(), Value::String("launch".into()));
+    }
 
     if object.get("action").and_then(Value::as_str) == Some("drag") {
         copy_alias(object, "from_x", &["x"]);
@@ -367,6 +443,9 @@ fn canonical_action(action: &str) -> String {
         "type" | "input_text" | "write_text" => "type_text".into(),
         "sleep" | "pause" | "delay" => "wait".into(),
         "navigate" | "goto" | "open" | "open_url" => "open_url".into(),
+        "launch_app" | "start_app" | "open_app" | "run_program" | "start_program" => {
+            "launch".into()
+        }
         "batch" | "multi_action" => "actions".into(),
         _ => normalized,
     }
@@ -2110,6 +2189,33 @@ mod tests {
         let click = normalize_computer_args(&json!({"action":"click_element", "id":"5"})).unwrap();
         assert_eq!(click["action"], "click");
         assert_eq!(click["window_id"], 5);
+
+        let launch = normalize_computer_args(&json!({
+            "action":"start-app", "application":"firefox", "mode":"virtual"
+        }))
+        .unwrap();
+        assert_eq!(launch["action"], "launch");
+        assert_eq!(launch["program"], "firefox");
+        assert_eq!(launch["backend"], "virtual");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_backend_is_isolated_and_never_host() {
+        let cfg = Config::default();
+        let cancel = AtomicBool::new(false);
+        let status = execute(
+            &cfg,
+            "backend-default-test",
+            &json!({"action":"capabilities"}),
+            &cancel,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(value["backend"], "isolated_headless_sway");
+        assert_eq!(value["host_pointer"], false);
+        assert_eq!(value["host_keyboard"], false);
     }
 
     #[test]
@@ -2268,6 +2374,124 @@ mod tests {
             true,
         )
         .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "实机验收：需要 Sway、grim、wtype、Firefox 和正在运行的 Niri"]
+    fn live_isolated_desktop_keeps_host_focus() {
+        let cancel = AtomicBool::new(false);
+        install_desktop_env(&cancel);
+        let before: Value =
+            serde_json::from_str(&niri_query("focused-window", &cancel).unwrap()).unwrap();
+        let before_id = before.get("id").and_then(Value::as_u64);
+        let root =
+            std::env::temp_dir().join(format!("yjlcoder_isolated_live_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.clone());
+        let launched = execute(
+            &cfg,
+            "isolated-live",
+            &json!({
+                "backend":"isolated", "action":"launch", "program":"firefox",
+                "args":["--no-remote","about:blank"], "wait_ms":1800
+            }),
+            &cancel,
+            true,
+        )
+        .unwrap();
+        let (_, image) = split_image_marker(&launched);
+        assert!(image
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file()));
+        let frame = load_latest_meta(&cfg, "isolated-live").unwrap();
+        execute(
+            &cfg,
+            "isolated-live",
+            &json!({
+                "backend":"isolated", "action":"click", "frame_id":frame.frame_id,
+                "x":frame.pixel_width / 2, "y":frame.pixel_height / 2
+            }),
+            &cancel,
+            true,
+        )
+        .unwrap();
+        execute(
+            &cfg,
+            "isolated-live",
+            &json!({"backend":"isolated","action":"press_key","keys":"CTRL+L"}),
+            &cancel,
+            true,
+        )
+        .unwrap();
+        execute(
+            &cfg,
+            "isolated-live",
+            &json!({"backend":"isolated","action":"type_text","text":"https://example.com"}),
+            &cancel,
+            true,
+        )
+        .unwrap();
+        execute(
+            &cfg,
+            "isolated-live",
+            &json!({"backend":"isolated","action":"press_key","keys":"Return"}),
+            &cancel,
+            true,
+        )
+        .unwrap();
+        let after: Value =
+            serde_json::from_str(&niri_query("focused-window", &cancel).unwrap()).unwrap();
+        assert_eq!(
+            before_id,
+            after.get("id").and_then(Value::as_u64),
+            "隔离桌面改变了宿主 Niri 焦点"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "实机验收：需要 Chromium 和正在运行的 Niri"]
+    fn live_isolated_browser_keeps_host_focus() {
+        let cancel = AtomicBool::new(false);
+        install_desktop_env(&cancel);
+        let before: Value =
+            serde_json::from_str(&niri_query("focused-window", &cancel).unwrap()).unwrap();
+        let before_id = before.get("id").and_then(Value::as_u64);
+        let root =
+            std::env::temp_dir().join(format!("yjlcoder_browser_live_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.clone());
+        let opened = execute(&cfg, "browser-live", &json!({
+            "backend":"browser", "action":"open_url", "url":"https://example.com", "wait_ms":1500
+        }), &cancel, true).unwrap();
+        let (_, image) = split_image_marker(&opened);
+        assert!(image
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file()));
+        let frame = load_latest_meta(&cfg, "browser-live").unwrap();
+        execute(
+            &cfg,
+            "browser-live",
+            &json!({
+                "backend":"browser", "action":"click", "frame_id":frame.frame_id,
+                "x":frame.pixel_width / 2, "y":frame.pixel_height / 2
+            }),
+            &cancel,
+            true,
+        )
+        .unwrap();
+        let after: Value =
+            serde_json::from_str(&niri_query("focused-window", &cancel).unwrap()).unwrap();
+        assert_eq!(
+            before_id,
+            after.get("id").and_then(Value::as_u64),
+            "隔离浏览器改变了宿主 Niri 焦点"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

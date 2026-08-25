@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 [dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
 base64 = "0.22.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
@@ -21,7 +22,6 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-image = { version = "0.25.10", default-features = false, features = ["png"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

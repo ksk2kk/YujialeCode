@@ -125,8 +125,8 @@ pub const CATEGORIES: &[Category] = &[
         tools: &[
             ToolDef {
                 name: "computer_use",
-                desc: "Linux Wayland、macOS、Windows 原生观察与操作；自动兼容常见 CUA 参数别名、Retina/DPI、多屏偏移和过期 frame。actions 批量只截图一次并自动压缩重复移动，降低本地模型调用成本",
-                args: "{\"action\":\"observe|list_outputs|list_windows|focus_window|open_url|click|double_click|move|drag|scroll|type_text|press_key|wait\",\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"window_id\":5,\"x\":123,\"y\":456,\"from_x\":10,\"from_y\":20,\"to_x\":30,\"to_y\":40,\"steps\":3,\"text\":\"...\",\"keys\":\"CTRL+L\",\"url\":\"https://...\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20}]}",
+                desc: "默认在独立桌面工作，不抢用户鼠标、键盘或焦点。Linux isolated 可运行任意 GUI；browser 用独立 Chromium/CDP 做低成本网页操作；只有明确 backend=host 才控制真实桌面。自动兼容常见 CUA 参数别名和批量动作",
+                args: "{\"backend\":\"isolated|browser|host\",\"action\":\"launch|observe|list_outputs|list_windows|focus_window|open_url|click|double_click|move|drag|scroll|type_text|press_key|wait|stop\",\"program\":\"firefox\",\"args\":[\"--private-window\"],\"target\":\"focused_output|output|all|region|window\",\"frame_id\":\"f...\",\"window_id\":5,\"x\":123,\"y\":456,\"from_x\":10,\"from_y\":20,\"to_x\":30,\"to_y\":40,\"steps\":3,\"text\":\"...\",\"keys\":\"CTRL+L\",\"url\":\"https://...\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20}]}",
             },
         ],
     },
