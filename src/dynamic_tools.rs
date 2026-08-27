@@ -25,9 +25,15 @@ pub struct DynamicTool {
     pub description: String,
     pub parameters: Value,
     pub script: String,
+    #[serde(default = "default_language")]
+    pub language: String,
     pub timeout_secs: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+fn default_language() -> String {
+    "sh".into()
 }
 
 pub fn register(cfg: &Config, args: &Value, reserved: &[&str]) -> Result<String, String> {
@@ -40,6 +46,14 @@ pub fn register(cfg: &Config, args: &Value, reserved: &[&str]) -> Result<String,
     let description = spec["description"].as_str().unwrap().trim().to_string();
     let parameters = spec["parameters"].clone();
     let script = normalize_script(spec["script"].as_str().unwrap());
+    let language = spec
+        .get("language")
+        .and_then(Value::as_str)
+        .unwrap_or("sh")
+        .to_string();
+    if language != "sh" && language != "python3" {
+        return Err("language 只能是 sh 或 python3（python3 时脚本用 sys.argv[1] 读取 JSON 参数）".into());
+    }
     let timeout_secs = spec.get("timeout_secs").and_then(Value::as_u64).unwrap_or(120);
     let replace = args.get("replace").and_then(Value::as_bool).unwrap_or(false)
         || spec.get("replace").and_then(Value::as_bool).unwrap_or(false);
@@ -55,6 +69,7 @@ pub fn register(cfg: &Config, args: &Value, reserved: &[&str]) -> Result<String,
         description,
         parameters,
         script,
+        language,
         timeout_secs,
         created_at_ms,
         updated_at_ms: now_ms(),
@@ -71,6 +86,27 @@ pub fn load(cfg: &Config, name: &str) -> Option<DynamicTool> {
     }
     let text = fs::read_to_string(tool_path(cfg, name)).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+pub fn delete(cfg: &Config, name: &str) -> Result<String, String> {
+    if !valid_name(name) {
+        return Err("name 必须匹配 [a-z][a-z0-9_]{2,47}".into());
+    }
+    let json_path = tool_path(cfg, name);
+    let sh_path = script_path(cfg, name);
+    let mut removed = false;
+    if json_path.exists() {
+        fs::remove_file(&json_path).map_err(|e| format!("删除失败: {e}"))?;
+        removed = true;
+    }
+    if sh_path.exists() {
+        let _ = fs::remove_file(&sh_path);
+    }
+    if removed {
+        Ok(format!("已删除热注册工具 {name}"))
+    } else {
+        Err(format!("热注册工具 {name} 不存在"))
+    }
 }
 
 pub fn list(cfg: &Config) -> Vec<DynamicTool> {
@@ -129,11 +165,20 @@ pub fn invocation_command(cfg: &Config, tool: &DynamicTool, args: &Value) -> Res
     let script_path = script_path(cfg, &tool.name);
     write_script_atomic(&script_path, &tool.script)?;
     let args_json = serde_json::to_string(args).map_err(|e| format!("参数序列化失败: {e}"))?;
-    Ok(format!(
-        "sh {} {}",
-        shell_quote(&script_path.to_string_lossy()),
-        shell_quote(&args_json)
-    ))
+    Ok(if tool.language == "python3" {
+        // python3 脚本直接用 sys.argv[1] 拿到 JSON 参数，省掉 heredoc 模板
+        format!(
+            "python3 {} {}",
+            shell_quote(&script_path.to_string_lossy()),
+            shell_quote(&args_json)
+        )
+    } else {
+        format!(
+            "sh {} {}",
+            shell_quote(&script_path.to_string_lossy()),
+            shell_quote(&args_json)
+        )
+    })
 }
 
 fn validate_invocation(tool: &DynamicTool, args: &Value) -> Result<(), String> {

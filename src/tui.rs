@@ -553,14 +553,15 @@ impl Tui {
         } else {
             String::new()
         };
+        // Bug4 修复：两套口径分开标注，避免“~90% 估计”和真实服务端命中率交替展示造成误读
         let cache = if let Some(percent) = usage.server_cache_percent() {
             format!(
-                " · 缓存读取 {} · 未命中/写入 {} · 命中率 {percent:.1}%",
+                " · 服务端缓存 命中率 {percent:.1}%（读 {} · 未命中/写 {}）",
                 usage.cache_read_tokens, usage.cache_miss_tokens
             )
-        } else if usage.cache_prefix_hits > 0 {
+        } else if usage.cache_prefix_hits + usage.cache_prefix_misses > 0 {
             format!(
-                " · 缓存前缀稳定 {}/{} 次（最长 {} 条消息）",
+                " · 前缀稳定估计 {}/{} 次（最长 {} 条消息）",
                 usage.cache_prefix_hits,
                 usage.cache_prefix_hits + usage.cache_prefix_misses,
                 usage.cache_prefix_messages
@@ -2240,7 +2241,10 @@ impl Tui {
         let usage = self.live_usage();
         let estimated = self.live_request_usage.prompt_tokens > 0 && !self.live_request_exact;
         let marker = if estimated { "~" } else { "" };
-        let cache = if usage.prompt_tokens > 0 {
+        // Bug4 修复：直播状态优先用服务端真实缓存口径；无真实数据时用本地前缀稳定估计并加 [est]
+        let cache = if let Some(percent) = usage.server_cache_percent() {
+            format!(" · cache {marker}{percent:.0}%")
+        } else if usage.prompt_tokens > 0 {
             let percent = usage.cache_read_tokens as f64 * 100.0 / usage.prompt_tokens as f64;
             format!(" · cache {marker}{percent:.0}%")
         } else {
@@ -4077,7 +4081,8 @@ mod tests {
         let summary = &t.chat.last().unwrap().text;
         assert!(summary.contains("↑ 上传 2000 token"), "最终上传: {summary}");
         assert!(summary.contains("↓ 写入 220 token"), "最终写入: {summary}");
-        assert!(summary.contains("缓存读取 1500"), "最终缓存: {summary}");
+        assert!(summary.contains("服务端缓存 命中率 75.0%"), "最终缓存: {summary}");
+        assert!(summary.contains("读 1500"), "最终缓存读取: {summary}");
         assert!(summary.contains("估算 ¥"), "最终金额: {summary}");
     }
     #[test]

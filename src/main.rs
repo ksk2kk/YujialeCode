@@ -314,13 +314,52 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
     let mut cur_perm_id: Option<u64> = None;
     let mut pending_goal_retry: Option<(std::time::Instant, usize, String)> = None;
     refresh_header(&mut tui, &cfg, &llm, &store);
+    // 重绘节流：事件突发（粘贴/拖拽/流式）按约 30fps 合并重绘，避免逐事件全量刷新
+    let mut dirty = true;
+    let mut last_redraw = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
     while !quit {
-        let key = match key_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(b) => parser.feed(b),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => parser.flush_pending_escape(),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
-        };
-        if let Some(key) = key {
+        // 批量消费按键：一次循环取完缓冲区里所有按键，再统一重绘。
+        // 避免粘贴大段文本/鼠标拖拽选择时逐键触发全量 build_frame（表现为逐字出现/选择卡顿）。
+        let mut batch: Vec<tui::Key> = Vec::new();
+        loop {
+            match key_rx.try_recv() {
+                Ok(b) => {
+                    if let Some(k) = parser.feed(b) {
+                        batch.push(k);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if batch.is_empty() {
+            match key_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(b) => {
+                    if let Some(k) = parser.feed(b) {
+                        batch.push(k);
+                    }
+                    loop {
+                        match key_rx.try_recv() {
+                            Ok(b2) => {
+                                if let Some(k) = parser.feed(b2) {
+                                    batch.push(k);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(k) = parser.flush_pending_escape() {
+                        batch.push(k);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+        let mut any_event = !batch.is_empty();
+        for key in batch {
                 match tui.handle_key(key) {
                     Action::Submit(text) => {
                         pending_goal_retry = None;
@@ -455,20 +494,26 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
                             tui.cancel_streaming();
                         }
                     }
-                    Action::Quit => quit = true,
+                    Action::Quit => {
+                        quit = true;
+                        break;
+                    }
                     Action::Redraw => {}
                     Action::None => {}
                 }
         }
         while let Ok(req) = ask_rx.try_recv() {
+            any_event = true;
             cur_ask_id = Some(req.id);
             tui.ask(req.questions);
         }
         while let Ok(req) = perm_rx.try_recv() {
+            any_event = true;
             cur_perm_id = Some(req.id);
             tui.open_perm_prompt(req);
         }
         while let Ok(ev) = ev_rx.try_recv() {
+            any_event = true;
             match ev {
                 AgentEvent::Delta(d) => tui.assistant_delta(&d),
                 AgentEvent::Reasoning(r) => {
@@ -500,6 +545,7 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
         }
         let mut normal_turn_completed = false;
         while let Ok(terminal) = terminal_rx.try_recv() {
+            any_event = true;
             match terminal {
                 TurnTerminal::Done { text, usage, timings } => {
                     tui.end_assistant_with_metrics(&text, usage, timings);
@@ -663,10 +709,21 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
             }
         }
         for notice in subagents::drain_notifications() {
+            any_event = true;
             tui.push_system(notice);
         }
         refresh_header(&mut tui, &cfg, &llm, &store);
-        tui.redraw();
+        if any_event {
+            dirty = true;
+        }
+        let now = std::time::Instant::now();
+        let throttled = now.duration_since(last_redraw) >= std::time::Duration::from_millis(33);
+        // 有变更时按 ~30fps 节流重绘；空闲时兜底刷新，保证最后一帧不漏
+        if dirty && (throttled || !any_event) {
+            tui.redraw();
+            last_redraw = now;
+            dirty = false;
+        }
     }
     cancel.store(true, Ordering::Relaxed);
     subagents::shutdown_all();

@@ -103,6 +103,8 @@ pub const KNOWN_OPS: &[&str] = &[
     "execute_command",
     "list_tools",
     "make_tools",
+    "update_tools",
+    "delete_tools",
     "readline",
     "writefile",
     "editline",
@@ -278,6 +280,19 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
             })
         }
         "make_tools" => crate::dynamic_tools::register(ctx.cfg, args, KNOWN_OPS),
+        "update_tools" => {
+            let mut inner = args.clone();
+            if let Value::Object(map) = &mut inner {
+                map.insert("replace".into(), Value::Bool(true));
+            }
+            crate::dynamic_tools::register(ctx.cfg, &inner, KNOWN_OPS)
+        }
+        "delete_tools" => crate::dynamic_tools::delete(
+            ctx.cfg,
+            args.get("name")
+                .and_then(Value::as_str)
+                .ok_or("delete_tools 需要 name 参数")?,
+        ),
         "readline" => file_read(args),
         "writefile" => file_write(args),
         "editline" => file_edit(args),
@@ -1411,7 +1426,7 @@ fn file_glob(args: &Value) -> Result<String, String> {
     let base = args.get("base").and_then(|b| b.as_str()).unwrap_or(".");
     let max_results = args.get("max").and_then(|m| m.as_u64()).unwrap_or(200) as usize;
     let mut results: Vec<String> = Vec::new();
-    walk(Path::new(base), 0, 12, &mut |rel: String, is_dir: bool| {
+    walk(Path::new(base), Path::new(base), 0, 12, &mut |rel: String, is_dir: bool| {
         if !is_dir && glob_match(pattern, &rel) && results.len() < max_results {
             results.push(rel);
         }
@@ -1425,7 +1440,7 @@ fn file_glob(args: &Value) -> Result<String, String> {
     }
     Ok(out)
 }
-fn walk(dir: &Path, depth: usize, max_depth: usize, f: &mut impl FnMut(String, bool)) {
+fn walk(dir: &Path, base: &Path, depth: usize, max_depth: usize, f: &mut impl FnMut(String, bool)) {
     if depth > max_depth {
         return;
     }
@@ -1434,14 +1449,17 @@ fn walk(dir: &Path, depth: usize, max_depth: usize, f: &mut impl FnMut(String, b
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let rel = if depth == 0 {
-            name.clone()
-        } else {
-            format!("{}/{name}", dir.to_string_lossy())
+        // rel 始终相对 base 输出（修复：depth=0 时旧实现输出裸文件名，
+        // 用 cwd 去读导致 src/ 下文件全部漏扫）
+        let rel = match dir.strip_prefix(base) {
+            Ok(rel_dir) if !rel_dir.as_os_str().is_empty() => {
+                format!("{}/{name}", rel_dir.to_string_lossy())
+            }
+            _ => name.clone(),
         };
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            walk(&e.path(), depth + 1, max_depth, f);
+            walk(&e.path(), base, depth + 1, max_depth, f);
             f(rel, true);
         } else {
             f(rel, false);
@@ -1492,32 +1510,73 @@ pub fn glob_match(pattern: &str, s: &str) -> bool {
     }
     match_seg(&p, &s)
 }
+fn grep_snippet(line: &str, start: usize, end: usize, before: usize, after: usize) -> String {
+    // 命中片段：匹配点前后各截一段，避免 JSONL 等超长行整行刷屏
+    const MAX: usize = 260;
+    let mut s = start.saturating_sub(before);
+    while s > 0 && !line.is_char_boundary(s) {
+        s -= 1;
+    }
+    let mut e = end.saturating_add(after).min(line.len());
+    while e < line.len() && !line.is_char_boundary(e) {
+        e += 1;
+    }
+    let mut out = String::new();
+    if s > 0 {
+        out.push('…');
+    }
+    out.push_str(&line[s..start]);
+    out.push_str(&line[start..end]);
+    out.push_str(&line[end..e]);
+    if e < line.len() {
+        out.push('…');
+    }
+    if out.chars().count() > MAX {
+        let clipped: String = out.chars().take(MAX).collect();
+        format!("{clipped}…")
+    } else {
+        out
+    }
+}
+
 fn file_grep(args: &Value) -> Result<String, String> {
     let pattern = arg_str(args, "pattern")?;
     let base = expand_home(args.get("path").and_then(|p| p.as_str()).unwrap_or("."));
     let glob = args.get("glob").and_then(|g| g.as_str());
     let max_results = args.get("max").and_then(|m| m.as_u64()).unwrap_or(50) as usize;
+    // 兼容 GNU grep 习惯：\| 视为正则交替；非法正则退化为字面量匹配
+    let regex = regex::Regex::new(&pattern.replace("\\|", "|")).ok();
+    let literal = regex.is_none();
     let mut hits: Vec<String> = Vec::new();
     let mut total_files = 0usize;
     let bp = Path::new(&base);
-    if bp.is_file() {
-        total_files += 1;
-        if let Ok(content) = std::fs::read_to_string(bp) {
-            for (i, line) in content.lines().enumerate() {
-                if line.contains(pattern) {
-                    hits.push(format!(
-                        "{base}:{}: {}",
-                        i + 1,
-                        line.trim().chars().take(200).collect::<String>()
-                    ));
-                    if hits.len() >= max_results {
-                        break;
-                    }
+    let scan_one = |full: &Path, display: &str, hits: &mut Vec<String>, total_files: &mut usize| {
+        *total_files += 1;
+        let Ok(content) = std::fs::read_to_string(full) else {
+            return;
+        };
+        for (i, line) in content.lines().enumerate() {
+            let hit = if literal {
+                line.find(&pattern).map(|st| (st, st + pattern.len()))
+            } else {
+                regex.as_ref().and_then(|r| r.find(line)).map(|m| (m.start(), m.end()))
+            };
+            if let Some((st, en)) = hit {
+                hits.push(format!(
+                    "{display}:{}: {}",
+                    i + 1,
+                    grep_snippet(line, st, en, 40, 90)
+                ));
+                if hits.len() >= max_results {
+                    return;
                 }
             }
         }
+    };
+    if bp.is_file() {
+        scan_one(bp, &base, &mut hits, &mut total_files);
     } else {
-        walk(bp, 0, 10, &mut |rel, is_dir| {
+        walk(bp, bp, 0, 10, &mut |rel, is_dir| {
             if is_dir || hits.len() >= max_results {
                 return;
             }
@@ -1526,21 +1585,7 @@ fn file_grep(args: &Value) -> Result<String, String> {
                     return;
                 }
             }
-            total_files += 1;
-            if let Ok(content) = std::fs::read_to_string(&rel) {
-                for (i, line) in content.lines().enumerate() {
-                    if line.contains(pattern) {
-                        hits.push(format!(
-                            "{rel}:{}: {}",
-                            i + 1,
-                            line.trim().chars().take(200).collect::<String>()
-                        ));
-                        if hits.len() >= max_results {
-                            return;
-                        }
-                    }
-                }
-            }
+            scan_one(&bp.join(&rel), &rel, &mut hits, &mut total_files);
         });
     }
     if hits.is_empty() {
@@ -2888,6 +2933,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
     #[test]
+    fn grep_directory_recursion_finds_base_files() {
+        let d = std::env::temp_dir().join(format!("yjlcoder_grep_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src/nested")).unwrap();
+        std::fs::write(d.join("src/llm.rs"), "cache_tracker line\n").unwrap();
+        std::fs::write(d.join("src/nested/mod.rs"), "cache_tracker nested\n").unwrap();
+        std::fs::write(d.join("other.txt"), "cache_tracker other\n").unwrap();
+        let mut t = TestCtx::new(d.clone());
+        let p = d.join("src").to_string_lossy().into_owned();
+        let r = execute("grep", &json!({"pattern": "cache_tracker", "path": p}), &mut t.ctx()).unwrap();
+        assert!(r.contains("llm.rs:1"), "根目录文件应被扫到: {r}");
+        assert!(r.contains("nested/mod.rs:1"), "嵌套文件应被扫到: {r}");
+        assert!(!r.contains("other.txt"), "不应扫出 base 外文件: {r}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn grep_supports_regex_alternation_and_snippet() {
+        let d = std::env::temp_dir().join(format!("yjlcoder_grep_re_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("a.jsonl"),
+            "{\"k\":\"alpha\"} {\"k\":\"beta\"}\n{\"k\":\"gamma\"}\n",
+        )
+        .unwrap();
+        let mut t = TestCtx::new(d.clone());
+        let p = d.join("a.jsonl").to_string_lossy().into_owned();
+        let r = execute("grep", &json!({"pattern": "alpha\\|gamma", "path": p}), &mut t.ctx()).unwrap();
+        assert!(r.contains("命中"), "正则交替应命中: {r}");
+        assert!(r.contains("alpha"), "应含 alpha: {r}");
+        assert!(r.contains("gamma"), "应含 gamma: {r}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
     fn execute_command_shell() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_store"));
         let r = execute(
@@ -3131,6 +3210,47 @@ mod tests {
         .unwrap();
         assert!(result.contains("已热注册工具 system_status_cmd_test"));
         assert!(crate::dynamic_tools::load(&t.cfg, "system_status_cmd_test").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn make_tools_python3_language_and_delete_tools() {
+        let dir = std::env::temp_dir().join(format!("yjlcoder_py_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut t = TestCtx::new(dir.join("sessions"));
+        t.cfg.set_test_data_dir(dir.clone());
+        // 注册 python3 工具
+        let spec = json!({
+            "name":"py_echo_test",
+            "description":"用 python3 接收 JSON 参数并返回问候文本；适合验证热注册工具的 python 语言支持。",
+            "parameters":{
+                "type":"object",
+                "properties":{"who":{"type":"string","description":"要问候的名字"}},
+                "required":["who"],
+                "additionalProperties":false
+            },
+            "language":"python3",
+            "script":"#!/usr/bin/env python3\nimport sys, json\nparams = json.loads(sys.argv[1])\nprint('hello ' + params['who'])\n",
+            "timeout_secs":30
+        });
+        let r = execute("make_tools", &spec, &mut t.ctx()).unwrap();
+        assert!(r.contains("已热注册工具 py_echo_test"), "注册: {r}");
+        let out = execute("py_echo_test", &json!({"who":"world"}), &mut t.ctx()).unwrap();
+        assert!(out.contains("hello world"), "python3 工具应能调用: {out}");
+        // delete_tools
+        let del = execute("delete_tools", &json!({"name":"py_echo_test"}), &mut t.ctx()).unwrap();
+        assert!(del.contains("已删除"), "删除: {del}");
+        assert!(crate::dynamic_tools::load(&t.cfg, "py_echo_test").is_none());
+        // 已删除后再调用应失败
+        assert!(execute("py_echo_test", &json!({"who":"x"}), &mut t.ctx()).is_err());
+        // 非法 language 应拒绝
+        let bad = json!({
+            "name":"bad_lang_test",
+            "description":"测试非法 language 应被拒绝注册；用于校验语言白名单。",
+            "parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false},
+            "language":"bash",
+            "script":"#!/bin/sh\necho hi\n"
+        });
+        assert!(execute("make_tools", &bad, &mut t.ctx()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

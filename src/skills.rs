@@ -187,6 +187,35 @@ fn fetch_url(url: &str) -> Result<String, String> {
     }
     Ok(text)
 }
+fn skill_outline(content: &str) -> String {
+    // frontmatter description + 所有标题，用于“结构头注入 + 详情按需查”
+    let mut lines = Vec::new();
+    let mut in_frontmatter = false;
+    for (i, line) in content.lines().enumerate() {
+        let t = line.trim();
+        if i == 0 && t == "---" {
+            in_frontmatter = true;
+            continue;
+        }
+        if in_frontmatter {
+            if t == "---" {
+                in_frontmatter = false;
+            } else if let Some(rest) = t.strip_prefix("description:") {
+                lines.push(format!("description:{}", rest.trim()));
+            }
+            continue;
+        }
+        if t.starts_with("### ") || t.starts_with("## ") || t.starts_with("# ") {
+            lines.push(t.to_string());
+        }
+    }
+    if lines.is_empty() {
+        "（无标题结构，需完整读取）".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 pub fn op_run_skill(args: &Value, cfg: &Config) -> Result<String, String> {
     ensure_bundled_skills(cfg)?;
     let name = args
@@ -197,9 +226,19 @@ pub fn op_run_skill(args: &Value, cfg: &Config) -> Result<String, String> {
     let content = fs::read_to_string(&p).map_err(|_| {
         format!("技能 {name} 未安装（install_skill {name} 安装，list_skills 查看）")
     })?;
-    let (truncated, _) = crate::compress::truncate_middle_with_token_budget(&content, 1500);
+    let (truncated, total_tokens) = crate::compress::truncate_middle_with_token_budget(&content, 1500);
+    if total_tokens.is_none() {
+        // 预算内：指令级内容完整注入，不截断
+        return Ok(format!(
+            "【技能 {name} 已加载】以下是完整技能说明，请严格按其执行:\n{content}"
+        ));
+    }
+    // 超预算：注入结构概览 + 开头内容，详情按需 readline（不再把指令截断塞进文件）
+    let outline = skill_outline(&content);
+    let path = p.to_string_lossy();
     Ok(format!(
-        "【技能 {name} 已加载】以下是技能说明，请严格按其执行:\n{truncated}"
+        "【技能 {name} 已加载】说明较长（约 {} tokens），先给结构概览与开头内容：\n\n结构：\n{outline}\n\n---\n{truncated}\n---\n\n完整 SKILL.md 位于 {path}；需要遗漏细节时用 readline 读取该文件（默认返回前 2000 行）。",
+        total_tokens.unwrap_or(0)
     ))
 }
 #[cfg(test)]

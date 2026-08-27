@@ -31,8 +31,8 @@ pub const CATEGORIES: &[Category] = &[
         tools: &[
             ToolDef {
                 name: "make_tools",
-                desc: "严格校验并热注册脚本工具；注册后立即出现在 custom 分类，无需重启",
-                args: "{\"name\":\"tool_name\",\"description\":\"何时调用、做什么、返回什么（20-500字）\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"script\":\"#!/bin/sh\\n# 参数 JSON 在 $1\",\"timeout_secs\":120}",
+                desc: "严格校验并热注册脚本工具（支持 language: sh|python3，python3 脚本用 sys.argv[1] 读 JSON 参数）；覆盖用 update_tools，删除用 delete_tools；注册后立即生效无需重启",
+                args: "{\"name\":\"tool_name\",\"description\":\"何时调用、做什么、返回什么（20-500字）\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"language\":\"python3\",\"script\":\"#!/usr/bin/env python3\\nimport sys, json\\nprint(json.loads(sys.argv[1]))\",\"timeout_secs\":120}",
             },
         ],
     },
@@ -45,7 +45,7 @@ pub const CATEGORIES: &[Category] = &[
             ToolDef { name: "editline", desc: "安全替换文件文本（自动兼容换行、尾随空格和 Unicode 标点差异）", args: "{\"path\":\"...\",\"old\":\"...\",\"new\":\"...\"}" },
             ToolDef { name: "appendline", desc: "追加内容到文件末尾", args: "{\"path\":\"...\",\"content\":\"...\"}" },
             ToolDef { name: "glob", desc: "按模式匹配文件名", args: "{\"pattern\":\"**/*.rs\"}" },
-            ToolDef { name: "grep", desc: "在文件/目录中搜索文本", args: "{\"pattern\":\"...\",\"path\":\".\",\"glob\":\"*.rs\"}" },
+            ToolDef { name: "grep", desc: "在文件/目录中搜索文本；pattern 支持正则与 \\| 交替，命中输出行号+上下文片段（超长行不刷屏）", args: "{\"pattern\":\"pricing\\|cache\",\"path\":\".\",\"glob\":\"*.rs\"}" },
             ToolDef { name: "listdir", desc: "连续分页列出目录；结果不会被通用输出层折叠，按 Next page 的 offset 继续", args: "{\"path\":\".\",\"offset\":0,\"limit\":200}" },
         ],
     },

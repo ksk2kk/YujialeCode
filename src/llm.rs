@@ -331,7 +331,7 @@ struct RequestCacheTracker {
     previous: Option<RequestCacheSnapshot>,
 }
 impl RequestCacheTracker {
-    fn observe(&mut self, model: &str, tools: &Option<Value>, messages: &[Value]) -> CacheObservation {
+    fn observe(&mut self, model: &str, tools: &Option<Value>, messages: &[Value]) -> (CacheObservation, Option<RequestCacheSnapshot>) {
         let observation = match &self.previous {
             Some(previous) => {
                 let stable = previous.model == model
@@ -351,7 +351,9 @@ impl RequestCacheTracker {
             }
             None => CacheObservation::default(),
         };
-        self.previous = Some(RequestCacheSnapshot {
+        // Bug3 修复：观察结果暂存为快照，不直接覆盖 previous。
+        // 只有请求成功（收到 200 与 usage）后才 commit，失败请求不会污染缓存预估。
+        let snapshot = Some(RequestCacheSnapshot {
             model: model.to_string(),
             tools: tools.clone(),
             messages: messages.to_vec(),
@@ -361,7 +363,12 @@ impl RequestCacheTracker {
                 count_image_values(messages),
             ),
         });
-        observation
+        (observation, snapshot)
+    }
+    fn commit(&mut self, snapshot: Option<RequestCacheSnapshot>) {
+        if let Some(s) = snapshot {
+            self.previous = Some(s);
+        }
     }
 }
 #[derive(Clone)]
@@ -765,7 +772,7 @@ impl RemoteClient {
             })
             .unwrap_or(false);
         let openai_messages = to_openai_messages(&req.messages, vision_available);
-        let cache_observation = self
+        let (cache_observation, cache_snapshot) = self
             .cache_tracker
             .lock()
             .map(|mut tracker| tracker.observe(&model, &req.tools, &openai_messages))
@@ -798,7 +805,10 @@ impl RemoteClient {
                 payload["chat_template_kwargs"] = json!({ "enable_thinking": false });
             }
         }
-        if req.stream && deepseek_api {
+        // Bug1 修复：stream_options.include_usage 必须对所有 OpenAI 兼容后端开启，
+        // 否则切到智谱 GLM / vLLM 等流式默认不返回 usage，命中率显示 0%、成本失真。
+        // 仅排除 llama.cpp（流式加 stream_options 会报错）。
+        if req.stream && !self.server_caps.lock().unwrap().is_llamacpp() {
             payload["stream_options"] = json!({ "include_usage": true });
         }
         let payload_text = payload.to_string();
@@ -841,6 +851,7 @@ impl RemoteClient {
                 self.observe_prompt_usage(&model, raw_prompt_tokens, usage.prompt_tokens);
                 on_event(StreamEvent::TokenProgress(TokenProgress { usage, exact: true }));
             }
+            let _ = self.cache_tracker.lock().map(|mut t| t.commit(cache_snapshot));
             attach_cache_observation(&mut result, cache_observation);
             return Ok(result);
         }
@@ -975,6 +986,7 @@ impl RemoteClient {
             }
             result.tool_calls.push(ToolCall { id, name, args });
         }
+        let _ = self.cache_tracker.lock().map(|mut t| t.commit(cache_snapshot));
         attach_cache_observation(&mut result, cache_observation);
         Ok(result)
     }
@@ -1174,10 +1186,11 @@ fn parse_usage(value: &Value) -> Usage {
     usage
 }
 fn attach_cache_observation(result: &mut ChatResult, observation: CacheObservation) {
-    if !observation.has_previous && result.usage.is_none() {
+    // Bug2 修复：没有真实 usage（后端没返回 / Bug1 场景）时不伪造全零 Usage，
+    // 否则下游 acc_usage 会把整场会话统计污染成 0。
+    let Some(usage) = result.usage.as_mut() else {
         return;
-    }
-    let mut usage = result.usage.unwrap_or_default();
+    };
     if observation.has_previous {
         if observation.stable_prefix {
             usage.cache_prefix_hits = 1;
@@ -1186,7 +1199,6 @@ fn attach_cache_observation(result: &mut ChatResult, observation: CacheObservati
             usage.cache_prefix_misses = 1;
         }
     }
-    result.usage = Some(usage);
 }
 fn parse_full_response(body: &str, on_event: &mut impl FnMut(StreamEvent)) -> Result<ChatResult, String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("响应解析失败: {e}"))?;
@@ -1414,16 +1426,24 @@ mod tests {
         let tools = Some(json!([{"name":"execute_command"},{"name":"list_tools"}]));
         let mut tracker = RequestCacheTracker::default();
         let first = vec![json!({"role":"system","content":"stable"}), json!({"role":"user","content":"a"})];
-        assert!(!tracker.observe("m", &tools, &first).has_previous);
+        let (obs, snap) = tracker.observe("m", &tools, &first);
+        assert!(!obs.has_previous);
+        tracker.commit(snap);
         let mut extended = first.clone();
         extended.push(json!({"role":"assistant","content":"b"}));
-        let hit = tracker.observe("m", &tools, &extended);
+        let (hit, snap2) = tracker.observe("m", &tools, &extended);
         assert!(hit.stable_prefix);
         assert_eq!(hit.prefix_messages, 2);
+        // 未 commit 时 previous 不被失败请求污染
+        tracker.commit(snap2);
+        // 失败请求：不 commit，previous 不应被它覆盖
         let changed = vec![json!({"role":"system","content":"changed"})];
-        let miss = tracker.observe("m", &tools, &changed);
+        let (miss, _snap3) = tracker.observe("m", &tools, &changed);
         assert!(miss.has_previous);
         assert!(!miss.stable_prefix);
+        // 再观察 extended：previous 仍是 extended（miss 未 commit），仍应命中
+        let (obs4, _snap4) = tracker.observe("m", &tools, &extended);
+        assert!(obs4.stable_prefix, "失败请求不应污染 previous");
     }
     #[test]
     fn prompt_estimate_counts_all_message_fields_and_native_tools() {
