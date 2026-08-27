@@ -5,8 +5,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub provider: Provider,
+    #[serde(default)]
+    pub agents: Agents,
     pub qq: Qq,
     pub tui: Tui,
+    #[serde(default)]
+    pub pricing: Pricing,
     #[serde(default)]
     pub search: Search,
     #[serde(default = "default_tool_times")]
@@ -21,6 +25,34 @@ pub struct Config {
     pub trace: Trace,
     #[serde(skip)]
     pub(crate) data_root: Option<PathBuf>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Agents {
+    /// Master switch for child/background agents. The runtime still applies
+    /// the hard concurrency, per-turn and nesting limits below.
+    pub enabled: bool,
+    /// Concurrent child inference requests. Values above two are clamped by
+    /// the runtime because this project targets single-machine local models.
+    pub max_concurrent: usize,
+    /// A parent model may create at most this many children in one turn.
+    pub max_spawn_per_turn: usize,
+    /// Child tool/model steps. On exhaustion the child returns what it has.
+    pub max_steps: usize,
+    /// Empty means inherit the parent model. DeepSeek setup fills Flash here
+    /// so Pro/Vision sessions can delegate cheaply.
+    pub model: String,
+}
+impl Default for Agents {
+    fn default() -> Self {
+        Agents {
+            enabled: true,
+            max_concurrent: 1,
+            max_spawn_per_turn: 1,
+            max_steps: 8,
+            model: String::new(),
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,6 +88,62 @@ pub struct Search {
     pub brave_key: String,
     pub searxng_url: String,
     pub searxng_key: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pricing {
+    /// Whether cost estimates are shown. Prices are always per one million tokens.
+    pub enabled: bool,
+    pub currency: String,
+    pub cache_read_per_million: f64,
+    pub cache_miss_per_million: f64,
+    pub output_per_million: f64,
+}
+impl Default for Pricing {
+    fn default() -> Self {
+        Pricing {
+            enabled: false,
+            currency: "¥".into(),
+            cache_read_per_million: 0.0,
+            cache_miss_per_million: 0.0,
+            output_per_million: 0.0,
+        }
+    }
+}
+impl Pricing {
+    pub fn deepseek_flash_cny() -> Self {
+        Pricing {
+            enabled: true,
+            currency: "¥".into(),
+            cache_read_per_million: 0.02,
+            cache_miss_per_million: 1.0,
+            output_per_million: 2.0,
+        }
+    }
+    pub fn estimate(
+        &self,
+        prompt_tokens: usize,
+        cache_read_tokens: usize,
+        cache_miss_tokens: usize,
+        output_tokens: usize,
+    ) -> Option<f64> {
+        if !self.enabled {
+            return None;
+        }
+        let read = cache_read_tokens.min(prompt_tokens);
+        let miss = if cache_miss_tokens > 0 || read > 0 {
+            cache_miss_tokens.min(prompt_tokens.saturating_sub(read))
+        } else {
+            // A backend without cache accounting is priced conservatively as a miss.
+            prompt_tokens
+        };
+        Some(
+            (read as f64 * self.cache_read_per_million
+                + miss as f64 * self.cache_miss_per_million
+                + output_tokens as f64 * self.output_per_million)
+                / 1_000_000.0,
+        )
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -127,7 +215,7 @@ impl Default for Config {
                 base_url: "https://api.deepseek.com".into(),
                 api_key: String::new(),
                 model: "deepseek-v4-flash".into(),
-                ctx_window: 1000000,
+                ctx_window: crate::backend::DEEPSEEK_V4_CONTEXT_WINDOW,
                 ctx_override: None,
                 native_tools: true,
                 timeout_secs: 120,
@@ -135,6 +223,7 @@ impl Default for Config {
                 load_context: 16384,
                 thinking_budget: None,
             },
+            agents: Agents::default(),
             qq: Qq {
                 ws_mode: "server".into(),
                 ws_addr: "127.0.0.1:6701".into(),
@@ -151,6 +240,7 @@ impl Default for Config {
                 compress_threshold: 0.75,
                 tool_result_max_tokens: 1000,
             },
+            pricing: Pricing::default(),
             search: Search {
                 brave_key: String::new(),
                 searxng_url: String::new(),
@@ -199,7 +289,14 @@ impl Config {
         let dir = self.data_dir();
         let _ = fs::create_dir_all(&dir);                                 
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(dir.join("config.json"), s);                               
+            let path = dir.join("config.json");
+            if fs::write(&path, s).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+                }
+            }
         }
     }
     pub fn data_dir(&self) -> PathBuf {
@@ -225,8 +322,14 @@ mod tests {
         let s = serde_json::to_string_pretty(&c).unwrap();
         let c2: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(c2.provider.model, "deepseek-v4-flash");
+        assert_eq!(c2.provider.ctx_window, 1_000_000);
+        assert!(c2.agents.enabled);
+        assert_eq!(c2.agents.max_concurrent, 1);
+        assert_eq!(c2.agents.max_spawn_per_turn, 1);
+        assert_eq!(c2.agents.max_steps, 8);
         assert_eq!(c2.tui.compress_threshold, 0.75);
         assert_eq!(c2.qq.auto_new, 0);
+        assert!(!c2.pricing.enabled);
         assert_eq!(c2.tool_times, 24);
         assert!(c2.fuckloop);
         let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -256,5 +359,20 @@ mod tests {
         v["provider"] = provider;
         let old4: Config = serde_json::from_value(v).unwrap();
         assert_eq!(old4.provider.ctx_override, None);
+        let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v.as_object_mut().unwrap().remove("pricing");
+        let old5: Config = serde_json::from_value(v).unwrap();
+        assert!(!old5.pricing.enabled);
+        let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v.as_object_mut().unwrap().remove("agents");
+        let old6: Config = serde_json::from_value(v).unwrap();
+        assert!(old6.agents.enabled);
+        assert_eq!(old6.agents.max_concurrent, 1);
+    }
+    #[test]
+    fn pricing_counts_cache_hits_and_misses_separately() {
+        let pricing = Pricing::deepseek_flash_cny();
+        let cost = pricing.estimate(1_000_000, 800_000, 200_000, 100_000).unwrap();
+        assert!((cost - 0.416).abs() < 1e-9);
     }
 }

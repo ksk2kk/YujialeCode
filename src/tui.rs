@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
+use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::tools::AskQuestion;
 const C_GREEN: &str = "\x1b[32m";                
@@ -84,12 +85,18 @@ pub enum Action {
     Submit(String),
     Command(String),
     AskSubmit(BTreeMap<String, String>),
+    ConfigSubmit(BTreeMap<String, String>),
     Cancel,
     RetrieveQueued,
     PermSubmit(crate::tools::PermDecisionKind),
     Quit,
     Redraw,
     None,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskKind {
+    Agent,
+    ProviderConfig,
 }
 #[derive(Debug, Clone)]
 struct AskUi {
@@ -192,7 +199,15 @@ pub struct Tui {
     header: String,
     ctx_used: usize,
     ctx_window: usize,
+    ctx_exact: bool,
+    last_exact_prompt_tokens: Option<usize>,
     queued_count: usize,
+    pricing: crate::config::Pricing,
+    stream_started: Option<Instant>,
+    live_committed_usage: crate::llm::Usage,
+    live_request_usage: crate::llm::Usage,
+    live_request_exact: bool,
+    live_generated_bytes: usize,
     chat: Vec<ChatLine>,
     scroll: usize,
     input: String,
@@ -206,6 +221,7 @@ pub struct Tui {
     commands: &'static [(&'static str, &'static str)],
     command_completion: Option<CommandCompletion>,
     asking: Option<AskUi>,
+    ask_kind: AskKind,
     perm_prompt: Option<PermUi>,
     mascot_state: MascotState,
     last_tool_op: Option<String>,
@@ -272,7 +288,15 @@ impl Tui {
             header: String::new(),
             ctx_used: 0,
             ctx_window: 0,
+            ctx_exact: false,
+            last_exact_prompt_tokens: None,
             queued_count: 0,
+            pricing: crate::config::Pricing::default(),
+            stream_started: None,
+            live_committed_usage: crate::llm::Usage::default(),
+            live_request_usage: crate::llm::Usage::default(),
+            live_request_exact: false,
+            live_generated_bytes: 0,
             chat: Vec::new(),
             scroll: 0,
             input: String::new(),
@@ -286,6 +310,7 @@ impl Tui {
             commands: &[],
             command_completion: None,
             asking: None,
+            ask_kind: AskKind::Agent,
             perm_prompt: None,
             mascot_state: MascotState::Idle,
             last_tool_op: None,
@@ -302,6 +327,14 @@ impl Tui {
         }
     }
     pub fn ask(&mut self, questions: Vec<AskQuestion>) {
+        self.ask_kind = AskKind::Agent;
+        self.open_ask(questions);
+    }
+    pub fn open_provider_setup(&mut self, cfg: &crate::config::Config) {
+        self.ask_kind = AskKind::ProviderConfig;
+        self.open_ask(crate::setup::provider_questions(cfg));
+    }
+    fn open_ask(&mut self, questions: Vec<AskQuestion>) {
         self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
@@ -317,6 +350,7 @@ impl Tui {
     }
     pub fn finish_ask(&mut self) {
         self.asking = None;
+        self.ask_kind = AskKind::Agent;
         self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
@@ -399,12 +433,43 @@ impl Tui {
     pub fn set_header(&mut self, s: String) {
         self.header = s;
     }
-    pub fn set_ctx(&mut self, used: usize, window: usize) {
-        self.ctx_used = used;
+    pub fn set_ctx_estimate(&mut self, used: usize, window: usize) {
         self.ctx_window = window;
+        if !self.streaming || !self.ctx_exact {
+            self.ctx_used = used;
+            self.ctx_exact = false;
+        }
+    }
+    pub fn last_exact_prompt_tokens(&self) -> Option<usize> {
+        self.last_exact_prompt_tokens
     }
     pub fn set_queued_count(&mut self, count: usize) {
         self.queued_count = count;
+    }
+    pub fn set_pricing(&mut self, pricing: crate::config::Pricing) {
+        self.pricing = pricing;
+    }
+    pub fn token_progress(&mut self, progress: crate::llm::TokenProgress) {
+        if progress.exact {
+            if !self.live_request_exact {
+                add_usage(&mut self.live_committed_usage, progress.usage);
+            }
+            self.live_request_usage = crate::llm::Usage::default();
+            self.live_request_exact = true;
+            self.ctx_used = progress.usage.prompt_tokens;
+            self.ctx_exact = true;
+            if progress.usage.prompt_tokens > 0 {
+                self.last_exact_prompt_tokens = Some(progress.usage.prompt_tokens);
+            }
+        } else {
+            self.live_request_usage = progress.usage;
+            self.live_request_exact = false;
+            self.ctx_used = progress.usage.prompt_tokens;
+            self.ctx_exact = false;
+        }
+    }
+    pub fn reasoning_token_delta(&mut self, text: &str) {
+        self.live_generated_bytes = self.live_generated_bytes.saturating_add(text.len());
     }
     pub fn retrieve_queued(&mut self, text: String) {
         self.queued_count = self.queued_count.saturating_sub(1);
@@ -423,12 +488,19 @@ impl Tui {
     pub fn begin_assistant(&mut self) {
         self.seal_reasoning();
         self.streaming = true;
+        self.stream_started = Some(Instant::now());
+        self.live_committed_usage = crate::llm::Usage::default();
+        self.live_request_usage = crate::llm::Usage::default();
+        self.live_request_exact = false;
+        self.live_generated_bytes = 0;
+        self.ctx_exact = false;
         self.mascot_event(MascotEvent::Progress);
         self.chat.push(ChatLine { role: ChatRole::Assistant, text: String::new(), pending: true, op: None });
         self.scroll = 0;
     }
     pub fn assistant_delta(&mut self, d: &str) {
         self.seal_reasoning();
+        self.live_generated_bytes = self.live_generated_bytes.saturating_add(d.len());
         self.mascot_event(MascotEvent::Progress);
         if let Some(last) = self.chat.last_mut() {
             if last.pending {
@@ -440,6 +512,7 @@ impl Tui {
     }
     pub fn end_assistant(&mut self, full: &str) {
         self.streaming = false;
+        self.stream_started = None;
         self.mascot_event(if full.trim().is_empty() {
             MascotEvent::Cancel
         } else {
@@ -474,7 +547,10 @@ impl Tui {
             String::new()
         };
         let cache = if let Some(percent) = usage.server_cache_percent() {
-            format!(" · 缓存命中 {} tok/{percent:.1}%", usage.cache_read_tokens)
+            format!(
+                " · 缓存读取 {} · 未命中/写入 {} · 命中率 {percent:.1}%",
+                usage.cache_read_tokens, usage.cache_miss_tokens
+            )
         } else if usage.cache_prefix_hits > 0 {
             format!(
                 " · 缓存前缀稳定 {}/{} 次（最长 {} 条消息）",
@@ -485,9 +561,24 @@ impl Tui {
         } else {
             String::new()
         };
+        let reasoning = if usage.reasoning_tokens > 0 {
+            format!(" · 其中思考 {}", usage.reasoning_tokens)
+        } else {
+            String::new()
+        };
+        let cost = self
+            .pricing
+            .estimate(
+                usage.prompt_tokens,
+                usage.cache_read_tokens,
+                usage.cache_miss_tokens,
+                usage.completion_tokens,
+            )
+            .map(|value| format!(" · 估算 {}{}", self.pricing.currency, format_cost(value)))
+            .unwrap_or_default();
         if usage.prompt_tokens > 0 || usage.completion_tokens > 0 || !speed.is_empty() || !cache.is_empty() {
             self.push_summary(format!(
-                "▸ 输入 {} token · 输出 {} token{speed}{cache}",
+                "▸ ↑ 上传 {} token · ↓ 写入 {} token{reasoning}{speed}{cache}{cost}",
                 usage.prompt_tokens, usage.completion_tokens
             ));
         }
@@ -731,15 +822,38 @@ impl Tui {
             let header = question.header.clone();
             asking.answers.insert(question.question.clone(), answer.clone());
             asking.current += 1;
-            asking.focus = 0;
+            asking.focus = if answer == "DeepSeek"
+                && asking
+                    .questions
+                    .get(asking.current)
+                    .is_some_and(|next| next.header == "API Key")
+            {
+                asking.questions[asking.current].options.len()
+            } else {
+                0
+            };
             asking.checked.clear();
             asking.notice = None;
             (header, asking.current >= asking.questions.len())
         };
-        self.push_user(format!("[{header}] {answer}"));
+        let visible_answer = if self.ask_kind == AskKind::ProviderConfig
+            && header == "API Key"
+            && !matches!(
+                answer.as_str(),
+                "保留当前密钥" | "清除密钥" | "本地服务无需密钥"
+            )
+        {
+            "已安全填写（不回显）"
+        } else {
+            &answer
+        };
+        self.push_user(format!("[{header}] {visible_answer}"));
         if completed {
             let answers = self.asking.as_ref().map(|asking| asking.answers.clone()).unwrap_or_default();
-            Action::AskSubmit(answers)
+            match self.ask_kind {
+                AskKind::Agent => Action::AskSubmit(answers),
+                AskKind::ProviderConfig => Action::ConfigSubmit(answers),
+            }
         } else {
             self.mascot_event(MascotEvent::Ask);
             Action::None
@@ -1596,8 +1710,11 @@ impl Tui {
             ""
         };
         let prefix_width = 2 + number.width() + check.width();
+        let secret_input = self.ask_kind == AskKind::ProviderConfig && question.header == "API Key";
         let custom = if self.input.is_empty() {
-            "Type something.".to_string()
+            if secret_input { "Paste API key (hidden).".to_string() } else { "Type something.".to_string() }
+        } else if secret_input {
+            "•".repeat(self.input.chars().count())
         } else {
             self.input.clone()
         };
@@ -1615,10 +1732,16 @@ impl Tui {
             "{color}{pointer}{C_RESET} {C_DIM}{number}{C_RESET}{color}{check}{custom}{C_RESET}"
         );
         let other_cursor = if other_focused {
-            let before: String = self.input.chars().take(self.cursor).collect();
+            let before = if secret_input {
+                "•".repeat(self.cursor)
+            } else {
+                self.input.chars().take(self.cursor).collect()
+            };
             let col = prefix_width + before.width() + 1;
             let ch = if self.input.is_empty() {
-                'T'
+                if secret_input { 'P' } else { 'T' }
+            } else if secret_input {
+                '•'
             } else {
                 self.input.chars().nth(self.cursor).unwrap_or(' ')
             };
@@ -2057,14 +2180,67 @@ impl Tui {
     fn chat_line_count(&self) -> usize {
         self.render_lines().len()
     }
+    fn live_usage(&self) -> crate::llm::Usage {
+        let mut usage = self.live_committed_usage;
+        add_usage(&mut usage, self.live_request_usage);
+        let generated = self.live_generated_bytes.saturating_add(3) / 4;
+        usage.completion_tokens = usage.completion_tokens.max(generated);
+        usage
+    }
+    fn live_status(&self) -> String {
+        if !self.streaming {
+            return String::new();
+        }
+        let elapsed = self.stream_started.map(|started| started.elapsed().as_secs()).unwrap_or(0);
+        let phase = match self.mascot_state {
+            MascotState::Tool => "Running tool",
+            MascotState::Asking => "Waiting for user",
+            MascotState::Angry | MascotState::Frantic => "Recovering",
+            _ if elapsed < 10 => "Thinking",
+            _ if elapsed < 20 => "Still thinking",
+            _ if elapsed < 30 => "Thinking more",
+            _ if elapsed < 45 => "Thinking some more",
+            _ => "Almost done thinking",
+        };
+        let usage = self.live_usage();
+        let estimated = self.live_request_usage.prompt_tokens > 0 && !self.live_request_exact;
+        let marker = if estimated { "~" } else { "" };
+        let cache = if usage.prompt_tokens > 0 {
+            let percent = usage.cache_read_tokens as f64 * 100.0 / usage.prompt_tokens as f64;
+            format!(" · cache {marker}{percent:.0}%")
+        } else {
+            String::new()
+        };
+        let cost = self
+            .pricing
+            .estimate(
+                usage.prompt_tokens,
+                usage.cache_read_tokens,
+                usage.cache_miss_tokens,
+                usage.completion_tokens,
+            )
+            .map(|value| format!(" · {}{}", self.pricing.currency, format_cost(value)))
+            .unwrap_or_default();
+        format!(
+            "{phase} {elapsed}s · ↑{marker}{} · ↓{marker}{}{cache}{cost} · ",
+            format_token_count(usage.prompt_tokens),
+            format_token_count(usage.completion_tokens),
+        )
+    }
     fn build_frame(&mut self) -> String {
         let mut out = String::with_capacity(self.w * self.h * 2);
         out.push_str("\x1b[H\x1b[0m");
-        let pct = self
-            .ctx_window
-            .checked_div(self.ctx_window)
-            .map(|_| (self.ctx_used * 100 / self.ctx_window).min(100))
-            .unwrap_or(0);
+        let pct = if self.ctx_window == 0 {
+            0.0
+        } else {
+            (self.ctx_used as f64 * 100.0 / self.ctx_window as f64).min(100.0)
+        };
+        let ctx_marker = if self.ctx_exact { "" } else { "~" };
+        let context = format!(
+            "ctx {ctx_marker}{}/{} ({pct:.2}%)",
+            format_token_count(self.ctx_used),
+            format_token_count(self.ctx_window),
+        );
         let light = if self.streaming {
             format!("{C_MAG}◐{C_RESET}")
         } else {
@@ -2115,8 +2291,9 @@ impl Tui {
             Some(n) => format!(" · {n}"),
             None => String::new(),
         };
+        let live = self.live_status();
         let status_text = truncate_width(
-            &format!("● ctx {pct}%{queue_status}{notice} · {}", self.header),
+            &format!("● {live}{context}{queue_status}{notice} · {}", self.header),
             self.w.saturating_sub(2),
         );
         let status_pad = self.w.saturating_sub(status_text.width());
@@ -2285,6 +2462,34 @@ impl Tui {
         print!("\x1b[?2026h{update}\x1b[?2026l");
         let _ = std::io::stdout().flush();
         self.last_frame = frame;
+    }
+}
+fn add_usage(total: &mut crate::llm::Usage, delta: crate::llm::Usage) {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(delta.prompt_tokens);
+    total.completion_tokens = total.completion_tokens.saturating_add(delta.completion_tokens);
+    total.cache_read_tokens = total.cache_read_tokens.saturating_add(delta.cache_read_tokens);
+    total.cache_miss_tokens = total.cache_miss_tokens.saturating_add(delta.cache_miss_tokens);
+    total.reasoning_tokens = total.reasoning_tokens.saturating_add(delta.reasoning_tokens);
+    total.cache_prefix_hits = total.cache_prefix_hits.saturating_add(delta.cache_prefix_hits);
+    total.cache_prefix_misses = total.cache_prefix_misses.saturating_add(delta.cache_prefix_misses);
+    total.cache_prefix_messages = total.cache_prefix_messages.max(delta.cache_prefix_messages);
+}
+fn format_token_count(tokens: usize) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 10_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else if tokens < 1_000_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        format!("{:.2}m", tokens as f64 / 1_000_000.0)
+    }
+}
+fn format_cost(value: f64) -> String {
+    if value < 0.01 {
+        format!("{value:.6}")
+    } else {
+        format!("{value:.4}")
     }
 }
 fn tool_display(op: &str, args: &str) -> (String, String, String) {
@@ -2926,7 +3131,7 @@ mod tests {
         t.w = 80;
         t.h = 26;
         t.set_header("deepseek-v4-flash │ 会话 main │ native".into());
-        t.set_ctx(500_000, 1_000_000);
+        t.set_ctx_estimate(500_000, 1_000_000);
         let welcome = t.build_frame();
         let welcome_plain = strip_ansi(&welcome);
         assert!(welcome_plain.contains("YJLcoder v"), "欢迎卡品牌");
@@ -2945,7 +3150,10 @@ mod tests {
         assert!(strip_ansi(&frame).contains("◔ ◔"), "思考时眼睛改变");
         assert!(frame.contains("\x1b[K"), "整帧重画应逐行清屏");
         assert!(frame.contains("◐"), "生成中状态灯");
-        assert!(strip_ansi(&frame).contains("ctx 50%"), "上下文状态");
+        assert!(
+            strip_ansi(&frame).contains("ctx ~500k/1.00m (50.00%)"),
+            "上下文状态"
+        );
         assert!(frame.contains("\x1b[48;5;237m"), "用户消息背景块");
         let plain = strip_ansi(&frame);
         assert!(plain.contains("你好"), "用户消息可见");
@@ -3145,6 +3353,25 @@ mod tests {
             panic!("自由文本应作为 Other 提交");
         };
         assert_eq!(answers["怎么处理？"], "稍后再决定");
+    }
+    #[test]
+    fn provider_setup_reuses_ask_ui_but_returns_config_action() {
+        let mut t = Tui::new();
+        t.open_provider_setup(&crate::config::Config::default());
+        assert_eq!(t.handle_key(Key::Enter), Action::None);
+        for c in "sk-hidden-test".chars() {
+            assert_eq!(t.handle_key(Key::Char(c)), Action::None);
+        }
+        assert!(!strip_ansi(&t.build_frame()).contains("sk-hidden-test"));
+        assert_eq!(t.handle_key(Key::Enter), Action::None);
+        assert!(!strip_ansi(&t.build_frame()).contains("sk-hidden-test"));
+        assert_eq!(t.handle_key(Key::Enter), Action::None);
+        let Action::ConfigSubmit(answers) = t.handle_key(Key::Enter) else {
+            panic!("供应商配置最后一步应返回独立配置动作");
+        };
+        assert_eq!(answers[crate::setup::PROVIDER_QUESTION], "DeepSeek");
+        assert_eq!(answers[crate::setup::MODEL_QUESTION], "DeepSeek V4 Flash");
+        assert_eq!(answers[crate::setup::AGENT_QUESTION], "开启（单并发）");
     }
     #[test]
     fn structured_ask_escape_cancels_and_tiny_terminal_keeps_header() {
@@ -3772,5 +3999,70 @@ mod tests {
         let count = styled.chars().filter(|c| *c == '思').count();
         assert!((800..=805).contains(&count), "尾部 800 字符保留（+折叠提示里的字）: {styled:?}");
         assert!(!styled.contains(&"思".repeat(1200)), "完整长文本不渲染");
+    }
+    #[test]
+    fn live_token_status_and_final_cost_are_visible() {
+        let mut t = Tui::new();
+        t.w = 240;
+        t.h = 28;
+        t.set_header("deepseek-v4-flash │ 会话 test │ native".into());
+        t.set_pricing(crate::config::Pricing::deepseek_flash_cny());
+        t.begin_assistant();
+        t.stream_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(50));
+        t.token_progress(crate::llm::TokenProgress {
+            usage: crate::llm::Usage {
+                prompt_tokens: 2_000,
+                cache_read_tokens: 1_500,
+                cache_miss_tokens: 500,
+                ..Default::default()
+            },
+            exact: false,
+        });
+        t.reasoning_token_delta(&"r".repeat(400));
+        t.assistant_delta(&"a".repeat(400));
+        let live = strip_ansi(&t.build_frame());
+        assert!(live.contains("Almost done thinking 50s"), "状态阶梯: {live:?}");
+        assert!(live.contains("↑~2.0k"), "上传估算: {live:?}");
+        assert!(live.contains("↓~200"), "写入估算: {live:?}");
+        assert!(live.contains("cache ~75%"), "缓存估算: {live:?}");
+        assert!(live.contains("¥"), "金额估算: {live:?}");
+
+        t.end_assistant_with_metrics(
+            "done",
+            crate::llm::Usage {
+                prompt_tokens: 2_000,
+                completion_tokens: 220,
+                cache_read_tokens: 1_500,
+                cache_miss_tokens: 500,
+                reasoning_tokens: 120,
+                ..Default::default()
+            },
+            crate::llm::Timings::default(),
+        );
+        let summary = &t.chat.last().unwrap().text;
+        assert!(summary.contains("↑ 上传 2000 token"), "最终上传: {summary}");
+        assert!(summary.contains("↓ 写入 220 token"), "最终写入: {summary}");
+        assert!(summary.contains("缓存读取 1500"), "最终缓存: {summary}");
+        assert!(summary.contains("估算 ¥"), "最终金额: {summary}");
+    }
+    #[test]
+    fn server_prompt_usage_replaces_local_context_estimate_while_streaming() {
+        let mut t = Tui::new();
+        t.w = 180;
+        t.h = 28;
+        t.set_header("deepseek-v4-flash │ 会话 test │ native".into());
+        t.set_ctx_estimate(9_000, 1_000_000);
+        t.begin_assistant();
+        t.token_progress(crate::llm::TokenProgress {
+            usage: crate::llm::Usage {
+                prompt_tokens: 10_321,
+                ..Default::default()
+            },
+            exact: true,
+        });
+        t.set_ctx_estimate(9_111, 1_000_000);
+        let frame = strip_ansi(&t.build_frame());
+        assert!(frame.contains("ctx 10k/1.00m (1.03%)"), "精确值应无波浪号: {frame}");
+        assert_eq!(t.last_exact_prompt_tokens(), Some(10_321));
     }
 }

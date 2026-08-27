@@ -41,6 +41,58 @@ impl Drop for ActiveTurnGuard {
 pub fn runtime_is_busy() -> bool {
     ACTIVE_AGENT_TURNS.load(Ordering::Acquire) > 0
 }
+fn system_prompt_for(cfg: &Config, chat_mode: bool, chat_only: bool) -> String {
+    if crate::subagents::in_child() {
+        return crate::subagents::child_system_prompt().to_string();
+    }
+    let base = if chat_only {
+        CHAT_ONLY_PROMPT
+    } else if chat_mode && cfg.provider.native_tools {
+        NATIVE_QQ_SYSTEM_PROMPT
+    } else if chat_mode {
+        QQ_SYSTEM_PROMPT
+    } else if cfg.provider.native_tools {
+        NATIVE_SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT
+    };
+    if chat_mode && !chat_only {
+        format!("{base}\n\n{CHAT_PHILOSOPHY}")
+    } else {
+        base.to_string()
+    }
+}
+pub fn effective_context_window(cfg: &Config, llm: &Llm) -> usize {
+    crate::backend::effective_window_for_model(
+        cfg.provider.ctx_override,
+        llm.n_ctx(),
+        cfg.provider.ctx_window,
+        &llm.model_name(),
+    )
+}
+pub fn estimate_context_tokens(
+    cfg: &Config,
+    llm: &Llm,
+    messages: &[Msg],
+    chat_mode: bool,
+    chat_only: bool,
+) -> usize {
+    let mut request_messages = vec![Msg::new(
+        "system",
+        system_prompt_for(cfg, chat_mode, chat_only),
+    )];
+    request_messages.extend_from_slice(messages);
+    llm.estimate_prompt_tokens(&ChatRequest {
+        messages: request_messages,
+        tools: if cfg.provider.native_tools && !chat_only {
+            Some(native_tools_json())
+        } else {
+            None
+        },
+        max_tokens: None,
+        stream: !chat_mode,
+    })
+}
 #[derive(Default)]
 struct ToolLoopGuard {
     last_call: Option<String>,
@@ -199,6 +251,7 @@ fn requested_line_number(input: &str) -> Option<usize> {
 pub enum AgentEvent {
     Delta(String),
     Reasoning(String),
+    TokenProgress(crate::llm::TokenProgress),
     ToolRun { op: String, args: String },
     ToolProgress(crate::tools::ToolProgress),
     ToolResult(String),
@@ -211,6 +264,9 @@ fn fwd_stream(ev: crate::llm::StreamEvent, on_event: &mut impl FnMut(AgentEvent)
     match ev {
         crate::llm::StreamEvent::Delta(d) => on_event(AgentEvent::Delta(d)),
         crate::llm::StreamEvent::Reasoning(r) => on_event(AgentEvent::Reasoning(r)),
+        crate::llm::StreamEvent::TokenProgress(progress) => {
+            on_event(AgentEvent::TokenProgress(progress))
+        }
         crate::llm::StreamEvent::Garbage { kind, sample, run, total, limit } => {
             on_event(AgentEvent::Garbage { kind: kind.to_string(), sample, run, total, limit })
         }
@@ -224,6 +280,15 @@ fn trace_record_at(data_root: &std::path::Path, session: &str, ev: &AgentEvent) 
     let rec = match ev {
         AgentEvent::Delta(d) => serde_json::json!({"kind": "delta", "text": d}),
         AgentEvent::Reasoning(r) => serde_json::json!({"kind": "reasoning", "text": r}),
+        AgentEvent::TokenProgress(progress) => serde_json::json!({
+            "kind": "token_progress",
+            "exact": progress.exact,
+            "prompt_tokens": progress.usage.prompt_tokens,
+            "completion_tokens": progress.usage.completion_tokens,
+            "cache_read_tokens": progress.usage.cache_read_tokens,
+            "cache_miss_tokens": progress.usage.cache_miss_tokens,
+            "reasoning_tokens": progress.usage.reasoning_tokens,
+        }),
         AgentEvent::Garbage { kind, sample, run, total, limit } => serde_json::json!({
             "kind": "garbage", "pos": kind, "sample": sample, "run": run, "total": total, "limit": limit
         }),
@@ -335,62 +400,68 @@ impl Agent {
         Agent::with_store(cfg, llm, store, qq_tx, chat_mode, chat_only, cancel)
     }
     fn active_system_prompt(&self) -> String {
-        let base = if self.chat_only {
-            CHAT_ONLY_PROMPT
-        } else if self.chat_mode && self.cfg.provider.native_tools {
-            NATIVE_QQ_SYSTEM_PROMPT
-        } else if self.chat_mode {
-            QQ_SYSTEM_PROMPT
-        } else if self.cfg.provider.native_tools {
-            NATIVE_SYSTEM_PROMPT
-        } else {
-            SYSTEM_PROMPT
-        };
-        if self.chat_mode && !self.chat_only {
-            format!("{base}\n\n{CHAT_PHILOSOPHY}")
-        } else {
-            base.to_string()
-        }
+        system_prompt_for(&self.cfg, self.chat_mode, self.chat_only)
     }
     fn maybe_auto_compact(&mut self, on_event: &mut impl FnMut(AgentEvent)) {
         let msgs = self.store.current().messages;
         if msgs.is_empty() {
             return;
         }
-        let sys_tokens = compress::approx_token_count(&self.active_system_prompt());
-        let tokens = sys_tokens + compress::approx_total_tokens(&msgs);
-        let window = crate::backend::effective_window(
-            self.cfg.provider.ctx_override,
-            self.llm.n_ctx(),
-            self.cfg.provider.ctx_window,
+        let fixed_tokens = estimate_context_tokens(
+            &self.cfg,
+            &self.llm,
+            &[],
+            self.chat_mode,
+            self.chat_only,
         );
+        let tokens = estimate_context_tokens(
+            &self.cfg,
+            &self.llm,
+            &msgs,
+            self.chat_mode,
+            self.chat_only,
+        );
+        let window = effective_context_window(&self.cfg, &self.llm);
         let threshold = self.cfg.tui.compress_threshold;
         if tokens >= window || (tokens as f64) >= window as f64 * threshold {
             on_event(AgentEvent::Notice(format!(
                 "上下文 {tokens}/{window} tok 超阈值，自动压缩中…"
             )));
             let target_total = (window as f64 * threshold * 0.8) as usize;
-            let history_budget = target_total.saturating_sub(sys_tokens).max(128);
+            let history_budget = target_total.saturating_sub(fixed_tokens).max(128);
             match compress::compact_to_limit(&self.llm, &msgs, &self.cancel, history_budget) {
                 Ok(new_hist) => {
-                    let after = compress::approx_total_tokens(&new_hist);
+                    let after = estimate_context_tokens(
+                        &self.cfg,
+                        &self.llm,
+                        &new_hist,
+                        self.chat_mode,
+                        self.chat_only,
+                    );
                     if let Err(e) = self.store.replace_current(&new_hist) {
                         on_event(AgentEvent::Error(format!("压缩落盘失败: {e}")));
                         return;
                     }
-                    on_event(AgentEvent::Notice(format!("压缩完成：{tokens} -> {} tok", sys_tokens + after)));
+                    on_event(AgentEvent::Notice(format!("压缩完成：~{tokens} -> ~{after} tok")));
                 }
                 Err(e) => on_event(AgentEvent::Error(format!("压缩失败: {e}"))),
             }
         }
     }
     pub fn run_turn(&mut self, user_input: &str, on_event: &mut impl FnMut(AgentEvent)) -> Result<String, String> {
+        let _local_inference = crate::subagents::local_inference_guard(&self.cfg);
         let _active_turn = ActiveTurnGuard::enter();
         self.cancel.store(false, Ordering::Relaxed);
         self.last_usage = crate::llm::Usage::default();
         self.last_timings = crate::llm::Timings::default();
         let trace_enabled = self.cfg.trace.enabled;
         let session_id = self.store.current_id().to_string();
+        let _subagent_turn = crate::subagents::begin_turn(&session_id);
+        if !crate::subagents::in_child() {
+            for result in crate::subagents::take_parent_results(&session_id) {
+                self.store.append(&Msg::new("user", result));
+            }
+        }
         let trace_session = session_id.clone();
         let trace_root = self.cfg.data_dir();
         let mut traced = move |ev: AgentEvent| {
@@ -399,11 +470,11 @@ impl Agent {
             }
             on_event(ev);
         };
-        self.maybe_auto_compact(&mut traced);
         self.store.append(&Msg::new("user", user_input));
         if self.store.is_dirty() {
             self.store.set_dirty(false);
         }
+        self.maybe_auto_compact(&mut traced);
         let mut tool_guard = ToolLoopGuard::default();
         let mut has_tool_result = false;
         if !self.chat_only {
@@ -477,7 +548,10 @@ impl Agent {
             let result = match attempt {
                 Ok(r) => r,
                 Err(e) => {
-                    if !self.cfg.provider.auto_reload || self.cancel.load(Ordering::Relaxed) {
+                    if !self.cfg.provider.auto_reload
+                        || !self.llm.is_llamacpp()
+                        || self.cancel.load(Ordering::Relaxed)
+                    {
                         return Err(e);
                     }
                     if reloads >= MAX_RELOADS {
@@ -561,7 +635,11 @@ impl Agent {
                     interrupts += 1;
                     if interrupts >= 3 {
                         traced(AgentEvent::Notice(format!("连续打断 {interrupts} 次仍无输出（思考流卡死），重载模型后重试…")));
-                        if self.cfg.provider.auto_reload && !self.cancel.load(Ordering::Relaxed) && reloads < MAX_RELOADS {
+                        if self.cfg.provider.auto_reload
+                            && self.llm.is_llamacpp()
+                            && !self.cancel.load(Ordering::Relaxed)
+                            && reloads < MAX_RELOADS
+                        {
                             reloads += 1;
                             self.reload_wait_cooldown(&mut traced)?;
                             interrupts = 0;                                         
@@ -597,7 +675,11 @@ impl Agent {
                 interrupts += 1;
                 if interrupts >= 3 {
                     traced(AgentEvent::Notice(format!("连续打断 {interrupts} 次仍无输出（思考流卡死），重载模型后重试…")));
-                    if self.cfg.provider.auto_reload && !self.cancel.load(Ordering::Relaxed) && reloads < MAX_RELOADS {
+                    if self.cfg.provider.auto_reload
+                        && self.llm.is_llamacpp()
+                        && !self.cancel.load(Ordering::Relaxed)
+                        && reloads < MAX_RELOADS
+                    {
                         reloads += 1;
                         self.reload_wait_cooldown(&mut traced)?;
                         interrupts = 0;                                         
@@ -616,7 +698,11 @@ impl Agent {
                 continue;
             }
             if output_looks_broken(&result) {
-                if self.cfg.provider.auto_reload && !self.cancel.load(Ordering::Relaxed) && reloads < MAX_RELOADS {
+                if self.cfg.provider.auto_reload
+                    && self.llm.is_llamacpp()
+                    && !self.cancel.load(Ordering::Relaxed)
+                    && reloads < MAX_RELOADS
+                {
                     reloads += 1;
                     traced(AgentEvent::Notice("模型输出异常，重载模型后重试…".into()));
                     self.reload_model(&mut traced)?;
@@ -674,6 +760,9 @@ impl Agent {
                 }
                 let mut asst = Msg::new("assistant", result.text.clone());
                 asst.tool_calls = result.tool_calls.clone();
+                if !result.reasoning.is_empty() {
+                    asst.reasoning_content = Some(result.reasoning.clone());
+                }
                 self.store.append(&asst);
                 let mut guard_reason = None;
                 for call in &result.tool_calls {
@@ -810,6 +899,7 @@ impl Agent {
             self.last_usage.completion_tokens += usage.completion_tokens;
             self.last_usage.cache_read_tokens += usage.cache_read_tokens;
             self.last_usage.cache_miss_tokens += usage.cache_miss_tokens;
+            self.last_usage.reasoning_tokens += usage.reasoning_tokens;
             self.last_usage.cache_prefix_hits += usage.cache_prefix_hits;
             self.last_usage.cache_prefix_misses += usage.cache_prefix_misses;
             self.last_usage.cache_prefix_messages = self

@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::time::Duration;
+pub const DEEPSEEK_V4_CONTEXT_WINDOW: usize = 1_000_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendKind {
     #[default]
@@ -50,6 +51,25 @@ pub fn derive_max_tokens(caps: &Capabilities, kind: TokenBudget, qq_max: usize) 
 }
 pub fn effective_window(ctx_override: Option<usize>, n_ctx: Option<usize>, fallback: usize) -> usize {
     ctx_override.or(n_ctx).unwrap_or(fallback)
+}
+pub fn known_model_context_window(model: &str) -> Option<usize> {
+    let model = model.trim().to_ascii_lowercase();
+    matches!(
+        model.as_str(),
+        "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-v4-flash-vision-exp"
+    )
+    .then_some(DEEPSEEK_V4_CONTEXT_WINDOW)
+}
+pub fn effective_window_for_model(
+    ctx_override: Option<usize>,
+    n_ctx: Option<usize>,
+    fallback: usize,
+    model: &str,
+) -> usize {
+    ctx_override
+        .or(n_ctx)
+        .or_else(|| known_model_context_window(model))
+        .unwrap_or(fallback)
 }
 fn get_json(url: &str, api_key: &str) -> Option<(u16, Value)> {
     let mut request = ureq::get(url).timeout(Duration::from_secs(2));
@@ -264,6 +284,29 @@ mod tests {
         assert_eq!(effective_window(None, Some(131072), 32768), 131072);
         assert_eq!(effective_window(None, None, 32768), 32768);
         assert_eq!(effective_window(None, Some(4096), 32768), 4096);
+    }
+    #[test]
+    fn deepseek_v4_models_have_one_million_context() {
+        for model in [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            assert_eq!(known_model_context_window(model), Some(1_000_000));
+            assert_eq!(
+                effective_window_for_model(None, None, 32_768, model),
+                1_000_000
+            );
+        }
+        assert_eq!(
+            effective_window_for_model(Some(65_536), None, 32_768, "deepseek-v4-flash"),
+            65_536
+        );
+        assert_eq!(
+            effective_window_for_model(None, Some(131_072), 32_768, "deepseek-v4-flash"),
+            131_072
+        );
+        assert_eq!(known_model_context_window("other-model"), None);
     }
     fn serve_discover_responses(responses: Vec<(String, u16, String)>) -> u16 {
         use std::io::{Read, Write};

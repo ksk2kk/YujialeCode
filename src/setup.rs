@@ -1,11 +1,18 @@
 use crate::backend::{Capabilities, discover};
 use crate::config::Config;
+use crate::tools::{AskOption, AskQuestion};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
+
+pub const PROVIDER_QUESTION: &str = "选择模型供应商；如果是其他 OpenAI 兼容服务，请选 Other 并直接输入 base_url";
+pub const API_KEY_QUESTION: &str = "输入供应商 API Key；已有配置可以直接保留";
+pub const MODEL_QUESTION: &str = "选择主模型；本地或其他供应商可选 Other 并输入模型名";
+pub const AGENT_QUESTION: &str = "是否启用受限后台 Agent？本地模型始终排队执行，不与主会话抢推理资源";
 pub const LOCAL_CANDIDATES: &[(&str, &str)] = &[
     ("http://127.0.0.1:8080", "llama.cpp"),
     ("http://127.0.0.1:11434", "Ollama"),
@@ -159,6 +166,7 @@ fn probe_candidates(candidates: &[(&str, &str)], api_key: &str) -> Vec<LocalEndp
         })
         .collect()
 }
+#[allow(dead_code)]
 pub fn quick_setup(cfg: &mut Config) -> String {
     let mut lines = Vec::new();
     let endpoints = probe_local_endpoints(&cfg.provider.api_key);
@@ -197,6 +205,171 @@ pub fn quick_setup(cfg: &mut Config) -> String {
     }
     cfg.save();
     lines.join("\n")
+}
+
+/// Builds the same provider form for first launch and `/config`. Reusing the
+/// Ask User renderer keeps keyboard behavior, custom text entry and visual
+/// language identical instead of maintaining a second modal implementation.
+pub fn provider_questions(cfg: &Config) -> Vec<AskQuestion> {
+    let has_key = !cfg.provider.api_key.trim().is_empty();
+    vec![
+        AskQuestion {
+            question: PROVIDER_QUESTION.into(),
+            header: "Provider".into(),
+            options: vec![
+                AskOption {
+                    label: "DeepSeek".into(),
+                    description: "官方 OpenAI 兼容接口；自动填写地址和价格预设".into(),
+                    preview: Some("https://api.deepseek.com".into()),
+                },
+                AskOption {
+                    label: "本地模型（自动探测）".into(),
+                    description: "扫描 llama.cpp、Ollama 和 LM Studio".into(),
+                    preview: Some("127.0.0.1".into()),
+                },
+            ],
+            multi_select: false,
+        },
+        AskQuestion {
+            question: API_KEY_QUESTION.into(),
+            header: "API Key".into(),
+            options: if has_key {
+                vec![
+                    AskOption {
+                        label: "保留当前密钥".into(),
+                        description: "当前已有密钥，界面不会显示明文".into(),
+                        preview: None,
+                    },
+                    AskOption {
+                        label: "清除密钥".into(),
+                        description: "删除本机保存的供应商密钥".into(),
+                        preview: None,
+                    },
+                ]
+            } else {
+                vec![AskOption {
+                    label: "本地服务无需密钥".into(),
+                    description: "仅适用于未开启鉴权的本地模型服务".into(),
+                    preview: None,
+                }]
+            },
+            multi_select: false,
+        },
+        AskQuestion {
+            question: MODEL_QUESTION.into(),
+            header: "Model".into(),
+            options: vec![
+                AskOption {
+                    label: "DeepSeek V4 Flash".into(),
+                    description: "速度和成本优先，默认推荐".into(),
+                    preview: Some("deepseek-v4-flash".into()),
+                },
+                AskOption {
+                    label: "DeepSeek V4 Pro".into(),
+                    description: "复杂任务质量优先".into(),
+                    preview: Some("deepseek-v4-pro".into()),
+                },
+                AskOption {
+                    label: "DeepSeek V4 Flash Vision".into(),
+                    description: "需要截图、图像识别或 Computer Use 时使用".into(),
+                    preview: Some("deepseek-v4-flash-vision-exp".into()),
+                },
+            ],
+            multi_select: false,
+        },
+        AskQuestion {
+            question: AGENT_QUESTION.into(),
+            header: "Agents".into(),
+            options: vec![
+                AskOption {
+                    label: "开启（单并发）".into(),
+                    description: "每回合最多创建 1 个；最多同时运行 1 个；禁止嵌套".into(),
+                    preview: Some("安全默认".into()),
+                },
+                AskOption {
+                    label: "关闭后台 Agent".into(),
+                    description: "主模型不能创建子任务".into(),
+                    preview: None,
+                },
+            ],
+            multi_select: false,
+        },
+    ]
+}
+
+fn answer<'a>(answers: &'a BTreeMap<String, String>, question: &str) -> Result<&'a str, String> {
+    answers
+        .get(question)
+        .map(String::as_str)
+        .ok_or_else(|| format!("配置表缺少答案: {question}"))
+}
+
+/// Applies a completed provider form atomically. Validation happens before
+/// `save`, so a bad custom URL or missing cloud key never destroys a working
+/// configuration.
+pub fn apply_provider_answers(
+    cfg: &mut Config,
+    answers: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let provider = answer(answers, PROVIDER_QUESTION)?.trim();
+    let key = answer(answers, API_KEY_QUESTION)?.trim();
+    let model = answer(answers, MODEL_QUESTION)?.trim();
+    let agents = answer(answers, AGENT_QUESTION)?.trim();
+    let mut next = cfg.clone();
+
+    match key {
+        "保留当前密钥" => {}
+        "本地服务无需密钥" => next.provider.api_key.clear(),
+        "清除密钥" => next.provider.api_key.clear(),
+        value => next.provider.api_key = value.to_string(),
+    }
+
+    match provider {
+        "DeepSeek" => next.provider.base_url = "https://api.deepseek.com".into(),
+        "本地模型（自动探测）" => {
+            let endpoints = probe_local_endpoints(&next.provider.api_key);
+            let endpoint = endpoints.first().ok_or(
+                "没有发现本地模型服务。请先启动 llama.cpp/Ollama/LM Studio，或在 Provider 的 Other 中输入地址",
+            )?;
+            apply_endpoint(&mut next, endpoint, &endpoint.model_names()[0]);
+        }
+        value if value.starts_with("http://") || value.starts_with("https://") => {
+            next.provider.base_url = value.trim_end_matches('/').to_string();
+        }
+        _ => {
+            return Err(
+                "Provider 必须选择 DeepSeek、本地自动探测，或在 Other 输入 http(s) 地址".into(),
+            )
+        }
+    }
+
+    next.provider.model = match model {
+        "DeepSeek V4 Flash" => "deepseek-v4-flash".into(),
+        "DeepSeek V4 Pro" => "deepseek-v4-pro".into(),
+        "DeepSeek V4 Flash Vision" => "deepseek-v4-flash-vision-exp".into(),
+        value if !value.is_empty() => value.to_string(),
+        _ => return Err("模型名不能为空".into()),
+    };
+    next.agents.enabled = agents == "开启（单并发）";
+    next.agents.max_concurrent = 1;
+    next.agents.max_spawn_per_turn = 1;
+    if next.provider.base_url.contains("api.deepseek.com") {
+        if next.provider.api_key.trim().is_empty() {
+            return Err("DeepSeek 需要 API Key；请在 API Key 页的 Other 中输入".into());
+        }
+        next.pricing = crate::config::Pricing::deepseek_flash_cny();
+        next.agents.model = "deepseek-v4-flash".into();
+        next.provider.ctx_window = crate::backend::DEEPSEEK_V4_CONTEXT_WINDOW;
+        next.provider.ctx_override = None;
+    }
+    next.save();
+    *cfg = next;
+    Ok(format!(
+        "配置完成：{} · {} · 后台 Agent {}",
+        cfg.provider.base_url,
+        cfg.provider.model,
+        if cfg.agents.enabled { "开启（1 个并发）" } else { "关闭" }
+    ))
 }
 fn apply_endpoint(cfg: &mut Config, ep: &LocalEndpoint, model: &str) {
     cfg.provider.base_url = format!("{}/v1", ep.origin);
@@ -602,5 +775,43 @@ mod tests {
         }
         assert_eq!(cfg.provider.base_url, "http://127.0.0.1:9000/v1");
         assert_eq!(cfg.provider.model, "mm");
+    }
+    #[test]
+    fn provider_form_applies_deepseek_atomically() {
+        let dir = tmp_dir("provider-form");
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(dir.clone());
+        let answers = BTreeMap::from([
+            (PROVIDER_QUESTION.to_string(), "DeepSeek".to_string()),
+            (API_KEY_QUESTION.to_string(), "sk-form-test".to_string()),
+            (MODEL_QUESTION.to_string(), "DeepSeek V4 Pro".to_string()),
+            (AGENT_QUESTION.to_string(), "开启（单并发）".to_string()),
+        ]);
+        let result = apply_provider_answers(&mut cfg, &answers).unwrap();
+        assert!(result.contains("deepseek-v4-pro"));
+        assert_eq!(cfg.provider.base_url, "https://api.deepseek.com");
+        assert_eq!(cfg.provider.model, "deepseek-v4-pro");
+        assert_eq!(cfg.provider.ctx_window, 1_000_000);
+        assert_eq!(cfg.provider.ctx_override, None);
+        assert_eq!(cfg.agents.model, "deepseek-v4-flash");
+        assert!(cfg.agents.enabled);
+        assert!(cfg.pricing.enabled);
+        let saved = fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(saved.contains("deepseek-v4-pro"));
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn provider_form_rejects_missing_deepseek_key_without_mutation() {
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:8080/v1".into();
+        let original = cfg.provider.base_url.clone();
+        let answers = BTreeMap::from([
+            (PROVIDER_QUESTION.to_string(), "DeepSeek".to_string()),
+            (API_KEY_QUESTION.to_string(), "保留当前密钥".to_string()),
+            (MODEL_QUESTION.to_string(), "DeepSeek V4 Flash".to_string()),
+            (AGENT_QUESTION.to_string(), "关闭后台 Agent".to_string()),
+        ]);
+        assert!(apply_provider_answers(&mut cfg, &answers).is_err());
+        assert_eq!(cfg.provider.base_url, original);
     }
 }

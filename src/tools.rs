@@ -1,19 +1,19 @@
+use crate::config::Config;
+use crate::llm::Llm;
+use crate::registry::{list_categories_text, list_category_text};
+use crate::session::SessionStore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use crate::config::Config;
-use crate::llm::Llm;
-use crate::registry::{list_categories_text, list_category_text};
-use crate::session::SessionStore;
 const FILE_READ_DEFAULT_MAX_LINES: usize = 2_000;
 const FILE_READ_MAX_LINES_PER_PAGE: usize = 2_000;
 const FILE_READ_MAX_SIZE_BYTES: u64 = 256 * 1024;
@@ -136,11 +136,19 @@ pub const KNOWN_OPS: &[&str] = &[
     "goal",
     "fuck_master",
     "computer_use",
+    "spawn_agent",
+    "list_agents",
+    "wait_agent",
+    "stop_agent",
 ];
 pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
+    crate::subagents::authorize_tool_call(op, args)?;
     if op.eq_ignore_ascii_case("make_tools") || op.eq_ignore_ascii_case("make-tools") {
         let spec = make_tools_payload(args);
         return crate::dynamic_tools::register(ctx.cfg, &spec, KNOWN_OPS);
+    }
+    if let Some(result) = crate::plugins::execute_if_present(op, args, ctx) {
+        return result;
     }
     if let Some(tool) = crate::dynamic_tools::load(ctx.cfg, op) {
         return execute_dynamic_tool(&tool, args, ctx);
@@ -153,7 +161,10 @@ pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, Stri
             .filter(|value| dispatch_name(value).is_some());
         let dispatch = if dispatch_name(args).is_some() {
             Some(args)
-        } else if let Some(inner) = args.get("args").filter(|inner| dispatch_name(inner).is_some()) {
+        } else if let Some(inner) = args
+            .get("args")
+            .filter(|inner| dispatch_name(inner).is_some())
+        {
             Some(inner)
         } else {
             recovered_cmd.as_ref()
@@ -161,9 +172,14 @@ pub fn execute(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<String, Stri
         if let Some(dispatch) = dispatch {
             if let Some(name) = dispatch_name(dispatch) {
                 let inner = dispatch_payload(dispatch, name);
-                if name.eq_ignore_ascii_case("make_tools") || name.eq_ignore_ascii_case("make-tools") {
+                if name.eq_ignore_ascii_case("make_tools")
+                    || name.eq_ignore_ascii_case("make-tools")
+                {
                     let spec = make_tools_payload(&inner);
                     return crate::dynamic_tools::register(ctx.cfg, &spec, KNOWN_OPS);
+                }
+                if let Some(result) = crate::plugins::execute_if_present(name, &inner, ctx) {
+                    return result;
                 }
                 if let Some(tool) = crate::dynamic_tools::load(ctx.cfg, name) {
                     return execute_dynamic_tool(&tool, &inner, ctx);
@@ -194,13 +210,20 @@ fn dispatch_payload(dispatch: &Value, target: &str) -> Value {
     let Some(object) = dispatch.as_object() else {
         return json!({});
     };
-    let wrappers: &[&str] = if target.eq_ignore_ascii_case("make_tools")
-        || target.eq_ignore_ascii_case("make-tools")
-    {
-        &["args", "arguments", "params", "input", "payload", "request"]
-    } else {
-        &["args", "arguments", "parameters", "params", "input", "payload", "request"]
-    };
+    let wrappers: &[&str] =
+        if target.eq_ignore_ascii_case("make_tools") || target.eq_ignore_ascii_case("make-tools") {
+            &["args", "arguments", "params", "input", "payload", "request"]
+        } else {
+            &[
+                "args",
+                "arguments",
+                "parameters",
+                "params",
+                "input",
+                "payload",
+                "request",
+            ]
+        };
     if let Some(value) = wrappers.iter().find_map(|key| object.get(*key)) {
         return match value {
             Value::String(raw) => crate::tool_compat::parse_args(raw),
@@ -239,12 +262,17 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "list_tools" => {
             let cat = args.get("category").and_then(|c| c.as_str());
             Ok(match cat {
-                Some(crate::dynamic_tools::CUSTOM_CATEGORY) => crate::dynamic_tools::list_detail(ctx.cfg),
-                Some(c) => list_category_text(c)
-                    .ok_or_else(|| format!("未知分类: {c}（无参数调用 list_tools 查看分类目录）"))?,
+                Some(crate::dynamic_tools::CUSTOM_CATEGORY) => {
+                    crate::dynamic_tools::list_detail(ctx.cfg)
+                }
+                Some(crate::plugins::CATEGORY) => crate::plugins::list_detail(ctx.cfg),
+                Some(c) => list_category_text(c).ok_or_else(|| {
+                    format!("未知分类: {c}（无参数调用 list_tools 查看分类目录）")
+                })?,
                 None => {
                     let mut index = list_categories_text();
                     index.push_str(&crate::dynamic_tools::list_index_line(ctx.cfg));
+                    index.push_str(&crate::plugins::list_index_line(ctx.cfg));
                     index
                 }
             })
@@ -289,9 +317,38 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
             ctx.cancel,
             ctx.llm.supports_vision(),
         ),
+        "spawn_agent" => {
+            let mut payload = args.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("action".into(), Value::String("spawn".into()));
+            }
+            crate::subagents::execute(&payload, ctx)
+        }
+        "list_agents" => {
+            let mut payload = args.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("action".into(), Value::String("list".into()));
+            }
+            crate::subagents::execute(&payload, ctx)
+        }
+        "wait_agent" => {
+            let mut payload = args.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("action".into(), Value::String("wait".into()));
+            }
+            crate::subagents::execute(&payload, ctx)
+        }
+        "stop_agent" => {
+            let mut payload = args.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("action".into(), Value::String("stop".into()));
+            }
+            crate::subagents::execute(&payload, ctx)
+        }
         _ => match crate::dynamic_tools::load(ctx.cfg, op) {
             Some(tool) => execute_dynamic_tool(&tool, args, ctx),
-            None => Err(format!("未知工具: {op}（list_tools 查看可用工具）")),
+            None => crate::plugins::execute_if_present(op, args, ctx)
+                .unwrap_or_else(|| Err(format!("未知工具: {op}（list_tools 查看可用工具）"))),
         },
     }
 }
@@ -346,7 +403,11 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     let perm = ctx.perm.as_ref();
     if let Some(handle) = perm {
         if !handle.auto.load(Ordering::Relaxed) {
-            let cmd_kind = cmd.split_whitespace().next().unwrap_or(cmd.as_str()).to_string();
+            let cmd_kind = cmd
+                .split_whitespace()
+                .next()
+                .unwrap_or(cmd.as_str())
+                .to_string();
             let allowed = handle
                 .allowed
                 .lock()
@@ -356,7 +417,11 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
                 let id = handle.seq.fetch_add(1, Ordering::Relaxed);
                 handle
                     .tx
-                    .send(PermRequest { id, cmd: cmd.clone(), cmd_kind: cmd_kind.clone() })
+                    .send(PermRequest {
+                        id,
+                        cmd: cmd.clone(),
+                        cmd_kind: cmd_kind.clone(),
+                    })
                     .map_err(|_| "权限通道已关闭".to_string())?;
                 let decision = loop {
                     if handle.cancel.load(Ordering::Relaxed) {
@@ -364,7 +429,7 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
                     }
                     match handle.rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(d) if d.id == id => break d.decision,
-                        Ok(_) => continue,              
+                        Ok(_) => continue,
                         Err(RecvTimeoutError::Timeout) => continue,
                         Err(RecvTimeoutError::Disconnected) => return Err("权限通道已断开".into()),
                     }
@@ -407,9 +472,7 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
         .env("GIT_EDITOR", "true")
         .env("PAGER", "cat");
     configure_process_group(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("启动命令失败: {e}"))?;
+    let mut child = command.spawn().map_err(|e| format!("启动命令失败: {e}"))?;
     let process_group = child.id();
     let stdout = child.stdout.take().ok_or("无法连接命令 stdout")?;
     let stderr = child.stderr.take().ok_or("无法连接命令 stderr")?;
@@ -422,7 +485,9 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_secs(timeout);
     let mut capture = CommandCapture::default();
-    let mut last_progress = started.checked_sub(Duration::from_secs(2)).unwrap_or(started);
+    let mut last_progress = started
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(started);
     let mut last_heartbeat = started;
     let (status, stop) = loop {
         while let Ok(chunk) = pipe_rx.try_recv() {
@@ -568,8 +633,7 @@ impl CommandCapture {
     }
 
     fn total_lines(&self) -> usize {
-        self.newline_count
-            + usize::from(self.total_bytes > 0 && self.last_byte != Some(b'\n'))
+        self.newline_count + usize::from(self.total_bytes > 0 && self.last_byte != Some(b'\n'))
     }
 
     fn live_output(&self) -> String {
@@ -610,7 +674,11 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
     });
 }
 
-fn send_command_progress(ctx: &ToolCtx<'_>, capture: &mut CommandCapture, started: std::time::Instant) {
+fn send_command_progress(
+    ctx: &ToolCtx<'_>,
+    capture: &mut CommandCapture,
+    started: std::time::Instant,
+) {
     let Some(tx) = ctx.event_tx else {
         capture.progress_dirty = false;
         return;
@@ -710,10 +778,7 @@ fn shell_invokes_cat(command: &str) -> bool {
 }
 fn segment_invokes_cat(words: &[String]) -> bool {
     let mut first = 0usize;
-    while first < words.len()
-        && words[first].contains('=')
-        && !words[first].starts_with('=')
-    {
+    while first < words.len() && words[first].contains('=') && !words[first].starts_with('=') {
         first += 1;
     }
     let Some(name) = words.get(first).map(|word| shell_executable_name(word)) else {
@@ -868,9 +933,20 @@ fn extract_leading_file_path(input: &str) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 fn is_meta_question(s: &str) -> bool {
-    ["怎么", "什么", "如何", "为什么", "吗", "呢", "咋", "哪个", "哪些", "有没有"]
-        .iter()
-        .any(|w| s.contains(w))
+    [
+        "怎么",
+        "什么",
+        "如何",
+        "为什么",
+        "吗",
+        "呢",
+        "咋",
+        "哪个",
+        "哪些",
+        "有没有",
+    ]
+    .iter()
+    .any(|w| s.contains(w))
 }
 fn extract_url(s: &str) -> Option<String> {
     let pos = s.to_lowercase().find("http")?;
@@ -901,7 +977,9 @@ fn expand_home(path: &str) -> String {
 fn file_read(args: &Value) -> Result<String, String> {
     let path = expand_home(arg_str(args, "path")?);
     if is_blocked_read_path(&path) {
-        return Err(format!("Cannot read '{path}': this device file would block or produce infinite output."));
+        return Err(format!(
+            "Cannot read '{path}': this device file would block or produce infinite output."
+        ));
     }
     let metadata = std::fs::metadata(&path).map_err(|e| format!("读取失败: {e}"))?;
     if metadata.is_dir() {
@@ -909,9 +987,19 @@ fn file_read(args: &Value) -> Result<String, String> {
             "Cannot read '{path}': the specified path is a directory. Use listdir or execute_command with ls."
         ));
     }
-    let start = args.get("start").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
-    let explicit_limit = args.get("limit").and_then(Value::as_u64).map(|value| value as usize);
-    let explicit_end = args.get("end").and_then(Value::as_u64).map(|value| value as usize);
+    let start = args
+        .get("start")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let explicit_limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let explicit_end = args
+        .get("end")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
     let limit = match (explicit_limit, explicit_end) {
         (Some(0), _) => return Err("limit 必须大于 0".into()),
         (Some(limit), _) => limit,
@@ -924,7 +1012,10 @@ fn file_read(args: &Value) -> Result<String, String> {
             "limit cannot exceed {FILE_READ_MAX_LINES_PER_PAGE} lines. Read consecutive pages with offset/limit instead."
         ));
     }
-    if explicit_limit.is_none() && explicit_end.is_none() && metadata.len() > FILE_READ_MAX_SIZE_BYTES {
+    if explicit_limit.is_none()
+        && explicit_end.is_none()
+        && metadata.len() > FILE_READ_MAX_SIZE_BYTES
+    {
         return Err(format!(
             "File content ({}) exceeds maximum allowed size ({}). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
             format_file_size(metadata.len()),
@@ -940,7 +1031,9 @@ fn file_read(args: &Value) -> Result<String, String> {
     let mut selected_lines = 0usize;
     loop {
         raw_line.clear();
-        let bytes = reader.read_until(b'\n', &mut raw_line).map_err(|e| format!("读取失败: {e}"))?;
+        let bytes = reader
+            .read_until(b'\n', &mut raw_line)
+            .map_err(|e| format!("读取失败: {e}"))?;
         if bytes == 0 {
             break;
         }
@@ -1053,7 +1146,10 @@ fn file_edit(args: &Value) -> Result<String, String> {
     let normalized_new = normalize_lf(new);
     let exact_count = normalized.matches(&normalized_old).count();
     let (edited, mode) = if exact_count == 1 {
-        (normalized.replacen(&normalized_old, &normalized_new, 1), "精确匹配")
+        (
+            normalized.replacen(&normalized_old, &normalized_new, 1),
+            "精确匹配",
+        )
     } else if exact_count > 1 {
         return Err(format!(
             "找到 {exact_count} 处匹配，拒绝猜测要改哪一处；请在 old 中补充上下文使其唯一"
@@ -1063,7 +1159,10 @@ fn file_edit(args: &Value) -> Result<String, String> {
         let fuzzy_old = normalize_for_fuzzy_match(&normalized_old);
         let fuzzy_count = fuzzy_content.matches(&fuzzy_old).count();
         if fuzzy_count == 0 {
-            return Err("未找到要替换的文本（已自动尝试换行、尾随空格、智能引号、破折号和特殊空格兼容）".into());
+            return Err(
+                "未找到要替换的文本（已自动尝试换行、尾随空格、智能引号、破折号和特殊空格兼容）"
+                    .into(),
+            );
         }
         if fuzzy_count > 1 {
             return Err(format!(
@@ -1085,7 +1184,11 @@ fn file_edit(args: &Value) -> Result<String, String> {
     if edited == normalized {
         return Err("替换前后内容相同，文件未改动".into());
     }
-    let restored = if line_ending == "\r\n" { edited.replace('\n', "\r\n") } else { edited };
+    let restored = if line_ending == "\r\n" {
+        edited.replace('\n', "\r\n")
+    } else {
+        edited
+    };
     let output = format!("{bom}{restored}");
     std::fs::write(&path, output).map_err(|e| format!("写入失败: {e}"))?;
     Ok(format!("已替换 {path} 中的唯一匹配（{mode}）"))
@@ -1101,9 +1204,11 @@ fn normalize_for_fuzzy_match(text: &str) -> String {
                 .map(|c| match c {
                     '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
                     '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
-                    '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => '-',
-                    '\u{00a0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}' | '\u{2007}'
-                    | '\u{2008}' | '\u{2009}' | '\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
+                    '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+                    | '\u{2212}' => '-',
+                    '\u{00a0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+                    | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200a}' | '\u{202f}'
+                    | '\u{205f}' | '\u{3000}' => ' ',
                     other => other,
                 })
                 .collect::<String>()
@@ -1168,7 +1273,8 @@ fn file_append(args: &Value) -> Result<String, String> {
         .append(true)
         .open(&path)
         .map_err(|e| format!("打开失败: {e}"))?;
-    f.write_all(content.as_bytes()).map_err(|e| format!("追加失败: {e}"))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("追加失败: {e}"))?;
     f.write_all(b"\n").ok();
     Ok(format!("已追加到 {path}"))
 }
@@ -1220,7 +1326,14 @@ fn file_listdir(args: &Value) -> Result<String, String> {
     });
     let total = items.len();
     if offset >= total {
-        return Ok(listdir_page_output(&path, total, offset, limit, skipped, &[]));
+        return Ok(listdir_page_output(
+            &path,
+            total,
+            offset,
+            limit,
+            skipped,
+            &[],
+        ));
     }
     let requested_end = offset.saturating_add(limit).min(total);
     let mut page: Vec<String> = items[offset..requested_end]
@@ -1267,7 +1380,9 @@ fn listdir_page_output(
     if total == 0 {
         out.push_str("Entries: 0 total; showing 0.\n");
     } else if page.is_empty() {
-        out.push_str(&format!("Entries: {total} total; offset {offset} is past the end.\n"));
+        out.push_str(&format!(
+            "Entries: {total} total; offset {offset} is past the end.\n"
+        ));
     } else {
         out.push_str(&format!(
             "Entries: {total} total; showing {}-{}.\n",
@@ -1314,10 +1429,16 @@ fn walk(dir: &Path, depth: usize, max_depth: usize, f: &mut impl FnMut(String, b
     if depth > max_depth {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let rel = if depth == 0 { name.clone() } else { format!("{}/{name}", dir.to_string_lossy()) };
+        let rel = if depth == 0 {
+            name.clone()
+        } else {
+            format!("{}/{name}", dir.to_string_lossy())
+        };
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
             walk(&e.path(), depth + 1, max_depth, f);
@@ -1384,7 +1505,11 @@ fn file_grep(args: &Value) -> Result<String, String> {
         if let Ok(content) = std::fs::read_to_string(bp) {
             for (i, line) in content.lines().enumerate() {
                 if line.contains(pattern) {
-                    hits.push(format!("{base}:{}: {}", i + 1, line.trim().chars().take(200).collect::<String>()));
+                    hits.push(format!(
+                        "{base}:{}: {}",
+                        i + 1,
+                        line.trim().chars().take(200).collect::<String>()
+                    ));
                     if hits.len() >= max_results {
                         break;
                     }
@@ -1405,7 +1530,11 @@ fn file_grep(args: &Value) -> Result<String, String> {
             if let Ok(content) = std::fs::read_to_string(&rel) {
                 for (i, line) in content.lines().enumerate() {
                     if line.contains(pattern) {
-                        hits.push(format!("{rel}:{}: {}", i + 1, line.trim().chars().take(200).collect::<String>()));
+                        hits.push(format!(
+                            "{rel}:{}: {}",
+                            i + 1,
+                            line.trim().chars().take(200).collect::<String>()
+                        ));
                         if hits.len() >= max_results {
                             return;
                         }
@@ -1415,9 +1544,15 @@ fn file_grep(args: &Value) -> Result<String, String> {
         });
     }
     if hits.is_empty() {
-        return Ok(format!("在 {base} 中未找到 {pattern:?}（扫描 {total_files} 个文件）"));
+        return Ok(format!(
+            "在 {base} 中未找到 {pattern:?}（扫描 {total_files} 个文件）"
+        ));
     }
-    Ok(format!("命中 {pattern:?}（{} 处）:\n{}", hits.len(), hits.join("\n")))
+    Ok(format!(
+        "命中 {pattern:?}（{} 处）:\n{}",
+        hits.len(),
+        hits.join("\n")
+    ))
 }
 fn net_get(args: &Value, head_only: bool) -> Result<String, String> {
     let url = arg_str(args, "url")?;
@@ -1460,7 +1595,10 @@ fn net_get(args: &Value, head_only: bool) -> Result<String, String> {
 fn sec_portscan(args: &Value) -> Result<String, String> {
     let host = arg_str(args, "host")?;
     let ports_spec = arg_str(args, "ports")?;
-    let timeout_ms = args.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(500);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(500);
     let mut ports: Vec<u16> = Vec::new();
     for part in ports_spec.split(',') {
         let part = part.trim();
@@ -1468,8 +1606,14 @@ fn sec_portscan(args: &Value) -> Result<String, String> {
             continue;
         }
         if let Some((a, b)) = part.split_once('-') {
-            let lo: u16 = a.trim().parse().map_err(|_| format!("端口格式错误: {part}"))?;
-            let hi: u16 = b.trim().parse().map_err(|_| format!("端口格式错误: {part}"))?;
+            let lo: u16 = a
+                .trim()
+                .parse()
+                .map_err(|_| format!("端口格式错误: {part}"))?;
+            let hi: u16 = b
+                .trim()
+                .parse()
+                .map_err(|_| format!("端口格式错误: {part}"))?;
             if hi < lo || hi - lo > 10000 {
                 return Err(format!("端口范围过大: {part}"));
             }
@@ -1508,16 +1652,26 @@ fn sec_portscan(args: &Value) -> Result<String, String> {
         out
     };
     if open.is_empty() {
-        Ok(format!("{host}（{ip}）扫描 {} 个端口：全部关闭", ports.len()))
+        Ok(format!(
+            "{host}（{ip}）扫描 {} 个端口：全部关闭",
+            ports.len()
+        ))
     } else {
         let list: Vec<String> = open.iter().map(|p| p.to_string()).collect();
-        Ok(format!("{host}（{ip}）开放端口（{}）: {}", open.len(), list.join(", ")))
+        Ok(format!(
+            "{host}（{ip}）开放端口（{}）: {}",
+            open.len(),
+            list.join(", ")
+        ))
     }
 }
 fn sec_dns(args: &Value) -> Result<String, String> {
     let name = arg_str(args, "name")?;
     let mut ips: Vec<String> = Vec::new();
-    for sa in (name, 0u16).to_socket_addrs().map_err(|e| format!("解析失败: {e}"))? {
+    for sa in (name, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("解析失败: {e}"))?
+    {
         let ip = sa.ip().to_string();
         if !ips.contains(&ip) {
             ips.push(ip);
@@ -1533,7 +1687,11 @@ fn session_list(ctx: &mut ToolCtx) -> Result<String, String> {
     let mut out = String::from("会话列表:\n");
     for id in ctx.store.list() {
         let (msgs, tokens) = crate::session::session_stats(&ctx.store.path(&id));
-        let mark = if id == ctx.store.current_id() { " *" } else { "" };
+        let mark = if id == ctx.store.current_id() {
+            " *"
+        } else {
+            ""
+        };
         out.push_str(&format!("- {id}（{msgs} 条消息, ~{tokens} tok）{mark}\n"));
     }
     Ok(out)
@@ -1559,7 +1717,9 @@ fn ctx_compress(ctx: &mut ToolCtx) -> Result<String, String> {
     let new_hist = crate::compress::compact(ctx.llm, &msgs, ctx.cancel)?;
     ctx.store.replace_current(&new_hist)?;
     let after = crate::compress::approx_total_tokens(&new_hist);
-    Ok(format!("压缩完成：{before} tok -> {after} tok（摘要已注入，最近消息保留）"))
+    Ok(format!(
+        "压缩完成：{before} tok -> {after} tok（摘要已注入，最近消息保留）"
+    ))
 }
 fn ctx_stats(ctx: &mut ToolCtx) -> Result<String, String> {
     let msgs = ctx.store.current().messages;
@@ -1599,9 +1759,14 @@ fn qq_send(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     }
     match ctx.qq_tx {
         Some(tx) => {
-            tx.send(QqOut { chat: chat.to_string(), text: text.to_string() })
-                .map_err(|_| "QQ 桥接通道已关闭".to_string())?;
-            Ok(format!("已投递 QQ 消息到 {chat}。本轮回复已发送完毕，请直接结束输出，不要再调用 qq_send"))
+            tx.send(QqOut {
+                chat: chat.to_string(),
+                text: text.to_string(),
+            })
+            .map_err(|_| "QQ 桥接通道已关闭".to_string())?;
+            Ok(format!(
+                "已投递 QQ 消息到 {chat}。本轮回复已发送完毕，请直接结束输出，不要再调用 qq_send"
+            ))
         }
         None => Err("QQ 桥接未运行（启动方式: yjlcoder --qq）".into()),
     }
@@ -1619,7 +1784,10 @@ fn qq_is_admin(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     if admins.contains(&qq) {
         Ok(format!("QQ {qq} 是管理员，可指挥 agent 操作电脑"))
     } else {
-        Ok(format!("QQ {qq} 不是管理员（普通用户，仅闲聊）。当前管理员列表: {:?}", admins))
+        Ok(format!(
+            "QQ {qq} 不是管理员（普通用户，仅闲聊）。当前管理员列表: {:?}",
+            admins
+        ))
     }
 }
 fn qq_add_admin(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -1641,13 +1809,21 @@ fn mem_dir_of(ctx: &ToolCtx) -> std::path::PathBuf {
 }
 fn chat_to_mem_id(chat: &str) -> Result<String, String> {
     if let Some(gid) = chat.strip_prefix("group:") {
-        let id: i64 = gid.trim().parse().map_err(|_| format!("群号格式错误: {gid}"))?;
+        let id: i64 = gid
+            .trim()
+            .parse()
+            .map_err(|_| format!("群号格式错误: {gid}"))?;
         Ok(format!("qq_g{id}"))
     } else if let Some(uid) = chat.strip_prefix("private:") {
-        let id: i64 = uid.trim().parse().map_err(|_| format!("QQ 号格式错误: {uid}"))?;
+        let id: i64 = uid
+            .trim()
+            .parse()
+            .map_err(|_| format!("QQ 号格式错误: {uid}"))?;
         Ok(format!("qq_u{id}"))
     } else {
-        Err(format!("chat 格式错误（应为 group:群号 或 private:QQ号）: {chat}"))
+        Err(format!(
+            "chat 格式错误（应为 group:群号 或 private:QQ号）: {chat}"
+        ))
     }
 }
 fn parse_mem_file(path: &Path) -> Vec<(String, String)> {
@@ -1684,7 +1860,11 @@ fn memory_search(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or("memory_search 需要 query 参数（搜索关键词）")?;
-    let chat = args.get("chat").and_then(|c| c.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let chat = args
+        .get("chat")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let mem_dir = mem_dir_of(ctx);
     let keywords: Vec<String> = query
         .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
@@ -1710,11 +1890,16 @@ fn memory_search(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         }
     }
     if files.is_empty() {
-        return Ok(format!("没有可搜索的记忆文件（{query}）。记忆由 QQ 对话自动记录，或由 memory_write 写入。"));
+        return Ok(format!(
+            "没有可搜索的记忆文件（{query}）。记忆由 QQ 对话自动记录，或由 memory_write 写入。"
+        ));
     }
     let mut hits: Vec<(String, String, String)> = Vec::new();
     for f in &files {
-        let fname = f.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let fname = f
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         for (time, content) in parse_mem_file(f) {
             if keywords.iter().all(|k| content.contains(k.as_str())) {
                 hits.push((time, content, fname.clone()));
@@ -1724,7 +1909,7 @@ fn memory_search(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     if hits.is_empty() {
         return Ok(format!("记忆中未找到与“{query}”相关的内容。"));
     }
-    hits.sort_by(|a, b| b.0.cmp(&a.0));                       
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
     let mut out = format!("找到 {} 条相关记忆（关键词: {query}）:\n", hits.len());
     let mut srcs: Vec<String> = Vec::new();
     for (time, content, src) in hits.into_iter().take(5) {
@@ -1761,24 +1946,63 @@ fn memory_write(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     }
     let mem_file = mem_dir.join(format!("{id}.md"));
     let entry = format!("\n## {}\n{}\n", crate::time::now_stamp(), content);
-    match std::fs::OpenOptions::new().create(true).append(true).open(&mem_file) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&mem_file)
+    {
         Ok(mut f) => {
             use std::io::Write;
             if f.write_all(entry.as_bytes()).is_err() {
                 return Err("记忆写入失败".into());
             }
-            Ok(format!("已写入记忆: {content}\n（文件: {}）", mem_file.display()))
+            Ok(format!(
+                "已写入记忆: {content}\n（文件: {}）",
+                mem_file.display()
+            ))
         }
         Err(e) => Err(format!("记忆文件打开失败: {e}")),
     }
 }
 fn ask_user(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
+    let (question_order, answers) = request_user_answers(args, ctx)?;
+    let mut ordered_answers: Vec<(&String, &String)> = question_order
+        .iter()
+        .filter_map(|question| answers.get(question).map(|answer| (question, answer)))
+        .collect();
+    ordered_answers.extend(
+        answers
+            .iter()
+            .filter(|(question, _)| !question_order.contains(question)),
+    );
+    let answers_text = ordered_answers
+        .into_iter()
+        .map(|(question, answer)| {
+            format!(
+                "{}={}",
+                serde_json::to_string(question).unwrap_or_else(|_| format!("\"{question}\"")),
+                serde_json::to_string(answer).unwrap_or_else(|_| format!("\"{answer}\""))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "User has answered your questions: {answers_text}. You can now continue with the user's answers in mind."
+    ))
+}
+fn request_user_answers(
+    args: &Value,
+    ctx: &mut ToolCtx,
+) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
     let handle = ctx
         .ask
         .as_ref()
         .ok_or("当前模式不支持提问（ask_user 仅 TUI 交互可用）")?;
     let questions = parse_ask_questions(args)?;
-    let question_order: Vec<String> = questions.iter().map(|question| question.question.clone()).collect();
+    let question_order: Vec<String> = questions
+        .iter()
+        .map(|question| question.question.clone())
+        .collect();
     let id = handle.seq.fetch_add(1, Ordering::Relaxed);
     handle
         .tx
@@ -1790,35 +2014,22 @@ fn ask_user(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
         }
         match handle.rx.recv_timeout(Duration::from_millis(200)) {
             Ok(a) if a.id == id => {
-                let mut ordered_answers: Vec<(&String, &String)> = question_order
-                    .iter()
-                    .filter_map(|question| a.answers.get(question).map(|answer| (question, answer)))
-                    .collect();
-                ordered_answers.extend(
-                    a.answers
-                        .iter()
-                        .filter(|(question, _)| !question_order.contains(question)),
-                );
-                let answers_text = ordered_answers
-                    .into_iter()
-                    .map(|(question, answer)| {
-                        format!(
-                            "{}={}",
-                            serde_json::to_string(question).unwrap_or_else(|_| format!("\"{question}\"")),
-                            serde_json::to_string(answer).unwrap_or_else(|_| format!("\"{answer}\""))
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Ok(format!(
-                    "User has answered your questions: {answers_text}. You can now continue with the user's answers in mind."
-                ));
+                return Ok((question_order, a.answers));
             }
-            Ok(_) => continue,              
+            Ok(_) => continue,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Err("提问通道已断开".into()),
         }
     }
+}
+pub(crate) fn ask_user_answers(args: &Value, ctx: &mut ToolCtx) -> Result<Value, String> {
+    let (_, answers) = request_user_answers(args, ctx)?;
+    Ok(Value::Object(
+        answers
+            .into_iter()
+            .map(|(question, answer)| (question, Value::String(answer)))
+            .collect(),
+    ))
 }
 fn parse_ask_questions(args: &Value) -> Result<Vec<AskQuestion>, String> {
     let raw_questions: Vec<Value> = match args.get("questions") {
@@ -1832,18 +2043,15 @@ fn parse_ask_questions(args: &Value) -> Result<Vec<AskQuestion>, String> {
             .unwrap_or_default(),
     };
     if raw_questions.is_empty() {
-        return Err("ask_user 需要 questions（Claude Code 结构化问题数组；旧版字符串数组也兼容）".into());
+        return Err(
+            "ask_user 需要 questions（Claude Code 结构化问题数组；旧版字符串数组也兼容）".into(),
+        );
     }
     let mut questions = Vec::new();
     let mut used_questions = HashSet::new();
     for (index, raw) in raw_questions.into_iter().take(4).enumerate() {
         let (question, header, options, multi_select) = match raw {
-            Value::String(question) => (
-                question,
-                format!("问题{}", index + 1),
-                Vec::new(),
-                false,
-            ),
+            Value::String(question) => (question, format!("问题{}", index + 1), Vec::new(), false),
             Value::Object(object) => {
                 let question = object
                     .get("question")
@@ -2065,12 +2273,17 @@ mod tests {
             "multiSelect": false
         }]});
         let h = std::thread::spawn(move || {
-            let req = ask_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let req = ask_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             assert_eq!(req.id, 0);
             assert_eq!(req.questions.len(), 1);
             assert_eq!(req.questions[0].question, "你想看哪个配置文件？");
             assert_eq!(req.questions[0].header, "配置文件");
-            assert_eq!(req.questions[0].options[1].preview.as_deref(), Some("config.json"));
+            assert_eq!(
+                req.questions[0].options[1].preview.as_deref(),
+                Some("config.json")
+            );
             answer_tx
                 .send(AskAnswer {
                     id: req.id,
@@ -2094,8 +2307,13 @@ mod tests {
         std::thread::spawn(move || {
             let mut out = Vec::new();
             for decision in decisions {
-                let req = perm_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                let _ = dec_tx.send(PermDecision { id: req.id, decision });
+                let req = perm_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let _ = dec_tx.send(PermDecision {
+                    id: req.id,
+                    decision,
+                });
                 out.push(req);
             }
             out
@@ -2109,7 +2327,12 @@ mod tests {
         let (dec_tx, dec_rx) = std::sync::mpsc::channel();
         t.with_perm(perm_tx, dec_rx);
         let answerer = spawn_perm_answerer(perm_rx, dec_tx, vec![PermDecisionKind::Yes]);
-        let r = execute("execute_command", &json!({"cmd": "echo perm-yes"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "echo perm-yes"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         let reqs = answerer.join().unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].id, 0, "请求号从 0 起");
@@ -2126,10 +2349,21 @@ mod tests {
         let (dec_tx, dec_rx) = std::sync::mpsc::channel();
         t.with_perm(perm_tx, dec_rx);
         let answerer = spawn_perm_answerer(perm_rx, dec_tx, vec![PermDecisionKind::No]);
-        let err = execute("execute_command", &json!({"cmd": "echo blocked"}), &mut t.ctx()).unwrap_err();
+        let err = execute(
+            "execute_command",
+            &json!({"cmd": "echo blocked"}),
+            &mut t.ctx(),
+        )
+        .unwrap_err();
         answerer.join().unwrap();
-        assert!(err.contains("用户拒绝了命令执行"), "拒绝原因要讲清楚: {err}");
-        assert!(err.contains("echo blocked"), "拒绝信息里带上命令原文: {err}");
+        assert!(
+            err.contains("用户拒绝了命令执行"),
+            "拒绝原因要讲清楚: {err}"
+        );
+        assert!(
+            err.contains("echo blocked"),
+            "拒绝信息里带上命令原文: {err}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -2144,11 +2378,22 @@ mod tests {
             dec_tx,
             vec![PermDecisionKind::AlwaysAllow, PermDecisionKind::No],
         );
-        let r = execute("execute_command", &json!({"cmd": "echo first"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "echo first"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("first"));
-        let r2 = execute("execute_command", &json!({"cmd": "echo second"}), &mut t.ctx()).unwrap();
+        let r2 = execute(
+            "execute_command",
+            &json!({"cmd": "echo second"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r2.contains("second"));
-        let err = execute("execute_command", &json!({"cmd": "uname -s"}), &mut t.ctx()).unwrap_err();
+        let err =
+            execute("execute_command", &json!({"cmd": "uname -s"}), &mut t.ctx()).unwrap_err();
         assert!(err.contains("用户拒绝了命令执行"));
         let reqs = answerer.join().unwrap();
         assert_eq!(reqs.len(), 2, "两条请求都应发出并消费");
@@ -2164,9 +2409,17 @@ mod tests {
         let (_dec_tx, dec_rx) = std::sync::mpsc::channel();
         t.with_perm(perm_tx, dec_rx);
         t.perm_auto.store(true, Ordering::Relaxed);
-        let r = execute("execute_command", &json!({"cmd": "echo auto"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "echo auto"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("auto"));
-        assert_eq!(perm_rx.try_recv().unwrap_err(), std::sync::mpsc::TryRecvError::Empty);
+        assert_eq!(
+            perm_rx.try_recv().unwrap_err(),
+            std::sync::mpsc::TryRecvError::Empty
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -2177,18 +2430,36 @@ mod tests {
         let (dec_tx, dec_rx) = std::sync::mpsc::channel();
         t.with_perm(perm_tx, dec_rx);
         let answerer = std::thread::spawn(move || {
-            let req = perm_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            let _ = dec_tx.send(PermDecision { id: req.id, decision: PermDecisionKind::AutoEnable });
+            let req = perm_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let _ = dec_tx.send(PermDecision {
+                id: req.id,
+                decision: PermDecisionKind::AutoEnable,
+            });
             match perm_rx.recv_timeout(std::time::Duration::from_millis(300)) {
                 Ok(extra) => panic!("auto 开启后仍收到请求: {extra:?}"),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(e) => panic!("通道异常: {e}"),
             }
         });
-        let r = execute("execute_command", &json!({"cmd": "echo first"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "echo first"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("first"), "AutoEnable 也放行本条命令: {r}");
-        assert!(t.perm_auto.load(Ordering::Relaxed), "AutoEnable 应开启 auto 标志");
-        let r2 = execute("execute_command", &json!({"cmd": "echo second"}), &mut t.ctx()).unwrap();
+        assert!(
+            t.perm_auto.load(Ordering::Relaxed),
+            "AutoEnable 应开启 auto 标志"
+        );
+        let r2 = execute(
+            "execute_command",
+            &json!({"cmd": "echo second"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r2.contains("second"));
         answerer.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2214,10 +2485,15 @@ mod tests {
         t.with_ask(ask_tx, answer_rx);
         let args0 = serde_json::json!({"question": "第一个问题"});
         let h0 = std::thread::spawn(move || {
-            let req = ask_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let req = ask_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             assert_eq!(req.id, 0);
             assert_eq!(req.questions[0].question, "第一个问题");
-            assert!(req.questions[0].options.is_empty(), "旧版自由文本问题保持兼容");
+            assert!(
+                req.questions[0].options.is_empty(),
+                "旧版自由文本问题保持兼容"
+            );
             answer_tx
                 .send(AskAnswer {
                     id: 99,
@@ -2254,7 +2530,10 @@ mod tests {
         assert_eq!(questions[0].header.chars().count(), 12);
         assert_eq!(questions[0].options.len(), 4, "去重并限制为 4 个选项");
         assert!(questions[0].multi_select);
-        assert_ne!(questions[0].question, questions[1].question, "重复问题文本必须变成唯一键");
+        assert_ne!(
+            questions[0].question, questions[1].question,
+            "重复问题文本必须变成唯一键"
+        );
         assert_eq!(questions[1].options[1].description, "自己控制");
     }
     #[test]
@@ -2295,13 +2574,28 @@ mod tests {
         let f = d.join("t.txt");
         let p = f.to_string_lossy().into_owned();
         let mut t = TestCtx::new(d.clone());
-        let r = execute("writefile", &json!({"path": p, "content": "hello\nworld\n"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "writefile",
+            &json!({"path": p, "content": "hello\nworld\n"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("已写入"));
-        let r = execute("editline", &json!({"path": p, "old": "world", "new": "rust"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "editline",
+            &json!({"path": p, "old": "world", "new": "rust"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("已替换"));
         let r = execute("readline", &json!({"path": p}), &mut t.ctx()).unwrap();
         assert!(r.contains("rust"));
-        execute("appendline", &json!({"path": p, "content": "third"}), &mut t.ctx()).unwrap();
+        execute(
+            "appendline",
+            &json!({"path": p, "content": "third"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&p).unwrap();
         assert!(content.contains("third"));
         let _ = std::fs::remove_dir_all(&d);
@@ -2363,7 +2657,10 @@ mod tests {
         .unwrap();
         assert!(plain.contains("file\tvisible"));
         assert!(!plain.contains(".hidden"));
-        assert!(!plain.contains("exit code:"), "simple ls should use listdir: {plain}");
+        assert!(
+            !plain.contains("exit code:"),
+            "simple ls should use listdir: {plain}"
+        );
         let all = execute(
             "execute_command",
             &json!({"cmd":"ls -la", "cwd":d}),
@@ -2392,12 +2689,16 @@ mod tests {
         )
         .unwrap();
         assert!(past.contains("Entries: 1 total; offset 99 is past the end."));
-        assert!(execute("listdir", &json!({"path": d, "limit":0}), &mut t.ctx())
-            .unwrap_err()
-            .contains("大于 0"));
-        assert!(execute("listdir", &json!({"path": d, "limit":1001}), &mut t.ctx())
-            .unwrap_err()
-            .contains("不能超过 1000"));
+        assert!(
+            execute("listdir", &json!({"path": d, "limit":0}), &mut t.ctx())
+                .unwrap_err()
+                .contains("大于 0")
+        );
+        assert!(
+            execute("listdir", &json!({"path": d, "limit":1001}), &mut t.ctx())
+                .unwrap_err()
+                .contains("不能超过 1000")
+        );
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&store);
     }
@@ -2407,7 +2708,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("range.txt");
-        let content = (1..=2_105).map(|line| format!("line-{line}\n")).collect::<String>();
+        let content = (1..=2_105)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
         std::fs::write(&f, content).unwrap();
         let mut t = TestCtx::new(d.clone());
         let ranged = execute(
@@ -2434,7 +2737,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("large.txt");
-        let content = "abcdefghij\n".repeat(30_000);            
+        let content = "abcdefghij\n".repeat(30_000);
         std::fs::write(&f, content).unwrap();
         let mut t = TestCtx::new(d.clone());
         let error = execute("readline", &json!({"path": f}), &mut t.ctx()).unwrap_err();
@@ -2506,21 +2809,30 @@ mod tests {
         .unwrap();
         assert!(result.contains("容错匹配"));
         let edited = std::fs::read_to_string(&f).unwrap();
-        assert!(edited.starts_with("keep   \r\n"), "未触及行必须保持尾随空格和 CRLF");
+        assert!(
+            edited.starts_with("keep   \r\n"),
+            "未触及行必须保持尾随空格和 CRLF"
+        );
         assert!(edited.contains("let s = \"new\";\r\n"));
         assert!(edited.ends_with("last\r\n"));
         let _ = std::fs::remove_dir_all(&d);
     }
     #[test]
     fn editline_refuses_ambiguous_matches() {
-        let d = std::env::temp_dir().join(format!("yjlcoder_edit_ambiguous_{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("yjlcoder_edit_ambiguous_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("ambiguous.txt");
         std::fs::write(&f, "same\nsame\n").unwrap();
         let p = f.to_string_lossy().into_owned();
         let mut t = TestCtx::new(d.clone());
-        let error = execute("editline", &json!({"path": p, "old": "same", "new": "x"}), &mut t.ctx()).unwrap_err();
+        let error = execute(
+            "editline",
+            &json!({"path": p, "old": "same", "new": "x"}),
+            &mut t.ctx(),
+        )
+        .unwrap_err();
         assert!(error.contains("2 处匹配"));
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "same\nsame\n");
         let _ = std::fs::remove_dir_all(&d);
@@ -2563,14 +2875,27 @@ mod tests {
         let r = execute("grep", &json!({"pattern": "wifi", "path": p}), &mut t.ctx()).unwrap();
         assert!(r.contains("命中"), "单文件 grep 应命中: {r}");
         assert!(r.contains("wifi = true"));
-        let r2 = execute("grep", &json!({"pattern": "nomatch", "path": p}), &mut t.ctx()).unwrap();
-        assert!(r2.contains("扫描 1 个文件"), "未命中时也应报告扫描 1 个文件: {r2}");
+        let r2 = execute(
+            "grep",
+            &json!({"pattern": "nomatch", "path": p}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert!(
+            r2.contains("扫描 1 个文件"),
+            "未命中时也应报告扫描 1 个文件: {r2}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
     #[test]
     fn execute_command_shell() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_exec_store"));
-        let r = execute("execute_command", &json!({"cmd": "echo yjlcoder-test"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "echo yjlcoder-test"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("yjlcoder-test"));
     }
     #[test]
@@ -2583,8 +2908,15 @@ mod tests {
             &mut t.ctx(),
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5), "large pipe output deadlocked");
-        assert!(r.starts_with("exit code: 0\n"), "r: {}", &r[..r.len().min(200)]);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "large pipe output deadlocked"
+        );
+        assert!(
+            r.starts_with("exit code: 0\n"),
+            "r: {}",
+            &r[..r.len().min(200)]
+        );
         assert!(r.len() >= 1_000_000);
     }
     #[test]
@@ -2635,7 +2967,10 @@ mod tests {
             &mut t.ctx(),
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(3), "timeout did not return promptly");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout did not return promptly"
+        );
         assert!(r.starts_with("exit code: 124\n"), "r: {r}");
         let pid = r
             .lines()
@@ -2708,12 +3043,18 @@ mod tests {
     #[test]
     fn execute_command_dispatches_op() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_dispatch_store"));
-        let r = execute("execute_command", &json!({"op": "list_tools", "args": {}}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"op": "list_tools", "args": {}}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("[file]"));
     }
     #[test]
     fn fuck_master_is_a_persistent_system_tool() {
-        let dir = std::env::temp_dir().join(format!("yjlcoder_fuck_master_tool_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("yjlcoder_fuck_master_tool_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut t = TestCtx::new(dir.join("sessions"));
         t.cfg.set_test_data_dir(dir.clone());
@@ -2723,7 +3064,8 @@ mod tests {
             "FuckMaster",
             &json!({"action":"add","goal":"推进学习路线","every":"1h"}),
             &mut t.ctx(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(added.contains("fm-0001"));
         let listed = execute("fuck_master", &json!({"action":"list"}), &mut t.ctx()).unwrap();
         assert!(listed.contains("推进学习路线"));
@@ -2764,9 +3106,11 @@ mod tests {
         )
         .unwrap();
         assert!(output.contains("registered-ok"));
-        assert!(execute("list_tools", &json!({"category":"custom"}), &mut t.ctx())
-            .unwrap()
-            .contains("system_status_test"));
+        assert!(
+            execute("list_tools", &json!({"category":"custom"}), &mut t.ctx())
+                .unwrap()
+                .contains("system_status_test")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
@@ -2792,19 +3136,34 @@ mod tests {
     #[test]
     fn execute_command_self_op_runs_cmd() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_selfop_store"));
-        let r = execute("execute_command", &json!({"cmd": "echo hi", "op": "execute_command"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": "echo hi", "op": "execute_command"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("hi"), "r: {r}");
     }
     #[test]
     fn execute_command_nested_self_op() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_nestop_store"));
-        let r = execute("execute_command", &json!({"op": "execute_command", "args": {"cmd": "echo nested"}}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"op": "execute_command", "args": {"cmd": "echo nested"}}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("nested"), "r: {r}");
     }
     #[test]
     fn execute_command_flat_op_form() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_flatop_store"));
-        let r = execute("execute_command", &json!({"op": "list_tools"}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"op": "list_tools"}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("[file]"), "r: {r}");
     }
     #[test]
@@ -2812,22 +3171,45 @@ mod tests {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_kw_store"));
         let p = std::env::temp_dir().join("yjlcoder_kw.txt");
         std::fs::write(&p, "kw-content").unwrap();
-        let r = execute("execute_command", &json!({"cmd": format!("读取 {}", p.display())}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "execute_command",
+            &json!({"cmd": format!("读取 {}", p.display())}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("kw-content"), "r: {r}");
         let _ = std::fs::remove_file(&p);
     }
     #[test]
     fn keyword_tool_mapping() {
-        assert_eq!(keyword_tool("搜索 马斯克"), Some(("web_search", json!({"query": "马斯克"}))));
-        assert_eq!(keyword_tool("搜索马斯克"), Some(("web_search", json!({"query": "马斯克"}))));
-        assert_eq!(keyword_tool("查一下 rust async"), Some(("web_search", json!({"query": "rust async"}))));
-        assert_eq!(keyword_tool("帮我搜索一下rust"), Some(("web_search", json!({"query": "rust"}))));
-        assert_eq!(keyword_tool("search foo bar"), Some(("web_search", json!({"query": "foo bar"}))));
+        assert_eq!(
+            keyword_tool("搜索 马斯克"),
+            Some(("web_search", json!({"query": "马斯克"})))
+        );
+        assert_eq!(
+            keyword_tool("搜索马斯克"),
+            Some(("web_search", json!({"query": "马斯克"})))
+        );
+        assert_eq!(
+            keyword_tool("查一下 rust async"),
+            Some(("web_search", json!({"query": "rust async"})))
+        );
+        assert_eq!(
+            keyword_tool("帮我搜索一下rust"),
+            Some(("web_search", json!({"query": "rust"})))
+        );
+        assert_eq!(
+            keyword_tool("search foo bar"),
+            Some(("web_search", json!({"query": "foo bar"})))
+        );
         assert_eq!(
             keyword_tool("抓取 https://example.com/a b"),
             Some(("web_fetch", json!({"url": "https://example.com/a"})))
         );
-        assert_eq!(keyword_tool("读取 Cargo.toml"), Some(("readline", json!({"path": "Cargo.toml"}))));
+        assert_eq!(
+            keyword_tool("读取 Cargo.toml"),
+            Some(("readline", json!({"path": "Cargo.toml"})))
+        );
         assert_eq!(
             keyword_tool("读取 ~/.config/noctalia/noctalia-config.toml，告诉我第129行"),
             Some((
@@ -2863,16 +3245,40 @@ mod tests {
         {
             let mut ctx = t.ctx();
             ctx.qq_tx = Some(&tx);
-            let r = execute("qq_send", &json!({"chat": "group:3160168215", "text": "hi"}), &mut ctx);
+            let r = execute(
+                "qq_send",
+                &json!({"chat": "group:3160168215", "text": "hi"}),
+                &mut ctx,
+            );
             let e = r.unwrap_err();
             assert!(e.contains("白名单"), "e: {e}");
-            assert!(execute("qq_send", &json!({"chat": "private:999", "text": "hi"}), &mut ctx).is_err());
+            assert!(execute(
+                "qq_send",
+                &json!({"chat": "private:999", "text": "hi"}),
+                &mut ctx
+            )
+            .is_err());
             assert!(execute("qq_send", &json!({"chat": "abc", "text": "hi"}), &mut ctx).is_err());
-            assert!(execute("qq_send", &json!({"chat": "group:728563593", "text": ""}), &mut ctx).is_err());
-            let r = execute("qq_send", &json!({"chat": "group:728563593", "text": "你好"}), &mut ctx).unwrap();
+            assert!(execute(
+                "qq_send",
+                &json!({"chat": "group:728563593", "text": ""}),
+                &mut ctx
+            )
+            .is_err());
+            let r = execute(
+                "qq_send",
+                &json!({"chat": "group:728563593", "text": "你好"}),
+                &mut ctx,
+            )
+            .unwrap();
             assert!(r.contains("已投递"), "r: {r}");
             assert_eq!(rx.try_recv().unwrap().chat, "group:728563593");
-            let r = execute("qq_send", &json!({"chat": "private:3160168215", "text": "hi"}), &mut ctx).unwrap();
+            let r = execute(
+                "qq_send",
+                &json!({"chat": "private:3160168215", "text": "hi"}),
+                &mut ctx,
+            )
+            .unwrap();
             assert!(r.contains("已投递"), "r: {r}");
             assert_eq!(rx.try_recv().unwrap().chat, "private:3160168215");
         }
@@ -2881,7 +3287,12 @@ mod tests {
     #[test]
     fn portscan_localhost() {
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_scan_store"));
-        let r = execute("portscan", &json!({"host": "127.0.0.1", "ports": "22,1", "timeout_ms": 300}), &mut t.ctx()).unwrap();
+        let r = execute(
+            "portscan",
+            &json!({"host": "127.0.0.1", "ports": "22,1", "timeout_ms": 300}),
+            &mut t.ctx(),
+        )
+        .unwrap();
         assert!(r.contains("127.0.0.1"));
     }
     #[test]
@@ -2903,9 +3314,24 @@ mod tests {
         {
             let mut ctx = t.ctx_with_mem(d.clone());
             assert!(execute("memory_write", &json!({"content": "x"}), &mut ctx).is_err());
-            assert!(execute("memory_write", &json!({"chat": "group:728563593"}), &mut ctx).is_err());
-            assert!(execute("memory_write", &json!({"chat": "abc", "content": "x"}), &mut ctx).is_err());
-            let r = execute("memory_write", &json!({"chat": "group:728563593", "content": "刚才搜索马斯克"}), &mut ctx).unwrap();
+            assert!(execute(
+                "memory_write",
+                &json!({"chat": "group:728563593"}),
+                &mut ctx
+            )
+            .is_err());
+            assert!(execute(
+                "memory_write",
+                &json!({"chat": "abc", "content": "x"}),
+                &mut ctx
+            )
+            .is_err());
+            let r = execute(
+                "memory_write",
+                &json!({"chat": "group:728563593", "content": "刚才搜索马斯克"}),
+                &mut ctx,
+            )
+            .unwrap();
             assert!(r.contains("已写入记忆"), "r: {r}");
         }
         let f = d.join("qq_g728563593.md");
@@ -2926,19 +3352,39 @@ mod tests {
         .unwrap();
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_mem_store3"));
         let mut ctx = t.ctx_with_mem(d.clone());
-        let r = execute("memory_search", &json!({"query": "马斯克", "chat": "group:728563593"}), &mut ctx).unwrap();
+        let r = execute(
+            "memory_search",
+            &json!({"query": "马斯克", "chat": "group:728563593"}),
+            &mut ctx,
+        )
+        .unwrap();
         assert!(r.contains("找到 2 条相关记忆"), "r: {r}");
         let idx_recent = r.find("马斯克喜欢发推特").unwrap();
         let idx_old = r.find("刚才搜索马斯克").unwrap();
         assert!(idx_recent < idx_old, "时间倒序: {r}");
         assert!(r.contains("readline"), "应提示读全文: {r}");
-        let r2 = execute("memory_search", &json!({"query": "马斯克 nemotron"}), &mut ctx).unwrap();
+        let r2 = execute(
+            "memory_search",
+            &json!({"query": "马斯克 nemotron"}),
+            &mut ctx,
+        )
+        .unwrap();
         assert!(r2.contains("找到 1 条"), "AND 优先: {r2}");
         assert!(r2.contains("nemotron"), "{r2}");
-        let r3 = execute("memory_search", &json!({"query": "不存在的东西xyz"}), &mut ctx).unwrap();
+        let r3 = execute(
+            "memory_search",
+            &json!({"query": "不存在的东西xyz"}),
+            &mut ctx,
+        )
+        .unwrap();
         assert!(r3.contains("未找到"), "r3: {r3}");
         assert!(execute("memory_search", &json!({"query": ""}), &mut ctx).is_err());
-        let r4 = execute("memory_search", &json!({"query": "马斯克", "chat": "group:999"}), &mut ctx).unwrap();
+        let r4 = execute(
+            "memory_search",
+            &json!({"query": "马斯克", "chat": "group:999"}),
+            &mut ctx,
+        )
+        .unwrap();
         assert!(r4.contains("没有可搜索的记忆文件"), "r4: {r4}");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2953,7 +3399,12 @@ mod tests {
         .unwrap();
         let mut t = TestCtx::new(std::env::temp_dir().join("yjlcoder_mem_store4"));
         let mut ctx = t.ctx_with_mem(d.clone());
-        let r = execute("memory_search", &json!({"query": "马斯克", "chat": "group:728563593"}), &mut ctx).unwrap();
+        let r = execute(
+            "memory_search",
+            &json!({"query": "马斯克", "chat": "group:728563593"}),
+            &mut ctx,
+        )
+        .unwrap();
         assert!(r.contains("[2026-08-13 14:00]"), "时间戳来自节标题: {r}");
         assert!(r.contains("马斯克"), "r: {r}");
         let _ = std::fs::remove_dir_all(&d);
@@ -2961,7 +3412,10 @@ mod tests {
     #[test]
     fn chat_to_mem_id_mapping() {
         assert_eq!(chat_to_mem_id("group:728563593").unwrap(), "qq_g728563593");
-        assert_eq!(chat_to_mem_id("private:3160168215").unwrap(), "qq_u3160168215");
+        assert_eq!(
+            chat_to_mem_id("private:3160168215").unwrap(),
+            "qq_u3160168215"
+        );
         assert!(chat_to_mem_id("abc").is_err());
         assert!(chat_to_mem_id("group:abc").is_err());
     }

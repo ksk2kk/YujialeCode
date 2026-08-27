@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -9,10 +10,15 @@ const POST_TOOL_REASONING_MAX: usize = 512;
 const PLAN_LOOP_TOOL_BLOCKS: usize = 3;
 const TAIL_REPEAT_WINDOW: usize = 40;
 const TAIL_REPEAT_MIN: usize = 3;
+const APPROX_IMAGE_TOKENS: usize = 1_024;
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Msg {
     pub role: String,
     pub content: String,
+    /// Some OpenAI-compatible reasoning APIs (notably DeepSeek) require the
+    /// exact reasoning text to be echoed with an assistant tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Local screenshot path. It is persisted as a small path rather than a
     /// base64 blob; only the newest still-relevant frame is encoded for a
     /// vision-capable backend when the request is built.
@@ -38,7 +44,15 @@ pub struct ToolCall {
 pub enum StreamEvent {
     Delta(String),
     Reasoning(String),
+    TokenProgress(TokenProgress),
     Garbage { kind: &'static str, sample: String, run: usize, total: usize, limit: usize },
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenProgress {
+    pub usage: Usage,
+    /// False means the upload count is a local preflight estimate. True means
+    /// the numbers came from the provider's usage object.
+    pub exact: bool,
 }
 #[derive(Debug, Clone, Default)]
 pub struct ChatResult {
@@ -50,14 +64,16 @@ pub struct ChatResult {
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct Usage {
-    #[serde(default)]
+    #[serde(default, alias = "input_tokens")]
     pub prompt_tokens: usize,
-    #[serde(default)]
+    #[serde(default, alias = "output_tokens")]
     pub completion_tokens: usize,
     #[serde(default, alias = "prompt_cache_hit_tokens", alias = "cache_read_input_tokens")]
     pub cache_read_tokens: usize,
     #[serde(default, alias = "prompt_cache_miss_tokens", alias = "cache_creation_input_tokens")]
     pub cache_miss_tokens: usize,
+    #[serde(default, skip_deserializing)]
+    pub reasoning_tokens: usize,
     #[serde(default, skip_deserializing)]
     pub cache_prefix_hits: usize,
     #[serde(default, skip_deserializing)]
@@ -67,7 +83,7 @@ pub struct Usage {
 }
 impl Usage {
     pub fn server_cache_percent(self) -> Option<f64> {
-        if self.cache_read_tokens == 0 {
+        if self.cache_read_tokens == 0 && self.cache_miss_tokens == 0 {
             return None;
         }
         let denominator = if self.cache_miss_tokens > 0 {
@@ -110,6 +126,7 @@ impl Llm {
                 std::time::Instant::now() - Duration::from_secs(60),
             )),
             cache_tracker: Arc::new(Mutex::new(RequestCacheTracker::default())),
+            prompt_calibration: Arc::new(Mutex::new(PromptCalibration::default())),
         })
     }
     pub fn mock() -> Self {
@@ -124,6 +141,25 @@ impl Llm {
     pub fn set_model(&self, name: String) {
         if let Llm::Remote(c) = self {
             *c.model.lock().unwrap() = name;
+        }
+    }
+    /// Creates an inference client with an independent model selector. A plain
+    /// `Clone` intentionally shares the selector for live `/model` updates;
+    /// background agents must not use that clone because selecting their cheap
+    /// model would silently switch the user's main conversation too.
+    pub fn fork_with_model(&self, model: &str) -> Self {
+        match self {
+            Llm::Remote(client) => {
+                let mut child = client.clone();
+                child.model = Arc::new(Mutex::new(if model.trim().is_empty() {
+                    client.model.lock().unwrap().clone()
+                } else {
+                    model.trim().to_string()
+                }));
+                child.cache_tracker = Arc::new(Mutex::new(RequestCacheTracker::default()));
+                Llm::Remote(child)
+            }
+            Llm::Mock(_) => Llm::mock(),
         }
     }
     pub fn stream(
@@ -205,10 +241,16 @@ impl Llm {
     }
     pub fn supports_vision(&self) -> bool {
         match self {
-            Llm::Remote(c) => c
-                .server_caps
-                .lock()
-                .map(|caps| {
+            Llm::Remote(c) => {
+                let model_looks_visual = c
+                    .model
+                    .lock()
+                    .map(|model| {
+                        let model = model.to_ascii_lowercase();
+                        model.contains("vision") || model.contains("vl") || model.contains("multimodal")
+                    })
+                    .unwrap_or(false);
+                model_looks_visual || c.server_caps.lock().map(|caps| {
                     caps.modalities.iter().any(|modality| {
                         matches!(
                             modality.to_ascii_lowercase().as_str(),
@@ -216,7 +258,8 @@ impl Llm {
                         )
                     })
                 })
-                .unwrap_or(false),
+                .unwrap_or(false)
+            }
             Llm::Mock(_) => false,
         }
     }
@@ -227,18 +270,61 @@ impl Llm {
         };
         crate::backend::derive_max_tokens(&caps, kind, qq_max)
     }
+    pub fn estimate_prompt_tokens(&self, req: &ChatRequest) -> usize {
+        let messages: Vec<Value> = req.messages.iter().map(to_openai_msg).collect();
+        let image_count = usize::from(self.supports_vision() && live_image_path(&req.messages).is_some());
+        let raw = approximate_prompt_tokens(&messages, &req.tools, image_count);
+        match self {
+            Llm::Remote(client) => {
+                let model = client.model.lock().unwrap().clone();
+                client.calibrated_prompt_tokens(&model, raw)
+            }
+            Llm::Mock(_) => raw,
+        }
+    }
+}
+#[derive(Debug, Default)]
+struct PromptCalibration {
+    factors: HashMap<String, f64>,
+}
+impl PromptCalibration {
+    fn factor(&self, model: &str) -> f64 {
+        self.factors
+            .get(&model.to_ascii_lowercase())
+            .copied()
+            .unwrap_or_else(|| default_prompt_factor(model))
+    }
+    fn observe(&mut self, model: &str, raw: usize, exact: usize) {
+        if raw == 0 || exact == 0 {
+            return;
+        }
+        let observed = (exact as f64 / raw as f64).clamp(0.5, 4.0);
+        self.factors
+            .entry(model.to_ascii_lowercase())
+            .and_modify(|factor| *factor = *factor * 0.75 + observed * 0.25)
+            .or_insert(observed);
+    }
+}
+fn default_prompt_factor(model: &str) -> f64 {
+    if crate::backend::known_model_context_window(model).is_some() {
+        1.6
+    } else {
+        1.0
+    }
 }
 #[derive(Debug, Clone, Default)]
 struct RequestCacheSnapshot {
     model: String,
     tools: Option<Value>,
     messages: Vec<Value>,
+    approx_prompt_tokens: usize,
 }
 #[derive(Debug, Clone, Copy, Default)]
 struct CacheObservation {
     has_previous: bool,
     stable_prefix: bool,
     prefix_messages: usize,
+    estimated_prefix_tokens: usize,
 }
 #[derive(Debug, Default)]
 struct RequestCacheTracker {
@@ -256,6 +342,11 @@ impl RequestCacheTracker {
                     has_previous: true,
                     stable_prefix: stable,
                     prefix_messages: if stable { previous.messages.len() } else { 0 },
+                    estimated_prefix_tokens: if stable {
+                        previous.approx_prompt_tokens
+                    } else {
+                        0
+                    },
                 }
             }
             None => CacheObservation::default(),
@@ -264,6 +355,11 @@ impl RequestCacheTracker {
             model: model.to_string(),
             tools: tools.clone(),
             messages: messages.to_vec(),
+            approx_prompt_tokens: approximate_prompt_tokens(
+                messages,
+                tools,
+                count_image_values(messages),
+            ),
         });
         observation
     }
@@ -280,6 +376,7 @@ pub struct RemoteClient {
     pub server_caps: Arc<Mutex<crate::backend::Capabilities>>,
     pub last_reload: Arc<Mutex<std::time::Instant>>,
     cache_tracker: Arc<Mutex<RequestCacheTracker>>,
+    prompt_calibration: Arc<Mutex<PromptCalibration>>,
 }
 enum HttpEvent {
     Headers(u16),
@@ -462,6 +559,10 @@ pub(crate) fn api_origin(base_url: &str) -> &str {
     let base = base.strip_suffix("/chat/completions").unwrap_or(base);
     base.strip_suffix("/v1").unwrap_or(base)
 }
+fn is_deepseek_api(base_url: &str) -> bool {
+    let origin = api_origin(base_url).to_ascii_lowercase();
+    origin == "https://api.deepseek.com" || origin == "https://api.deepseek.com/"
+}
 fn is_loopback_http_origin(origin: &str) -> bool {
     let Some(authority) = origin.strip_prefix("http://").map(|s| s.split('/').next().unwrap_or(s)) else {
         return false;
@@ -615,6 +716,19 @@ pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String>
     Ok(ids)
 }
 impl RemoteClient {
+    fn calibrated_prompt_tokens(&self, model: &str, raw: usize) -> usize {
+        let factor = self
+            .prompt_calibration
+            .lock()
+            .map(|calibration| calibration.factor(model))
+            .unwrap_or_else(|_| default_prompt_factor(model));
+        ((raw as f64 * factor).ceil() as usize).max(raw)
+    }
+    fn observe_prompt_usage(&self, model: &str, raw: usize, exact: usize) {
+        if let Ok(mut calibration) = self.prompt_calibration.lock() {
+            calibration.observe(model, raw, exact);
+        }
+    }
     fn stream(
         &self,
         req: &ChatRequest,
@@ -631,6 +745,7 @@ impl RemoteClient {
         disable_reasoning: bool,
     ) -> Result<ChatResult, String> {
         let model = self.model.lock().unwrap().clone();
+        let deepseek_api = is_deepseek_api(&self.base_url);
         let url = if self.bypass_local_llamacpp_router {
             discover_local_llamacpp_backend(&self.base_url, &self.api_key, &model, cancel)?
                 .unwrap_or_else(|| chat_url(&self.base_url))
@@ -668,17 +783,45 @@ impl RemoteClient {
         }
         if let Some(b) = self.thinking_budget {
             if !self.server_caps.lock().unwrap().is_llamacpp() {
-                payload["thinking"] = json!({ "type": "enabled", "budget_tokens": b });
+                payload["thinking"] = if deepseek_api {
+                    json!({ "type": "enabled" })
+                } else {
+                    json!({ "type": "enabled", "budget_tokens": b })
+                };
             }
         }
         if disable_reasoning {
-            payload["reasoning_effort"] = json!("none");
-            payload["chat_template_kwargs"] = json!({ "enable_thinking": false });
+            if deepseek_api {
+                payload["thinking"] = json!({ "type": "disabled" });
+            } else {
+                payload["reasoning_effort"] = json!("none");
+                payload["chat_template_kwargs"] = json!({ "enable_thinking": false });
+            }
         }
+        if req.stream && deepseek_api {
+            payload["stream_options"] = json!({ "include_usage": true });
+        }
+        let payload_text = payload.to_string();
+        let image_count = usize::from(live_image_path(&req.messages).is_some() && vision_available);
+        let raw_prompt_tokens =
+            approximate_prompt_tokens(&openai_messages, &req.tools, image_count);
+        let estimated_prompt_tokens = self.calibrated_prompt_tokens(&model, raw_prompt_tokens);
+        let estimated_cache_read = self
+            .calibrated_prompt_tokens(&model, cache_observation.estimated_prefix_tokens)
+            .min(estimated_prompt_tokens);
+        on_event(StreamEvent::TokenProgress(TokenProgress {
+            usage: Usage {
+                prompt_tokens: estimated_prompt_tokens,
+                cache_read_tokens: estimated_cache_read,
+                cache_miss_tokens: estimated_prompt_tokens.saturating_sub(estimated_cache_read),
+                ..Usage::default()
+            },
+            exact: false,
+        }));
         let http = CancellableHttp::post_json(
             url,
             self.api_key.clone(),
-            payload.to_string(),
+            payload_text,
             req.stream,
             Duration::from_secs(self.timeout_secs),
         )?;
@@ -694,6 +837,10 @@ impl RemoteClient {
         if !req.stream {
             let body = collect_http_body(&http, cancel)?;
             let mut result = parse_full_response(&body, on_event)?;
+            if let Some(usage) = result.usage {
+                self.observe_prompt_usage(&model, raw_prompt_tokens, usage.prompt_tokens);
+                on_event(StreamEvent::TokenProgress(TokenProgress { usage, exact: true }));
+            }
             attach_cache_observation(&mut result, cache_observation);
             return Ok(result);
         }
@@ -728,8 +875,11 @@ impl RemoteClient {
             if let Some(err) = v.get("error") {
                 return Err(format!("API 错误: {}", err));
             }
-            if let Some(usage) = v.get("usage") {
-                result.usage = Some(parse_usage(usage));
+            if let Some(usage_value) = v.get("usage").filter(|usage| usage.is_object()) {
+                let usage = parse_usage(usage_value);
+                self.observe_prompt_usage(&model, raw_prompt_tokens, usage.prompt_tokens);
+                result.usage = Some(usage);
+                on_event(StreamEvent::TokenProgress(TokenProgress { usage, exact: true }));
             }
             if let Some(timings) = v.get("timings") {
                 result.timings = serde_json::from_value::<Timings>(timings.clone()).ok();
@@ -803,14 +953,16 @@ impl RemoteClient {
                 } else {
                     REASONING_LOOP_MAX
                 };
-                if result.reasoning.chars().count() > reasoning_limit {
-                    break;
-                }
-                if count_complete_tool_blocks(&result.reasoning) >= PLAN_LOOP_TOOL_BLOCKS {
-                    break;
-                }
-                if tail_repeats(&result.reasoning, TAIL_REPEAT_WINDOW, TAIL_REPEAT_MIN) {
-                    break;
+                if !deepseek_api {
+                    if result.reasoning.chars().count() > reasoning_limit {
+                        break;
+                    }
+                    if count_complete_tool_blocks(&result.reasoning) >= PLAN_LOOP_TOOL_BLOCKS {
+                        break;
+                    }
+                    if tail_repeats(&result.reasoning, TAIL_REPEAT_WINDOW, TAIL_REPEAT_MIN) {
+                        break;
+                    }
                 }
             }
         }
@@ -1015,6 +1167,10 @@ fn parse_usage(value: &Value) -> Usage {
     {
         usage.cache_miss_tokens = usage.prompt_tokens - usage.cache_read_tokens;
     }
+    usage.reasoning_tokens = value
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
     usage
 }
 fn attach_cache_observation(result: &mut ChatResult, observation: CacheObservation) {
@@ -1051,6 +1207,12 @@ fn parse_full_response(body: &str, on_event: &mut impl FnMut(StreamEvent)) -> Re
         result.text = content.to_string();
         for chunk in split_chunks(content) {
             on_event(StreamEvent::Delta(chunk));
+        }
+    }
+    if let Some(reasoning) = msg.get("reasoning_content").and_then(|content| content.as_str()) {
+        result.reasoning = reasoning.to_string();
+        for chunk in split_chunks(reasoning) {
+            on_event(StreamEvent::Reasoning(chunk));
         }
     }
     if let Some(calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
@@ -1101,6 +1263,9 @@ fn split_chunks(s: &str) -> Vec<String> {
 }
 fn to_openai_msg(m: &Msg) -> Value {
     let mut v = json!({"role": m.role, "content": m.content});
+    if let Some(reasoning) = &m.reasoning_content {
+        v["reasoning_content"] = json!(reasoning);
+    }
     if !m.tool_calls.is_empty() {
         v["tool_calls"] = json!(m
             .tool_calls
@@ -1118,6 +1283,56 @@ fn to_openai_msg(m: &Msg) -> Value {
     v
 }
 
+fn approximate_prompt_tokens(
+    messages: &[Value],
+    tools: &Option<Value>,
+    image_count: usize,
+) -> usize {
+    let normalized: Vec<Value> = messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                        if let Some(url) = part.pointer_mut("/image_url/url") {
+                            *url = json!("<image>");
+                        }
+                    }
+                }
+            }
+            message
+        })
+        .collect();
+    compress::approx_token_count(&json!({"messages": normalized, "tools": tools}).to_string())
+        .saturating_add(image_count.saturating_mul(APPROX_IMAGE_TOKENS))
+}
+
+fn count_image_values(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+        .count()
+}
+
+fn live_image_path(messages: &[Msg]) -> Option<&str> {
+    let (index, path) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| message.image_path.as_deref().map(|path| (index, path)))?;
+    if messages[index + 1..]
+        .iter()
+        .any(|message| matches!(message.role.as_str(), "assistant" | "user"))
+    {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 fn to_openai_messages(messages: &[Msg], vision_available: bool) -> Vec<Value> {
     let mut out: Vec<Value> = messages.iter().map(to_openai_msg).collect();
     if !vision_available {
@@ -1127,20 +1342,9 @@ fn to_openai_messages(messages: &[Msg], vision_available: bool) -> Vec<Value> {
     // An old screenshot must not unexpectedly reappear on a later user turn.
     // Keep it live only while no later assistant/user message has superseded
     // the tool result. Trailing native tool responses are allowed.
-    let Some((index, path)) = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, message)| message.image_path.as_deref().map(|path| (index, path)))
-    else {
+    let Some(path) = live_image_path(messages) else {
         return out;
     };
-    if messages[index + 1..]
-        .iter()
-        .any(|message| matches!(message.role.as_str(), "assistant" | "user"))
-    {
-        return out;
-    }
 
     if let Ok(data_url) = crate::computer_use::image_data_url(path) {
         out.push(json!({
@@ -1179,11 +1383,13 @@ mod tests {
             "prompt_tokens": 1000,
             "completion_tokens": 20,
             "prompt_cache_hit_tokens": 800,
-            "prompt_cache_miss_tokens": 200
+            "prompt_cache_miss_tokens": 200,
+            "completion_tokens_details": {"reasoning_tokens": 12}
         }));
         assert_eq!(deepseek.cache_read_tokens, 800);
         assert_eq!(deepseek.cache_miss_tokens, 200);
         assert_eq!(deepseek.server_cache_percent(), Some(80.0));
+        assert_eq!(deepseek.reasoning_tokens, 12);
         let openai = parse_usage(&json!({
             "prompt_tokens": 500,
             "completion_tokens": 10,
@@ -1192,6 +1398,16 @@ mod tests {
         assert_eq!(openai.cache_read_tokens, 450);
         assert_eq!(openai.cache_miss_tokens, 50);
         assert_eq!(openai.server_cache_percent(), Some(90.0));
+        let anthropic = parse_usage(&json!({
+            "input_tokens": 300,
+            "output_tokens": 40,
+            "cache_read_input_tokens": 250,
+            "cache_creation_input_tokens": 50
+        }));
+        assert_eq!(anthropic.prompt_tokens, 300);
+        assert_eq!(anthropic.completion_tokens, 40);
+        assert_eq!(anthropic.cache_read_tokens, 250);
+        assert_eq!(anthropic.cache_miss_tokens, 50);
     }
     #[test]
     fn request_cache_tracker_requires_exact_append_only_prefix() {
@@ -1208,6 +1424,50 @@ mod tests {
         let miss = tracker.observe("m", &tools, &changed);
         assert!(miss.has_previous);
         assert!(!miss.stable_prefix);
+    }
+    #[test]
+    fn prompt_estimate_counts_all_message_fields_and_native_tools() {
+        let mut assistant = Msg::new("assistant", "调用工具");
+        assistant.reasoning_content = Some("内部推理".repeat(100));
+        assistant.tool_calls.push(ToolCall {
+            id: "call_1".into(),
+            name: "execute_command".into(),
+            args: r#"{"cmd":"printf very-long-argument"}"#.repeat(100),
+        });
+        let messages = vec![Msg::new("system", "系统提示"), assistant];
+        let without_tools = ChatRequest {
+            messages: messages.clone(),
+            tools: None,
+            max_tokens: None,
+            stream: true,
+        };
+        let with_tools = ChatRequest {
+            messages,
+            tools: Some(json!([{
+                "type": "function",
+                "function": {
+                    "name": "execute_command",
+                    "description": "执行命令".repeat(100),
+                    "parameters": {"type": "object"}
+                }
+            }])),
+            max_tokens: None,
+            stream: true,
+        };
+        let llm = Llm::mock();
+        let content_only = compress::approx_total_tokens(&without_tools.messages);
+        let full_without_tools = llm.estimate_prompt_tokens(&without_tools);
+        let full_with_tools = llm.estimate_prompt_tokens(&with_tools);
+        assert!(full_without_tools > content_only, "应计入角色、推理和工具参数");
+        assert!(full_with_tools > full_without_tools, "应计入原生工具定义");
+    }
+    #[test]
+    fn deepseek_prompt_estimate_learns_from_server_usage() {
+        let mut calibration = PromptCalibration::default();
+        assert_eq!(calibration.factor("deepseek-v4-flash"), 1.6);
+        calibration.observe("deepseek-v4-flash", 400, 660);
+        assert!((calibration.factor("deepseek-v4-flash") - 1.65).abs() < 1e-9);
+        assert_eq!(calibration.factor("other-model"), 1.0);
     }
     #[test]
     fn local_llamacpp_router_backend_is_discovered_safely() {
@@ -1268,6 +1528,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.text, "我需要查看工具");
+        assert_eq!(r.reasoning, "thinking...");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].id, "call_1");
         assert_eq!(r.tool_calls[0].name, "list_tools");
@@ -1304,6 +1565,7 @@ mod tests {
     #[test]
     fn to_openai_msg_native() {
         let mut m = Msg::new("assistant", "");
+        m.reasoning_content = Some("exact thought".into());
         m.tool_calls.push(ToolCall {
             id: "c1".into(),
             name: "execute_command".into(),
@@ -1311,6 +1573,7 @@ mod tests {
         });
         let v = to_openai_msg(&m);
         assert_eq!(v["tool_calls"][0]["function"]["name"], "execute_command");
+        assert_eq!(v["reasoning_content"], "exact thought");
     }
     #[test]
     fn old_session_without_image_path_still_deserializes() {

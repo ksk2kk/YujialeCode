@@ -132,6 +132,32 @@ pub const CATEGORIES: &[Category] = &[
         ],
     },
     Category {
+        id: "agent",
+        title: "受限后台 Agent（单并发、无嵌套、本地模型错峰）",
+        tools: &[
+            ToolDef {
+                name: "spawn_agent",
+                desc: "把一个独立的只读研究/检查任务交给后台 Agent。每个主回合最多创建 1 个；不要把同一任务拆成多个 Agent，也不要在本回合反复轮询",
+                args: "{\"task\":\"明确目标、范围、证据和期望返回内容\",\"name\":\"短名称\"}",
+            },
+            ToolDef {
+                name: "list_agents",
+                desc: "紧凑列出后台 Agent；传 id 查看状态和已有结果",
+                args: "{} 或 {\"id\":\"agent-...\"}",
+            },
+            ToolDef {
+                name: "wait_agent",
+                desc: "查看一个后台 Agent 的结果；本地模型排队时会立即返回，禁止同一回合循环调用",
+                args: "{\"id\":\"agent-...\",\"wait_secs\":0}",
+            },
+            ToolDef {
+                name: "stop_agent",
+                desc: "停止运行中或排队中的后台 Agent",
+                args: "{\"id\":\"agent-...\"}",
+            },
+        ],
+    },
+    Category {
         id: "goal",
         title: "持续目标",
         tools: &[

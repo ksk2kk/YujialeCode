@@ -12,9 +12,11 @@ mod md;
 mod prompt;
 mod qq;
 mod qq_bot;
+mod plugins;
 mod registry;
 mod session;
 mod setup;
+mod subagents;
 mod skills;
 mod time;
 mod tool_compat;
@@ -24,6 +26,7 @@ mod tui;
 mod web;
 use agent::AgentEvent;
 use std::collections::{HashSet, VecDeque};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -125,19 +128,26 @@ fn main() {
         i += 1;
     }
     let mut cfg = Config::load();
+    if setup_flag && !std::io::stdin().is_terminal() {
+        setup::run_wizard(&mut cfg);
+        return;
+    }
     if let Some(m) = model_override {
         cfg.provider.model = m;
         cfg.save();
     }
-    if mock {
-    } else if setup_flag {
-        setup::run_wizard(&mut cfg);
-    } else if setup::needs_setup(&cfg) {
-        if qq_only {
-            eprintln!("首次使用前请先运行配置向导: yjlcoder --setup");
+    let open_setup = !mock && (setup_flag || setup::needs_setup(&cfg));
+    if open_setup && qq_only {
+        if setup::needs_setup(&cfg) {
+            eprintln!("首次使用前请先运行交互式配置: yjlcoder");
             std::process::exit(1);
         }
-        setup::run_wizard(&mut cfg);
+    }
+    if !mock && setup::needs_setup(&cfg) {
+        if qq_only {
+            eprintln!("首次使用前请先运行交互式配置: yjlcoder");
+            std::process::exit(1);
+        }
     }
     let mut llm = if mock {
         Llm::mock()
@@ -146,7 +156,7 @@ fn main() {
     };
     llm.set_llamacpp_router_bypass(!mock && cfg.llama.auto_start);
     llm.set_thinking_budget(cfg.provider.thinking_budget);
-    if !mock {
+    if !mock && !open_setup {
         llm.probe_server();
     }
     if qq_only {
@@ -162,20 +172,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        plugins::shutdown_all();
         return;
     }
-    run_tui(cfg, llm, qq_mode);
+    run_tui(cfg, llm, qq_mode, open_setup);
 }
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "查看命令帮助"),
-    ("setup", "配置向导（探测本地服务 / 导入 Claude Code 配置）"),
+    ("setup", "回到供应商配置页"),
     ("server", "查看/设置模型服务地址"),
     ("model", "查看/切换模型（列出服务端可用模型）"),
     ("apikey", "查看/设置 API 密钥"),
     ("ctx", "查看/覆盖上下文窗口"),
     ("budget", "查看/设置思考预算"),
     ("maxtokens", "查看/设置单轮生成上限"),
-    ("config", "查看当前全部配置总览"),
+    ("price", "查看/设置每百万 token 价格与金额估算"),
+    ("config", "供应商配置页（show 查看总览）"),
+    ("agents", "管理受限后台 Agent"),
     ("goal", "持续执行目标（状态/暂停/恢复/清除）"),
     ("FuckMaster", "定时主动通过 QQ 推进目标"),
     ("copy", "复制最近一条助手完整回复（Ctrl+O）"),
@@ -212,6 +225,9 @@ fn llama_health_ok(base_url: &str) -> bool {
     }
 }
 fn ensure_llama_online(cfg: &Config) -> (bool, String) {
+    if !is_local_model_url(&cfg.provider.base_url) {
+        return (true, "远程模型服务将在首次请求时验证".into());
+    }
     if llama_health_ok(&cfg.provider.base_url) {
         return (true, "模型服务在线".into());
     }
@@ -244,7 +260,11 @@ fn ensure_llama_online(cfg: &Config) -> (bool, String) {
     }
     (false, format!("已发起拉起 {svc}，但等待 {cfg} 秒后仍未就绪", cfg = cfg.llama.start_wait_secs))
 }
-fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
+fn is_local_model_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("[::1]")
+}
+fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
     let cancel = Arc::new(AtomicBool::new(false));
     if with_qq {
         let c = cfg.clone();
@@ -259,10 +279,19 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
     }
     let mut tui = Tui::new();
     tui.set_commands(COMMANDS);
+    tui.set_pricing(cfg.pricing.clone());
     let guard = tui.enter();
-    let (llama_ok, llama_note) = ensure_llama_online(&cfg);
-    if !llama_ok {
-        tui.push_warn(format!("⚠ {llama_note}"));
+    if !open_setup {
+        let (llama_ok, llama_note) = ensure_llama_online(&cfg);
+        if !llama_ok {
+            tui.push_warn(format!("⚠ {llama_note}"));
+        }
+    } else {
+        tui.push_system(
+            "欢迎使用 YJLcoder。先用方向键选择供应商和模型；API Key 只保存在本机，界面不会回显明文。"
+                .into(),
+        );
+        tui.open_provider_setup(&cfg);
     }
     let mut store = SessionStore::new(cfg.sessions_dir());
     if !store.current().messages.is_empty() {
@@ -389,6 +418,22 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                         }
                         tui.finish_ask();
                     }
+                    Action::ConfigSubmit(answers) => {
+                        tui.finish_ask();
+                        match setup::apply_provider_answers(&mut cfg, &answers) {
+                            Ok(message) => {
+                                sync_llm_from_cfg(&mut llm, &cfg);
+                                llm.set_model(cfg.provider.model.clone());
+                                tui.set_pricing(cfg.pricing.clone());
+                                tui.push_system(message);
+                                tui.push_system(server_caps_note(&llm));
+                            }
+                            Err(error) => {
+                                tui.push_error(format!("配置没有保存：{error}"));
+                                tui.open_provider_setup(&cfg);
+                            }
+                        }
+                    }
                     Action::PermSubmit(decision) => {
                         if let (Some(ptx), Some(id)) = (cur_perm_tx.as_ref(), cur_perm_id.take()) {
                             let _ = ptx.send(PermDecision { id, decision });
@@ -401,6 +446,10 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                             tui.finish_ask();
                             cur_answer_tx = None;
                             cur_ask_id = None;
+                            if setup::needs_setup(&cfg) {
+                                tui.push_warn("完成供应商配置后才能开始对话；Ctrl+D 可退出".into());
+                                tui.open_provider_setup(&cfg);
+                            }
                         }
                         if tui.is_streaming() {
                             tui.cancel_streaming();
@@ -423,10 +472,12 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
             match ev {
                 AgentEvent::Delta(d) => tui.assistant_delta(&d),
                 AgentEvent::Reasoning(r) => {
+                    tui.reasoning_token_delta(&r);
                     if cfg.trace.show_reasoning {
                         tui.push_reasoning(r);
                     }
                 }
+                AgentEvent::TokenProgress(progress) => tui.token_progress(progress),
                 AgentEvent::ToolRun { op, args } => tui.push_tool(&op, &args),
                 AgentEvent::ToolProgress(progress) => tui.push_tool_progress(&progress),
                 AgentEvent::ToolResult(r) => tui.push_tool_result(&r),
@@ -611,10 +662,15 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool) {
                 }
             }
         }
+        for notice in subagents::drain_notifications() {
+            tui.push_system(notice);
+        }
         refresh_header(&mut tui, &cfg, &llm, &store);
         tui.redraw();
     }
     cancel.store(true, Ordering::Relaxed);
+    subagents::shutdown_all();
+    plugins::shutdown_all();
     tui.exit();
     drop(guard);
     println!("bye");
@@ -678,7 +734,8 @@ fn goal_control_is_safe_while_running(cmd: &str) -> bool {
         )
 }
 fn refresh_header(tui: &mut Tui, cfg: &Config, llm: &Llm, store: &SessionStore) {
-    let (_msgs, tokens) = session::session_stats(&store.path(store.current_id()));
+    let messages = store.current().messages;
+    let tokens = agent::estimate_context_tokens(cfg, llm, &messages, false, false);
     let mode = if cfg.provider.native_tools { "native" } else { "text" };
     tui.set_header(format!(
         "{} │ 会话 {} │ {}",
@@ -686,10 +743,7 @@ fn refresh_header(tui: &mut Tui, cfg: &Config, llm: &Llm, store: &SessionStore) 
         store.current_id(),
         mode
     ));
-    tui.set_ctx(
-        tokens,
-        backend::effective_window(cfg.provider.ctx_override, llm.n_ctx(), cfg.provider.ctx_window),
-    );
+    tui.set_ctx_estimate(tokens, agent::effective_context_window(cfg, llm));
 }
 struct TurnSpawn {
     cfg: Config,
@@ -793,14 +847,17 @@ fn handle_command(
                  /reloadmodel  重载模型（卡死/输出异常时恢复）\n\
                  \n\
                  [配置]\n\
-                 /setup        配置向导（探测本地服务/导入 Claude Code 配置）\n\
+                 /setup        回到供应商图形配置页\n\
                  /server [地址] 查看或设置模型服务地址（llama.cpp/Ollama/LM Studio/兼容 API）\n\
                  /model <名称>  查看或切换模型（llama.cpp 自动列出服务端可用模型）\n\
                  /apikey [密钥] 查看或设置 API 密钥（/apikey clear 清除）\n\
                  /ctx [N|off]  查看或覆盖上下文窗口（默认自适应服务端 n_ctx）\n\
                  /budget [N|off] 查看或设置思考预算（llama.cpp 由服务端管理）\n\
                  /maxtokens [N] 查看或设置 QQ/聊天模式单轮回复上限（TUI 自动拉满 n_ctx）\n\
-                 /config       查看当前全部配置总览\n\
+                 /price [参数]  查看价格；deepseek-flash 自动填官方人民币价；off 关闭；\n\
+                                /price <缓存命中> <未命中> <输出> [币种] 自定义每百万 token 单价\n\
+                 /config       回到供应商配置页；/config show 查看总览\n\
+                 /agents       后台 Agent：list/on/off/show/stop/model\n\
                  \n\
                  [QQ]\n\
                  /qqadmin <QQ> 添加 QQ 管理员（可操作电脑）\n\
@@ -821,6 +878,62 @@ fn handle_command(
             match fuck_master::execute_slash(cfg, store.current_id(), rest) {
                 Ok(reply) => tui.push_system(reply),
                 Err(error) => tui.push_error(error),
+            }
+        }
+        "agents" => {
+            let (action, value) = rest
+                .split_once(' ')
+                .map(|(action, value)| (action.to_ascii_lowercase(), value.trim()))
+                .unwrap_or_else(|| (rest.to_ascii_lowercase(), ""));
+            match action.as_str() {
+                "" | "list" | "status" => {
+                    tui.push_system(format!(
+                        "后台 Agent: {} · 单并发 {} · 每回合 {} · 最大 {} 步 · 模型 {}\n{}",
+                        if cfg.agents.enabled { "开启" } else { "关闭" },
+                        cfg.agents.max_concurrent.clamp(1, 2),
+                        cfg.agents.max_spawn_per_turn.clamp(1, 2),
+                        cfg.agents.max_steps.clamp(1, 16),
+                        if cfg.agents.model.is_empty() { "继承主模型" } else { &cfg.agents.model },
+                        subagents::list_text(None),
+                    ));
+                }
+                "on" => {
+                    cfg.agents.enabled = true;
+                    cfg.agents.max_concurrent = 1;
+                    cfg.agents.max_spawn_per_turn = 1;
+                    cfg.save();
+                    tui.push_system("后台 Agent 已开启：单并发、每回合最多一个、禁止嵌套".into());
+                }
+                "off" => {
+                    cfg.agents.enabled = false;
+                    cfg.save();
+                    tui.push_system(
+                        "后台 Agent 已关闭；已经运行的任务不会被强杀，可用 /agents stop <id>"
+                            .into(),
+                    );
+                }
+                "show" => {
+                    tui.push_system(subagents::list_text((!value.is_empty()).then_some(value)))
+                }
+                "stop" if !value.is_empty() => match subagents::stop(value) {
+                    Ok(message) => tui.push_system(message),
+                    Err(error) => tui.push_error(error),
+                },
+                "model" => {
+                    cfg.agents.model = if matches!(value, "" | "inherit" | "same") {
+                        String::new()
+                    } else {
+                        value.to_string()
+                    };
+                    cfg.save();
+                    tui.push_system(format!(
+                        "后台 Agent 模型已设为 {}",
+                        if cfg.agents.model.is_empty() { "继承主模型" } else { &cfg.agents.model }
+                    ));
+                }
+                _ => tui.push_error(
+                    "用法: /agents [list|on|off|show <id>|stop <id>|model <名称|inherit>]".into(),
+                ),
             }
         }
         "copy" => {
@@ -878,14 +991,14 @@ fn handle_command(
         }
         "stats" => {
             let msgs = store.current().messages;
-            let tokens = compress::approx_total_tokens(&msgs);
-            let window = backend::effective_window(
-                cfg.provider.ctx_override,
-                llm.n_ctx(),
-                cfg.provider.ctx_window,
-            );
+            let tokens = agent::estimate_context_tokens(cfg, llm, &msgs, false, false);
+            let window = agent::effective_context_window(cfg, llm);
+            let exact = tui
+                .last_exact_prompt_tokens()
+                .map(|value| format!("\n上次请求服务端精确上传: {value} tok"))
+                .unwrap_or_else(|| "\n上次请求服务端精确上传: 暂无（发出一次请求后显示）".into());
             tui.push_system(format!(
-                "上下文: ~{tokens} / {window} tok（{:.1}%），消息 {} 条",
+                "下一次请求上下文（完整请求本地估算）: ~{tokens} / {window} tok（{:.2}%），消息 {} 条{exact}\n估算已包含系统提示词、原生工具定义、角色、工具参数和思考字段；请求进行时以服务端精确值覆盖。",
                 tokens as f64 * 100.0 / window as f64,
                 msgs.len()
             ));
@@ -948,7 +1061,13 @@ fn handle_command(
                 };
                 let mut cfg2 = cfg.clone();
                 cfg2.provider.model = name.clone();
+                if cfg2.provider.base_url.contains("api.deepseek.com")
+                    && backend::known_model_context_window(&name).is_some()
+                {
+                    cfg2.provider.ctx_window = backend::DEEPSEEK_V4_CONTEXT_WINDOW;
+                }
                 cfg2.save();
+                *cfg = cfg2;
                 llm.set_model(name.clone());
                 tui.push_system(format!("模型已切换为 {name}，下一条消息立即生效"));
                 let llm2 = llm.clone();
@@ -960,10 +1079,8 @@ fn handle_command(
             }
         }
         "setup" => {
-            let msg = setup::quick_setup(cfg);
-            tui.push_system(msg);
-            sync_llm_from_cfg(llm, cfg);
-            tui.push_system(server_caps_note(llm));
+            tui.push_system("已回到供应商配置页；现有配置只有在最后一步成功后才会被替换。".into());
+            tui.open_provider_setup(cfg);
         }
         "server" => {
             if rest.is_empty() {
@@ -1008,15 +1125,13 @@ fn handle_command(
         }
         "ctx" => {
             if rest.is_empty() {
-                let effective = backend::effective_window(
-                    cfg.provider.ctx_override,
-                    llm.n_ctx(),
-                    cfg.provider.ctx_window,
-                );
+                let effective = agent::effective_context_window(cfg, llm);
                 let source = if let Some(o) = cfg.provider.ctx_override {
                     format!("手动覆盖 {o}")
                 } else if let Some(n) = llm.n_ctx() {
                     format!("自适应（服务端 n_ctx {n}）")
+                } else if let Some(n) = backend::known_model_context_window(&llm.model_name()) {
+                    format!("模型规格（DeepSeek V4 官方 {n}）")
                 } else {
                     format!("回退值（非 llama.cpp 后端）")
                 };
@@ -1036,11 +1151,7 @@ fn handle_command(
                     }
                     _ => tui.push_error(format!(
                         "用法: /ctx <N>（token 数，≥1024，当前有效值 {}）",
-                        backend::effective_window(
-                            cfg.provider.ctx_override,
-                            llm.n_ctx(),
-                            cfg.provider.ctx_window,
-                        )
+                        agent::effective_context_window(cfg, llm)
                     )),
                 }
             }
@@ -1124,22 +1235,96 @@ fn handle_command(
                 }
             }
         }
+        "price" | "pricing" => {
+            let show = |pricing: &crate::config::Pricing| {
+                if pricing.enabled {
+                    format!(
+                        "Token 价格（每 100 万 token）:\n  缓存命中: {}{}\n  缓存未命中/写入: {}{}\n  模型输出: {}{}\n实时状态与每轮结尾会自动估算金额",
+                        pricing.currency,
+                        pricing.cache_read_per_million,
+                        pricing.currency,
+                        pricing.cache_miss_per_million,
+                        pricing.currency,
+                        pricing.output_per_million,
+                    )
+                } else {
+                    "Token 金额估算未开启。用法: /price deepseek-flash，或 /price <缓存命中> <未命中> <输出> [币种]".into()
+                }
+            };
+            if rest.is_empty() {
+                tui.push_system(show(&cfg.pricing));
+            } else if rest.eq_ignore_ascii_case("off") {
+                cfg.pricing.enabled = false;
+                cfg.save();
+                tui.set_pricing(cfg.pricing.clone());
+                tui.push_system("Token 金额估算已关闭".into());
+            } else if matches!(
+                rest.to_ascii_lowercase().as_str(),
+                "deepseek" | "deepseek-flash" | "auto"
+            ) {
+                cfg.pricing = crate::config::Pricing::deepseek_flash_cny();
+                cfg.save();
+                tui.set_pricing(cfg.pricing.clone());
+                tui.push_system(show(&cfg.pricing));
+            } else {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                let parsed = if (3..=4).contains(&parts.len()) {
+                    let read = parts[0].parse::<f64>().ok();
+                    let miss = parts[1].parse::<f64>().ok();
+                    let output = parts[2].parse::<f64>().ok();
+                    match (read, miss, output) {
+                        (Some(read), Some(miss), Some(output))
+                            if read.is_finite()
+                                && miss.is_finite()
+                                && output.is_finite()
+                                && read >= 0.0
+                                && miss >= 0.0
+                                && output >= 0.0 => Some((read, miss, output)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((read, miss, output)) = parsed {
+                    let currency = parts.get(3).copied().unwrap_or("¥");
+                    if currency.chars().count() > 6 || currency.chars().any(char::is_control) {
+                        tui.push_error("币种符号过长或包含控制字符".into());
+                    } else {
+                        cfg.pricing = crate::config::Pricing {
+                            enabled: true,
+                            currency: currency.to_string(),
+                            cache_read_per_million: read,
+                            cache_miss_per_million: miss,
+                            output_per_million: output,
+                        };
+                        cfg.save();
+                        tui.set_pricing(cfg.pricing.clone());
+                        tui.push_system(show(&cfg.pricing));
+                    }
+                } else {
+                    tui.push_error("用法: /price deepseek-flash | off | <缓存命中价> <未命中价> <输出价> [币种]（均为每百万 token）".into());
+                }
+            }
+        }
         "config" => {
+            if !rest.eq_ignore_ascii_case("show") {
+                tui.push_system("供应商配置：↑↓ 选择，Other 可输入自定义地址、密钥或模型。查看纯文本总览请用 /config show。".into());
+                tui.open_provider_setup(cfg);
+                return;
+            }
             let masked_key = if cfg.provider.api_key.is_empty() {
                 "（未设置）".to_string()
             } else {
                 let head: String = cfg.provider.api_key.chars().take(4).collect();
                 format!("{head}…")
             };
-            let window = backend::effective_window(
-                cfg.provider.ctx_override,
-                llm.n_ctx(),
-                cfg.provider.ctx_window,
-            );
+            let window = agent::effective_context_window(cfg, llm);
             let window_src = if let Some(o) = cfg.provider.ctx_override {
                 format!("手动覆盖 {o}")
             } else if let Some(n) = llm.n_ctx() {
                 format!("自适应（服务端 n_ctx {n}）")
+            } else if let Some(n) = backend::known_model_context_window(&llm.model_name()) {
+                format!("模型规格（DeepSeek V4 官方 {n}）")
             } else {
                 format!("回退值")
             };
@@ -1164,6 +1349,17 @@ fn handle_command(
             } else {
                 "未开启自动拉起".to_string()
             };
+            let pricing = if cfg.pricing.enabled {
+                format!(
+                    "{c}{}/{c}{}/{c}{}（命中/未命中/输出，每百万 token）",
+                    cfg.pricing.cache_read_per_million,
+                    cfg.pricing.cache_miss_per_million,
+                    cfg.pricing.output_per_million,
+                    c = cfg.pricing.currency,
+                )
+            } else {
+                "关闭（/price 设置）".into()
+            };
             tui.push_system(format!(
                 "当前配置总览:\n\
                  \n  [模型服务]\n\
@@ -1176,6 +1372,7 @@ fn handle_command(
                  \x20 TUI 单轮上限: {tui_cap}\n\
                  \x20 QQ 单轮上限: {}（/maxtokens 调整）\n\
                  \x20 思考预算: {budget}\n\
+                 \x20 Token 价格: {pricing}\n\
                  \n  [其他]\n\
                  \x20 工具轮数上限: {}（/tool_times）\n\
                  \x20 请求超时: {}s（/timeout）\n\
@@ -1189,6 +1386,14 @@ fn handle_command(
                 cfg.tool_times,
                 cfg.provider.timeout_secs,
                 if cfg.provider.native_tools { "开启" } else { "关闭" },
+            ));
+            tui.push_system(format!(
+                "[后台 Agent]\n  状态: {}\n  并发/每回合/最大步数: {}/{}/{}\n  模型: {}",
+                if cfg.agents.enabled { "开启" } else { "关闭" },
+                cfg.agents.max_concurrent.clamp(1, 2),
+                cfg.agents.max_spawn_per_turn.clamp(1, 2),
+                cfg.agents.max_steps.clamp(1, 16),
+                if cfg.agents.model.is_empty() { "继承主模型" } else { &cfg.agents.model },
             ));
         }
         "qqadmin" => {
