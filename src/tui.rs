@@ -209,6 +209,7 @@ pub struct Tui {
     live_request_exact: bool,
     live_generated_bytes: usize,
     chat: Vec<ChatLine>,
+    session_usage: crate::llm::Usage,
     scroll: usize,
     follow: bool,
     input: String,
@@ -299,6 +300,7 @@ impl Tui {
             live_request_exact: false,
             live_generated_bytes: 0,
             chat: Vec::new(),
+            session_usage: crate::llm::Usage::default(),
             scroll: 0,
             follow: true,
             input: String::new(),
@@ -574,7 +576,9 @@ impl Tui {
         } else {
             String::new()
         };
-        let cost = self
+        // 累计成本：把本轮 usage 累加到整个会话，显示“本轮 + 窗口累计”两笔
+        add_usage(&mut self.session_usage, usage);
+        let this_cost = self
             .pricing
             .estimate(
                 usage.prompt_tokens,
@@ -582,11 +586,22 @@ impl Tui {
                 usage.cache_miss_tokens,
                 usage.completion_tokens,
             )
-            .map(|value| format!(" · 估算 {}{}", self.pricing.currency, format_cost(value)))
+            .map(|value| format!(" · 本轮 {}{}", self.pricing.currency, format_cost(value)))
+            .unwrap_or_default();
+        let total = self.session_usage;
+        let acc_cost = self
+            .pricing
+            .estimate(
+                total.prompt_tokens,
+                total.cache_read_tokens,
+                total.cache_miss_tokens,
+                total.completion_tokens,
+            )
+            .map(|value| format!(" · 累计 {}{}", self.pricing.currency, format_cost(value)))
             .unwrap_or_default();
         if usage.prompt_tokens > 0 || usage.completion_tokens > 0 || !speed.is_empty() || !cache.is_empty() {
             self.push_summary(format!(
-                "▸ ↑ 上传 {} token · ↓ 写入 {} token{reasoning}{speed}{cache}{cost}",
+                "▸ ↑ 上传 {} token · ↓ 写入 {} token{reasoning}{speed}{cache}{this_cost}{acc_cost}",
                 usage.prompt_tokens, usage.completion_tokens
             ));
         }
@@ -738,6 +753,7 @@ impl Tui {
         self.chat.clear();
         self.last_tool_op = None;
         self.tool_progress_index = None;
+        self.session_usage = crate::llm::Usage::default();
         self.scroll = 0;
         self.mascot_event(MascotEvent::Cancel);
     }
@@ -4083,7 +4099,36 @@ mod tests {
         assert!(summary.contains("↓ 写入 220 token"), "最终写入: {summary}");
         assert!(summary.contains("服务端缓存 命中率 75.0%"), "最终缓存: {summary}");
         assert!(summary.contains("读 1500"), "最终缓存读取: {summary}");
-        assert!(summary.contains("估算 ¥"), "最终金额: {summary}");
+        assert!(summary.contains("累计 ¥"), "累计金额: {summary}");
+        assert!(summary.contains("本轮 ¥"), "本轮金额: {summary}");
+    }
+    #[test]
+    fn session_cost_accumulates_across_turns() {
+        let mut t = Tui::new();
+        t.w = 240;
+        t.h = 28;
+        t.set_header("acc-test".into());
+        t.set_pricing(crate::config::Pricing::deepseek_flash_cny());
+        let u = crate::llm::Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            ..Default::default()
+        };
+        t.begin_assistant();
+        t.end_assistant_with_metrics("第一轮", u, crate::llm::Timings::default());
+        let s1 = t.chat.last().unwrap().text.clone();
+        assert!(s1.contains("累计 ¥0.002"), "第一轮累计应等于本轮: {s1}");
+        t.begin_assistant();
+        t.end_assistant_with_metrics("第二轮", u, crate::llm::Timings::default());
+        let s2 = t.chat.last().unwrap().text.clone();
+        assert!(s2.contains("本轮 ¥0.002"), "第二轮本轮: {s2}");
+        assert!(s2.contains("累计 ¥0.004"), "第二轮累计应翻倍(0.001+0.001 输入 + 0.001+0.001 输出): {s2}");
+        // clear_chat 重置累计
+        t.clear_chat();
+        t.begin_assistant();
+        t.end_assistant_with_metrics("第三轮", u, crate::llm::Timings::default());
+        let s3 = t.chat.last().unwrap().text.clone();
+        assert!(s3.contains("累计 ¥0.002"), "clear_chat 后累计应重置: {s3}");
     }
     #[test]
     fn server_prompt_usage_replaces_local_context_estimate_while_streaming() {
