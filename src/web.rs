@@ -203,6 +203,9 @@ fn aggregate_search(
             }
         };
         for (rank, result) in results.into_iter().enumerate() {
+            if result.title.trim().is_empty() && result.snippet.trim().is_empty() {
+                continue; // 标题和摘要都为空：纯垃圾/壳页，直接过滤
+            }
             let canonical = canonical_url(&result.url);
             if canonical.is_empty()
                 || !domain_allowed(&canonical, include_domains, exclude_domains)
@@ -336,8 +339,33 @@ fn domain_quality(url: &str) -> i64 {
         100
     } else if host == "github.com" || host.ends_with(".github.com") || host == "docs.rs" || host.starts_with("docs.") || host.starts_with("developer.") {
         70
-    } else if ["pinterest.", "quora.", "zhidao.", "csdn.net"].iter().any(|bad| host.contains(bad)) {
-        -80
+    } else if [
+        "pinterest.",
+        "quora.",
+        "zhidao.",
+        "csdn.net",
+        "jianshu.",
+        "zhihu.com",
+        "360doc.",
+        "doc88.",
+        "docin.",
+        "mbalib.",
+        "book118.",
+        "taodocs.",
+        "51wendang.",
+        "wendangku",
+        "baijiahao",
+        "hudong.com",
+        "chachaba.",
+        "uucj.",
+        "yandex.",
+        "so.com",
+        "haosou",
+    ]
+    .iter()
+    .any(|bad| host.contains(bad))
+    {
+        -100
     } else {
         0
     }
@@ -503,12 +531,45 @@ fn http_get_with_headers(url: &str, headers: &[(&str, &str)], timeout: u64) -> R
         ureq::Error::Status(code, _) => format!("HTTP {code}"),
         other => format!("{other}"),
     })?;
-    let mut body = String::new();
+    let ctype = resp.header("Content-Type").unwrap_or("").to_lowercase();
+    let mut raw: Vec<u8> = Vec::new();
     resp.into_reader()
         .take(2 * 1024 * 1024)
-        .read_to_string(&mut body)
+        .read_to_end(&mut raw)
         .map_err(|e| format!("读取响应失败: {e}"))?;
-    Ok(body)
+    Ok(decode_http_body(&raw, &ctype))
+}
+
+// 按 HTTP Content-Type / <meta charset> 解码正文，修复 GBK/GB2312/Big5 等中文站乱码
+fn decode_http_body(raw: &[u8], content_type: &str) -> String {
+    let mut label: Option<String> = None;
+    for part in content_type.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix("charset=") {
+            label = Some(rest.trim().trim_matches('"').to_string());
+            break;
+        }
+    }
+    if label.is_none() {
+        let head = String::from_utf8_lossy(&raw[..raw.len().min(2048)]).to_lowercase();
+        if let Some(i) = head.find("charset=") {
+            let after = &head[i + 8..];
+            let end = after
+                .find(['"', '\'', '>', ';', ' '])
+                .unwrap_or(after.len());
+            let cand = after[..end].trim().trim_matches('"').trim_matches('\'');
+            if !cand.is_empty() && cand.len() <= 24 {
+                label = Some(cand.to_string());
+            }
+        }
+    }
+    match label
+        .as_deref()
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+    {
+        Some(enc) => enc.decode(raw).0.into_owned(),
+        None => String::from_utf8_lossy(raw).into_owned(),
+    }
 }
 fn parse_ddg_html(html: &str, max: usize) -> Vec<SearchResult> {
     const MARKER: &str = "class=\"result__a\"";
@@ -710,7 +771,7 @@ fn web_fetch_one(url: &str, max_chars: usize) -> Result<String, String> {
         .take(2 * 1024 * 1024)
         .read_to_end(&mut raw)
         .map_err(|e| format!("读取响应失败: {e}"))?;
-    let body = String::from_utf8_lossy(&raw).into_owned();
+    let body = decode_http_body(&raw, &ctype);
     let is_html = ctype.contains("html") || body.contains("<html") || body.contains("<!doctype");
     let (title, text) = if is_html {
         (html_title(&body), html_to_text(&body))
@@ -1001,6 +1062,22 @@ mod tests {
         assert!(out.contains("批量抓取（2 个 URL）"));
         assert!(out.contains("标题: A"));
         assert!(out.contains("不支持的 URL 协议"));
+    }
+    #[test]
+    fn decode_http_body_handles_gbk_and_meta_sniff() {
+        // GBK "你好" = C4E3 BAC3
+        let out = decode_http_body(&[0xC4, 0xE3, 0xBA, 0xC3], "text/html; charset=gbk");
+        assert_eq!(out, "你好", "GBK 应按 charset 解码: {out:?}");
+        // 无 header charset 时按 <meta charset> 嗅探
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"<html><meta charset=gb2312>");
+        raw.extend_from_slice(&[0xC4, 0xE3]); // gb2312 的 "你"
+        let sniffed = decode_http_body(&raw, "text/html");
+        assert_eq!(sniffed, "<html><meta charset=gb2312>你", "meta 嗅探应生效: {sniffed:?}");
+        // UTF-8 正常
+        assert_eq!(decode_http_body("你好".as_bytes(), "text/html; charset=utf-8"), "你好");
+        // 未知 charset 回退 UTF-8 lossy（不 panic）
+        let _ = decode_http_body(&[0xFF, 0xFE], "application/octet-stream");
     }
     #[test]
     fn html_to_text_compresses_blank_lines() {
