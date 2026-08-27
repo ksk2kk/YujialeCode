@@ -210,6 +210,7 @@ pub struct Tui {
     live_generated_bytes: usize,
     chat: Vec<ChatLine>,
     scroll: usize,
+    follow: bool,
     input: String,
     cursor: usize,
     history: Vec<String>,
@@ -299,6 +300,7 @@ impl Tui {
             live_generated_bytes: 0,
             chat: Vec::new(),
             scroll: 0,
+            follow: true,
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
@@ -483,6 +485,7 @@ impl Tui {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Begin);
         self.chat.push(ChatLine::new(ChatRole::User, text));
+        self.follow = true;
         self.scroll = 0;
     }
     pub fn begin_assistant(&mut self) {
@@ -496,7 +499,9 @@ impl Tui {
         self.ctx_exact = false;
         self.mascot_event(MascotEvent::Progress);
         self.chat.push(ChatLine { role: ChatRole::Assistant, text: String::new(), pending: true, op: None });
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn assistant_delta(&mut self, d: &str) {
         self.seal_reasoning();
@@ -526,7 +531,9 @@ impl Tui {
             }
         }
         self.chat.push(ChatLine::new(ChatRole::Assistant, full.to_string()));
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn end_assistant_with_metrics(
         &mut self,
@@ -595,7 +602,9 @@ impl Tui {
             pending: false,
             op: Some(display),
         });
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn push_tool_progress(&mut self, progress: &crate::tools::ToolProgress) {
         self.mascot_event(MascotEvent::ToolStart);
@@ -618,7 +627,9 @@ impl Tui {
             if let Some(line) = self.chat.get_mut(index) {
                 line.text = text;
                 line.pending = true;
-                self.scroll = 0;
+                if self.follow {
+                    self.scroll = 0;
+                }
                 return;
             }
         }
@@ -630,7 +641,9 @@ impl Tui {
             op: None,
         });
         self.tool_progress_index = Some(index);
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn push_tool_result(&mut self, result: &str) {
         self.seal_reasoning();
@@ -655,29 +668,39 @@ impl Tui {
         if let Some(index) = self.tool_progress_index.take() {
             if let Some(line) = self.chat.get_mut(index) {
                 *line = ChatLine::new(ChatRole::ToolResult, text);
-                self.scroll = 0;
+                if self.follow {
+                    self.scroll = 0;
+                }
                 return;
             }
         }
         self.chat.push(ChatLine::new(ChatRole::ToolResult, text));
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn push_system(&mut self, text: String) {
         self.seal_reasoning();
         self.chat.push(ChatLine::new(ChatRole::System, text));
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn push_error(&mut self, text: String) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Bug);
         self.chat.push(ChatLine::new(ChatRole::Error, text));
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn push_warn(&mut self, text: String) {
         self.seal_reasoning();
         self.mascot_event(MascotEvent::Warning);
         self.chat.push(ChatLine::new(ChatRole::Warn, text));
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn push_bug_warn(&mut self, text: String) {
         self.push_warn(text);
@@ -692,7 +715,9 @@ impl Tui {
             }
         }
         self.chat.push(ChatLine { role: ChatRole::Reasoning, text, pending: true, op: None });
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     fn seal_reasoning(&mut self) {
         if let Some(last) = self.chat.last_mut() {
@@ -704,7 +729,9 @@ impl Tui {
     pub fn push_summary(&mut self, text: String) {
         self.seal_reasoning();
         self.chat.push(ChatLine::new(ChatRole::Summary, text));
-        self.scroll = 0;
+        if self.follow {
+            self.scroll = 0;
+        }
     }
     pub fn clear_chat(&mut self) {
         self.chat.clear();
@@ -1297,18 +1324,26 @@ impl Tui {
             }
             Key::PageUp => {
                 self.scroll += self.chat_height().saturating_sub(1);
+                self.follow = false;
                 Action::None
             }
             Key::PageDown => {
                 self.scroll = self.scroll.saturating_sub(self.chat_height().saturating_sub(1));
+                if self.scroll == 0 {
+                    self.follow = true;
+                }
                 Action::None
             }
             Key::WheelUp => {
                 self.scroll += 3;
+                self.follow = false;
                 Action::None
             }
             Key::WheelDown => {
                 self.scroll = self.scroll.saturating_sub(3);
+                if self.scroll == 0 {
+                    self.follow = true;
+                }
                 Action::None
             }
             Key::MouseDown { row, col } => {
@@ -4065,4 +4100,60 @@ mod tests {
         assert!(frame.contains("ctx 10k/1.00m (1.03%)"), "精确值应无波浪号: {frame}");
         assert_eq!(t.last_exact_prompt_tokens(), Some(10_321));
     }
+    #[test]
+    fn tool_progress_heartbeat_keeps_user_scroll_position() {
+        let mut t = Tui::new();
+        t.w = 60;
+        t.h = 24;
+        t.push_user("设置一个定时任务".into());
+        t.push_tool("timer", r#"{"seconds":90}"#);
+        // 用户向上翻看历史
+        t.scroll = 5;
+        assert!(t.follow, "初始应跟随底部");
+        t.follow = false;
+        // 定时任务每秒心跳刷新进度：不应把用户拉回底部
+        for sec in 1..10u64 {
+            let p = crate::tools::ToolProgress {
+                output: String::new(),
+                elapsed_secs: sec,
+                total_lines: 0,
+                total_bytes: 0,
+            };
+            t.push_tool_progress(&p);
+        }
+        assert_eq!(t.scroll, 5, "心跳刷新不得重置滚动位置");
+        // 用户滚回底部：恢复跟随
+        t.scroll = 0;
+        t.follow = true;
+        t.push_tool_progress(&crate::tools::ToolProgress {
+            output: String::new(),
+            elapsed_secs: 11,
+            total_lines: 0,
+            total_bytes: 0,
+        });
+        assert_eq!(t.scroll, 0, "跟随时应保持在底部");
+    }
+
+    #[test]
+    fn scroll_keys_toggle_follow_flag() {
+        let mut t = Tui::new();
+        t.w = 60;
+        t.h = 24;
+        for i in 0..40 {
+            t.push_user(format!("历史消息 {i}"));
+        }
+        let _ = t.handle_key(Key::WheelUp);
+        assert!(!t.follow, "向上滚应停止跟随");
+        let _ = t.handle_key(Key::PageUp);
+        assert!(!t.follow, "PageUp 也应停止跟随");
+        t.scroll = 3; // 模拟滚到离底部还有 3 行
+        let _ = t.handle_key(Key::WheelDown); // 3-3=0 -> 恢复跟随
+        assert!(t.follow, "滚回底部应恢复跟随");
+        let _ = t.handle_key(Key::WheelUp);
+        assert!(!t.follow);
+        t.scroll = 0; // 已在底部
+        let _ = t.handle_key(Key::PageDown);
+        assert!(t.follow, "PageDown 到底部应保持跟随");
+    }
+
 }
