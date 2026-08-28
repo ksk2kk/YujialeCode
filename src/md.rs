@@ -104,16 +104,25 @@ pub fn block_parts(text: &str) -> Vec<(bool, String)> {
     let mut plain = String::new();
     let mut code = String::new();
     let mut in_code = false;
+    let mut md_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
             if in_code {
                 out.push((true, std::mem::take(&mut code)));
                 in_code = false;
+            } else if md_fence {
+                md_fence = false;
             } else {
                 if !plain.is_empty() {
                     out.push((false, std::mem::take(&mut plain)));
                 }
-                in_code = true;
+                let lang = trimmed.trim_start_matches('`').trim();
+                if lang == "markdown" || lang == "md" {
+                    md_fence = true;
+                } else {
+                    in_code = true;
+                }
             }
             continue;
         }
@@ -420,6 +429,27 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert!(parts[0].0);
         assert!(parts[0].1.contains("x = 1"));
+    }
+    #[test]
+    fn block_parts_markdown_fence_treated_as_plain() {
+        let src = "```markdown\n| a | b |\n|---|---|\n| 1 | 2 |\n```";
+        let parts = block_parts(src);
+        assert_eq!(parts.len(), 1, "markdown 围栏不产生代码块");
+        assert!(!parts[0].0, "markdown 围栏内容按普通文本");
+        assert!(parts[0].1.contains("| a | b |"));
+        let parts = block_parts("```md\n# 标题\n```\n结尾");
+        assert_eq!(parts.len(), 1);
+        assert!(!parts[0].0, "md 围栏也是普通文本");
+        assert!(parts[0].1.contains("# 标题"));
+        assert!(parts[0].1.contains("结尾"), "围栏外后续文本在同一段: {}", parts[0].1);
+    }
+    #[test]
+    fn block_parts_markdown_fence_inside_and_code_after() {
+        let src = "```markdown\n| x |\n|---|\n| y |\n```\n```rust\nfn main() {}\n```";
+        let parts = block_parts(src);
+        assert_eq!(parts.len(), 2);
+        assert!(!parts[0].0, "markdown 围栏是普通文本");
+        assert!(parts[1].0 && parts[1].1.contains("fn main()"), "后续 rust 围栏仍是代码块");
     }
     #[test]
     fn block_prefix_header_and_quote() {
