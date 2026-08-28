@@ -718,6 +718,8 @@ impl Tui {
             self.scroll = 0;
         }
     }
+    // bug: 垃圾 token 检测已禁用，暂无用例，保留供后续告警功能使用
+    #[allow(dead_code)]
     pub fn push_bug_warn(&mut self, text: String) {
         self.push_warn(text);
         self.mascot_event(MascotEvent::Bug);
@@ -2205,9 +2207,21 @@ impl Tui {
                 first = false;
                 continue;
             }
-            for pline in part.split_terminator('\n') {
+            let plines: Vec<&str> = part.split_terminator('\n').collect();
+            let mut i = 0;
+            while i < plines.len() {
+                if let Some((table, consumed)) = crate::md::parse_table(&plines[i..]) {
+                    for tl in crate::md::render_table(&table, cw) {
+                        out.push(RLine { shade: Some(C_BG_CODE), styled: format!("{C_ASST}{tl}") });
+                    }
+                    first = false;
+                    i += consumed;
+                    continue;
+                }
+                let pline = plines[i];
                 if pline.trim().is_empty() {
                     out.push(RLine { shade: None, styled: String::new() });
+                    i += 1;
                     continue;
                 }
                 let (head_style, head_prefix, rest) = crate::md::block_prefix(pline);
@@ -2226,6 +2240,7 @@ impl Tui {
                     out.push(RLine { shade: None, styled });
                     first = false;
                 }
+                i += 1;
             }
         }
     }

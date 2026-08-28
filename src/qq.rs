@@ -12,6 +12,7 @@ use crate::llm::Msg;
 use crate::llm::Llm;
 use crate::session::SessionStore;
 use crate::tools::QqOut;
+use unicode_width::UnicodeWidthStr;
 struct ChatState {
     running: bool,
     pending: Option<(String, bool)>,
@@ -745,16 +746,68 @@ fn strip_role_tag(s: &str) -> Option<String> {
 }
 fn qq_clean(text: &str) -> String {
     let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    let mut table: Vec<String> = Vec::new();
+    let flush_table = |out: &mut Vec<String>, table: &mut Vec<String>| {
+        if table.is_empty() {
+            return;
+        }
+        if table.len() >= 2 && crate::md::is_sep_row(&table[1]) {
+            let rows: Vec<Vec<String>> = table
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 1)
+                .map(|(_, l)| crate::md::split_cells(l))
+                .collect();
+            let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+            let mut widths = vec![0usize; cols];
+            for r in &rows {
+                for (i, c) in r.iter().enumerate().take(cols) {
+                    let c = strip_emoji(&strip_inline(c));
+                    widths[i] = widths[i].max(UnicodeWidthStr::width(c.trim()));
+                }
+            }
+            for r in &rows {
+                let cells: Vec<String> = r
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let c = strip_emoji(&strip_inline(c));
+                        let c = c.trim();
+                        let cw = UnicodeWidthStr::width(c);
+                        if i < cols {
+                            format!("{c}{}", " ".repeat(widths[i].saturating_sub(cw)))
+                        } else {
+                            c.to_string()
+                        }
+                    })
+                    .collect();
+                out.push(cells.join("  ").trim_end().to_string());
+            }
+        } else {
+            for l in table.iter() {
+                let plain = l.trim_matches('|').split('|').map(str::trim).collect::<Vec<_>>().join("  ");
+                out.push(strip_emoji(&strip_inline(&plain)).trim_end().to_string());
+            }
+        }
+        table.clear();
+    };
     for raw in text.lines() {
         let line = raw.trim();
         let line = strip_role_tag(line).unwrap_or_else(|| line.to_string());
         if line.starts_with("```") || line.starts_with("~~~") {
+            flush_table(&mut out, &mut table);
             continue;
         }
         let n = line.chars().count();
         if n >= 3 && line.chars().all(|c| c == '-' || c == '=' || c == '*') {
+            flush_table(&mut out, &mut table);
             continue;
         }
+        if line.starts_with('|') && line.contains('|') {
+            table.push(line);
+            continue;
+        }
+        flush_table(&mut out, &mut table);
         if line.contains('|') {
             let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
             if cells.len() > 1 && cells.iter().all(|cell| {
@@ -806,6 +859,7 @@ fn qq_clean(text: &str) -> String {
         };
         out.push(strip_emoji(&strip_inline(&plain)).trim_end().to_string());
     }
+    flush_table(&mut out, &mut table);
     out.join("\n")
 }
 fn strip_inline(s: &str) -> String {
@@ -1304,6 +1358,20 @@ mod tests {
         let src = "## 进度 🚀\n| 项目 | 状态 |\n|---|---|\n| Rust | **完成** ✅ |\n- [x] ~~删除~~ __强调__ _斜体_ config_file\n<https://example.com>";
         assert_eq!(qq_clean(src), "进度\n项目  状态\nRust  完成\n删除 强调 斜体 config_file\nhttps://example.com");
         assert!(!qq_clean("你好😄👨‍💻！").chars().any(|c| (c as u32) >= 0x1F000));
+    }
+    #[test]
+    fn qq_clean_aligns_table_columns() {
+        let src = "| 名字 | 说明 |\n|:---|---:|\n| a\\|b | 很长的一段说明文字 |\n| c | 短 |";
+        let got = qq_clean(src);
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines[0], "名字  说明");
+        assert_eq!(lines[1], "a|b   很长的一段说明文字", "转义管道符还原且按列对齐: {got}");
+        assert_eq!(lines[2], "c     短");
+    }
+    #[test]
+    fn qq_clean_pipe_line_without_table_stays_collapsed() {
+        assert_eq!(qq_clean("| 只言片语 |"), "只言片语");
+        assert_eq!(qq_clean("| a | b |\n| c | d |"), "a  b\nc  d", "无分隔行不按表格对齐");
     }
     #[test]
     fn final_transport_sanitizes_every_qq_message() {

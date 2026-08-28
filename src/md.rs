@@ -1,4 +1,4 @@
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Style {
     Plain,
@@ -143,6 +143,146 @@ pub fn block_prefix(line: &str) -> (Option<Style>, &'static str, &str) {
         return (None, "│ ", rest);
     }
     (None, "", line)
+}
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub rows: Vec<Vec<String>>,
+}
+pub fn split_cells(line: &str) -> Vec<String> {
+    const PIPE_ESC: char = '\u{1F}';
+    let trimmed = line.trim().trim_matches('|');
+    let mut cells: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'|') {
+            chars.next();
+            cur.push(PIPE_ESC);
+        } else if c == '|' {
+            cells.push(std::mem::take(&mut cur).trim().to_string());
+        } else {
+            cur.push(c);
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells.into_iter().map(|c| c.replace(PIPE_ESC, "|")).collect()
+}
+pub fn is_sep_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.contains('|') {
+        return false;
+    }
+    trimmed.trim_matches('|').split('|').all(|cell| {
+        let cell = cell.trim().trim_matches(':').trim();
+        !cell.is_empty() && cell.chars().all(|c| c == '-')
+    })
+}
+pub fn parse_table(lines: &[&str]) -> Option<(Table, usize)> {
+    if lines.len() < 2 {
+        return None;
+    }
+    let head = lines[0].trim();
+    if !head.starts_with('|') || !head.contains('|') || !is_sep_row(lines[1]) {
+        return None;
+    }
+    let mut rows = vec![split_cells(head)];
+    let mut n = 2;
+    while n < lines.len() {
+        let l = lines[n].trim();
+        if l.starts_with('|') && l.contains('|') {
+            rows.push(split_cells(l));
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    Some((Table { rows }, n))
+}
+fn compute_widths(t: &Table, max_width: usize) -> Vec<usize> {
+    let cols = t.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; cols];
+    for r in &t.rows {
+        for (i, c) in r.iter().enumerate().take(cols) {
+            widths[i] = widths[i].max(UnicodeWidthStr::width(c.as_str())).min(48);
+        }
+    }
+    let total = widths.iter().sum::<usize>() + 3 * cols + 1;
+    let mut overshoot = total.saturating_sub(max_width);
+    while overshoot > 0 {
+        let mut reduced = false;
+        for w in widths.iter_mut() {
+            if overshoot == 0 {
+                break;
+            }
+            if *w > 3 {
+                *w -= 1;
+                overshoot -= 1;
+                reduced = true;
+            }
+        }
+        if !reduced {
+            break;
+        }
+    }
+    widths
+}
+fn fit(s: &str, w: usize) -> String {
+    if UnicodeWidthStr::width(s) <= w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut cur = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        if cur + cw > w {
+            break;
+        }
+        out.push(ch);
+        cur += cw;
+    }
+    if UnicodeWidthStr::width(out.as_str()) < w {
+        out.push('…');
+    }
+    out
+}
+fn table_row_line(cells: &[String], widths: &[usize]) -> String {
+    let mut out = String::from("│");
+    for (i, w) in widths.iter().enumerate() {
+        let cell = cells.get(i).map(|c| fit(c, *w)).unwrap_or_default();
+        out.push(' ');
+        out.push_str(&cell);
+        out.push_str(&" ".repeat(w.saturating_sub(UnicodeWidthStr::width(cell.as_str()))));
+        out.push_str(" │");
+    }
+    out
+}
+pub fn render_table(t: &Table, max_width: usize) -> Vec<String> {
+    let widths = compute_widths(t, max_width);
+    let rows: Vec<Vec<String>> = t
+        .rows
+        .iter()
+        .map(|r| {
+            let mut padded = r.clone();
+            padded.resize(widths.len(), String::new());
+            padded
+        })
+        .collect();
+    let sep = |left: &str, mid: &str, right: &str| {
+        let mut s = String::from(left);
+        for (i, w) in widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push_str(if i + 1 < widths.len() { mid } else { right });
+        }
+        s
+    };
+    let mut out = vec![sep("┌", "┬", "┐")];
+    out.push(table_row_line(&rows[0], &widths));
+    out.push(sep("├", "┼", "┤"));
+    for r in &rows[1..] {
+        out.push(table_row_line(r, &widths));
+    }
+    out.push(sep("└", "┴", "┘"));
+    out
 }
 const RESET: &str = "\x1b[0m";
 fn style_ansi(style: Style) -> &'static str {
@@ -295,5 +435,43 @@ mod tests {
         assert_eq!(st, None);
         assert_eq!(pre, "");
         assert_eq!(rest, "- 列表项");
+    }
+    #[test]
+    fn table_parse_and_render() {
+        let lines = ["| 项目 | 状态 |", "|---|---|", "| Rust | 完成 |", "| 发布 | 进行中 |", "结束文字"];
+        let (t, n) = parse_table(&lines).unwrap();
+        assert_eq!(n, 4, "表格消费 4 行，剩余文本不消费");
+        assert_eq!(t.rows.len(), 3);
+        assert_eq!(t.rows[0], vec!["项目", "状态"]);
+        assert_eq!(t.rows[2], vec!["发布", "进行中"]);
+        let rendered = render_table(&t, 40);
+        assert_eq!(rendered[0], "┌──────┬────────┐");
+        assert_eq!(rendered[1], "│ 项目 │ 状态   │");
+        assert_eq!(rendered[2], "├──────┼────────┤");
+        assert_eq!(rendered[3], "│ Rust │ 完成   │");
+        assert_eq!(rendered[5], "└──────┴────────┘");
+    }
+    #[test]
+    fn table_no_separator_returns_none() {
+        assert!(parse_table(&["| a | b |"]).is_none(), "单行非表格");
+        assert!(parse_table(&["| a | b |", "普通文字"]).is_none(), "无分隔行");
+        assert!(parse_table(&["普通 | 文字", "|---|---|"]).is_none(), "表头不以 | 开头");
+        assert!(parse_table(&["| a |", "|---|", "x"]).is_some(), "数据行仅一行也有效");
+    }
+    #[test]
+    fn table_escaped_pipe_and_uneven_rows() {
+        let (t, _) = parse_table(&["| 名字 | 值 |", "|---|---|", "| a\\|b | x |", "| 单列 |"]).unwrap();
+        assert_eq!(t.rows[1][0], "a|b", "转义管道符还原");
+        assert_eq!(t.rows[2], vec!["单列"]);
+        let rendered = render_table(&t, 40);
+        assert_eq!(rendered[3], "│ a|b  │ x  │", "数据行渲染: {}", rendered[3]);
+        assert_eq!(rendered[4], "│ 单列 │    │", "缺列自动补空: {}", rendered[4]);
+    }
+    #[test]
+    fn table_fits_width_truncates() {
+        let (t, _) = parse_table(&["| 名字 |", "|---|", "| 超级无敌长的名字在这里显示不下 |"]).unwrap();
+        for r in render_table(&t, 20) {
+            assert!(UnicodeWidthStr::width(r.as_str()) <= 20, "表格行超宽: {r}");
+        }
     }
 }

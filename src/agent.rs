@@ -1,54 +1,67 @@
-use serde_json::Value;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
-use std::sync::Mutex;
+use serde_json::Value;//处理json
+use std::collections::hash_map::DefaultHasher;//计算哈希
+use std::collections::HashSet;//集合 不能有重复元素，来记录用户已经允许的操作
+use std::sync::Mutex;//互斥锁
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
-use crate::backend::TokenBudget;
-use crate::compress;
-use crate::config::Config;
-use crate::llm::{ChatRequest, Llm, Msg, ToolCall};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};//原子类型 多线程安全读写
+use std::sync::mpsc::{Receiver, Sender};//多生产者单消费通道，不同线程传递消息
+use std::sync::Arc;//原子引用计数
+use crate::backend::TokenBudget;// 思考预算
+use crate::compress;//上下文压缩
+use crate::config::Config;//用户配置文件
+use crate::llm::{ChatRequest, Llm, Msg, ToolCall};//llm.rs
 use crate::prompt::{
     CHAT_ONLY_PROMPT, CHAT_PHILOSOPHY, FINALIZE_PROMPT, NATIVE_QQ_SYSTEM_PROMPT,
     NATIVE_SYSTEM_PROMPT, QQ_SYSTEM_PROMPT, SYSTEM_PROMPT,
-};
-use crate::registry::native_tools_json;
-use crate::session::SessionStore;
+};//不同的系统提示词
+use crate::registry::native_tools_json;//原生工具调用
+use crate::session::SessionStore;//管理用户对话文件，存储
 use crate::tools::{
     AskAnswer, AskRequest, PermDecision, PermRequest, QqOut, ToolCtx, execute,
-};
-const MAX_RELOADS: usize = 2;
-const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
-const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;
-const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 4;
-const NO_PERM_MSG: &str = "（无权限：当前用户只能闲聊，无法操作电脑或调用工具。请礼貌拒绝，不要尝试其他工具。）";
-static ACTIVE_AGENT_TURNS: AtomicUsize = AtomicUsize::new(0);
-
-struct ActiveTurnGuard;
+};//给模型的工具
+const MAX_RELOADS: usize = 2;//只能重载两次
+                             //现在重载和石没区别
+const MAX_IDENTICAL_TOOL_CALLS: usize = 2;//相同工具调用最多两次，
+const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;//结构连续三次
+const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 4;//失败四次
+const NO_PERM_MSG: &str = "（严格保密电脑信息!：当前用户只能闲聊）";
+static ACTIVE_AGENT_TURNS: AtomicUsize = AtomicUsize::new(0);//看看有多少回合在运行，如果大于0,证明模型目前忙
+struct ActiveTurnGuard;//标记令牌
 impl ActiveTurnGuard {
     fn enter() -> Self {
+        //fn enter()是一个静态的方法，ACTIVE_AGENT_TURNS是回合数量
+        //feth_add给这个全局静态变量来加1,并且返回旧的数值
         ACTIVE_AGENT_TURNS.fetch_add(1, Ordering::AcqRel);
+        //Ordering::AcqRel是Acquire-Release的语义复合体，在单一操作上同时要求释放效果，确保再此操作之前的所有写入对后续操作可见
+        //还有获取效果Acquire,再次操作之后的所有读取可以看到之前的写入。构建跨线程同步栅栏，保证计数器一致
         Self
     }
 }
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
+        //给这个数值减去1,保证不要提前return和异常导致死锁和计数器错误
         ACTIVE_AGENT_TURNS.fetch_sub(1, Ordering::AcqRel);
     }
 }
+//上面这依托说人话就是AtiveTurnGrad就是一个工牌，零大小类型，就标记一个事情，比如这个事件就叫做牛马上班。我他妈来啦！enter()函数就会给工厂的人数+1,你正常下班还是异常下班，rust的编译器会自动给你插入drop()方法
+//
+
+
+
+
 pub fn runtime_is_busy() -> bool {
-    ACTIVE_AGENT_TURNS.load(Ordering::Acquire) > 0
+    ACTIVE_AGENT_TURNS.load(Ordering::Acquire) > 0//load 读取当前原子变量的值 顺序读取
+                                                  //Acuqire保证load之后的内存读写操作都不会弄到这个前面
 }
 fn system_prompt_for(cfg: &Config, chat_mode: bool, chat_only: bool) -> String {
     if crate::subagents::in_child() {
+        //检查是不是子代理，如果是，就给子代理的系统提示词
         return crate::subagents::child_system_prompt().to_string();
     }
     let base = if chat_only {
-        CHAT_ONLY_PROMPT
+        CHAT_ONLY_PROMPT//纯闲聊
     } else if chat_mode && cfg.provider.native_tools {
-        NATIVE_QQ_SYSTEM_PROMPT
+        NATIVE_QQ_SYSTEM_PROMPT//多轮对话模式
     } else if chat_mode {
         QQ_SYSTEM_PROMPT
     } else if cfg.provider.native_tools {
@@ -62,6 +75,7 @@ fn system_prompt_for(cfg: &Config, chat_mode: bool, chat_only: bool) -> String {
         base.to_string()
     }
 }
+//上下文窗口计算
 pub fn effective_context_window(cfg: &Config, llm: &Llm) -> usize {
     crate::backend::effective_window_for_model(
         cfg.provider.ctx_override,
@@ -257,7 +271,8 @@ pub enum AgentEvent {
     ToolResult(String),
     Notice(String),
     Error(String),
-    Garbage { kind: String, sample: String, run: usize, total: usize, limit: usize },
+    // bug: 垃圾 token 检测已禁用
+    // Garbage { kind: String, sample: String, run: usize, total: usize, limit: usize },
     Done(String),
 }
 fn fwd_stream(ev: crate::llm::StreamEvent, on_event: &mut impl FnMut(AgentEvent)) {
@@ -267,9 +282,10 @@ fn fwd_stream(ev: crate::llm::StreamEvent, on_event: &mut impl FnMut(AgentEvent)
         crate::llm::StreamEvent::TokenProgress(progress) => {
             on_event(AgentEvent::TokenProgress(progress))
         }
-        crate::llm::StreamEvent::Garbage { kind, sample, run, total, limit } => {
-            on_event(AgentEvent::Garbage { kind: kind.to_string(), sample, run, total, limit })
-        }
+        // bug: 垃圾 token 检测已禁用
+        // crate::llm::StreamEvent::Garbage { kind, sample, run, total, limit } => {
+        //     on_event(AgentEvent::Garbage { kind: kind.to_string(), sample, run, total, limit })
+        // }
     }
 }
 fn trace_record_at(data_root: &std::path::Path, session: &str, ev: &AgentEvent) {
@@ -289,9 +305,10 @@ fn trace_record_at(data_root: &std::path::Path, session: &str, ev: &AgentEvent) 
             "cache_miss_tokens": progress.usage.cache_miss_tokens,
             "reasoning_tokens": progress.usage.reasoning_tokens,
         }),
-        AgentEvent::Garbage { kind, sample, run, total, limit } => serde_json::json!({
-            "kind": "garbage", "pos": kind, "sample": sample, "run": run, "total": total, "limit": limit
-        }),
+        // bug: 垃圾 token 检测已禁用
+        // AgentEvent::Garbage { kind, sample, run, total, limit } => serde_json::json!({
+        //     "kind": "garbage", "pos": kind, "sample": sample, "run": run, "total": total, "limit": limit
+        // }),
         AgentEvent::ToolRun { op, args } => serde_json::json!({"kind": "tool_run", "op": op, "args": args}),
         AgentEvent::ToolProgress(progress) => serde_json::json!({
             "kind": "tool_progress",

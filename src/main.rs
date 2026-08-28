@@ -527,14 +527,15 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
                 AgentEvent::ToolProgress(progress) => tui.push_tool_progress(&progress),
                 AgentEvent::ToolResult(r) => tui.push_tool_result(&r),
                 AgentEvent::Notice(n) => tui.push_system(n),
-                AgentEvent::Garbage { kind, sample, run, total, limit } => {
-                    let count = if limit == 0 {
-                        format!("（累计第 {total} 次，仅记录不中止）")
-                    } else {
-                        format!("（累计第 {total} 次 · 连续 {run}/{limit}）")
-                    };
-                    tui.push_bug_warn(format!("垃圾 token 检测（{kind}）: {sample}{count}"));
-                }
+                // bug: 垃圾 token 检测已禁用
+                // AgentEvent::Garbage { kind, sample, run, total, limit } => {
+                //     let count = if limit == 0 {
+                //         format!("（累计第 {total} 次，仅记录不中止）")
+                //     } else {
+                //         format!("（累计第 {total} 次 · 连续 {run}/{limit}）")
+                //     };
+                //     tui.push_bug_warn(format!("垃圾 token 检测（{kind}）: {sample}{count}"));
+                // }
                 AgentEvent::Error(e) => {
                     tui.push_error(e);
                 }

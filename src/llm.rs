@@ -45,7 +45,8 @@ pub enum StreamEvent {
     Delta(String),
     Reasoning(String),
     TokenProgress(TokenProgress),
-    Garbage { kind: &'static str, sample: String, run: usize, total: usize, limit: usize },
+    // bug: 垃圾 token 检测已禁用
+    // Garbage { kind: &'static str, sample: String, run: usize, total: usize, limit: usize },
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenProgress {
@@ -856,12 +857,13 @@ impl RemoteClient {
             return Ok(result);
         }
         let mut result = ChatResult::default();
-        let mut garbage_run: usize = 0;                                   
-        let mut garbage_total: usize = 0;                     
-        let mut reasoning_garbage_run: usize = 0;                  
-        let mut reasoning_garbage_total: usize = 0;                
+        // bug: 垃圾 token 检测已禁用（误杀正常输出）
+        // let mut garbage_run: usize = 0;
+        // let mut garbage_total: usize = 0;
+        // let mut reasoning_garbage_run: usize = 0;
+        // let mut reasoning_garbage_total: usize = 0;
         let mut tool_bufs: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new();                             
+            std::collections::HashMap::new();
         loop {
             let line = match http.next(cancel)? {
                 HttpEvent::Line(line) => line,
@@ -913,51 +915,53 @@ impl RemoteClient {
                 }
             }
             if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                let chars: Vec<char> = content.chars().collect();
-                let junk = content.contains("<unused")
-                    || (chars.len() >= 4
-                        && (chars.iter().all(|c| *c == chars[0])                           
-                            || chars.iter().all(|c| c.is_whitespace() || c.is_control())))         
-                    ;
-                if junk {
-                    garbage_run += 1;
-                    garbage_total += 1;
-                    on_event(StreamEvent::Garbage {
-                        kind: "正文",
-                        sample: content.chars().take(40).collect(),
-                        run: garbage_run,
-                        total: garbage_total,
-                        limit: 8,
-                    });
-                    if garbage_run >= 8 {
-                        return Err("模型输出异常（垃圾 token），已中止请求".into());
-                    }
-                } else {
-                    garbage_run = 0;
-                }
+                // bug: 垃圾 token 检测已禁用（误杀正常输出，如模型输出表格/重复符号）
+                // let chars: Vec<char> = content.chars().collect();
+                // let junk = content.contains("<unused")
+                //     || (chars.len() >= 4
+                //         && (chars.iter().all(|c| *c == chars[0])
+                //             || chars.iter().all(|c| c.is_whitespace() || c.is_control())))
+                //     ;
+                // if junk {
+                //     garbage_run += 1;
+                //     garbage_total += 1;
+                //     on_event(StreamEvent::Garbage {
+                //         kind: "正文",
+                //         sample: content.chars().take(40).collect(),
+                //         run: garbage_run,
+                //         total: garbage_total,
+                //         limit: 8,
+                //     });
+                //     if garbage_run >= 8 {
+                //         return Err("模型输出异常（垃圾 token），已中止请求".into());
+                //     }
+                // } else {
+                //     garbage_run = 0;
+                // }
                 result.text.push_str(content);
                 on_event(StreamEvent::Delta(content.to_string()));
             }
             if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                 result.reasoning.push_str(r);
-                let chars: Vec<char> = r.chars().collect();
-                let junk = r.contains("<unused")
-                    || (chars.len() >= 4
-                        && (chars.iter().all(|c| *c == chars[0])         
-                            || chars.iter().all(|c| c.is_whitespace() || c.is_control())));         
-                if junk {
-                    reasoning_garbage_run += 1;
-                    reasoning_garbage_total += 1;
-                    on_event(StreamEvent::Garbage {
-                        kind: "思考流",
-                        sample: r.chars().take(40).collect(),
-                        run: reasoning_garbage_run,
-                        total: reasoning_garbage_total,
-                        limit: 0,          
-                    });
-                } else {
-                    reasoning_garbage_run = 0;
-                }
+                // bug: 垃圾 token 检测已禁用（误杀正常输出）
+                // let chars: Vec<char> = r.chars().collect();
+                // let junk = r.contains("<unused")
+                //     || (chars.len() >= 4
+                //         && (chars.iter().all(|c| *c == chars[0])
+                //             || chars.iter().all(|c| c.is_whitespace() || c.is_control())));
+                // if junk {
+                //     reasoning_garbage_run += 1;
+                //     reasoning_garbage_total += 1;
+                //     on_event(StreamEvent::Garbage {
+                //         kind: "思考流",
+                //         sample: r.chars().take(40).collect(),
+                //         run: reasoning_garbage_run,
+                //         total: reasoning_garbage_total,
+                //         limit: 0,
+                //     });
+                // } else {
+                //     reasoning_garbage_run = 0;
+                // }
                 on_event(StreamEvent::Reasoning(r.to_string()));
                 let reasoning_limit = if disable_reasoning {
                     POST_TOOL_REASONING_MAX
@@ -1713,85 +1717,87 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("取消后服务端应观察到 TCP 断连并释放 slot");
     }
-    #[test]
-    fn stream_garbage_content_reported_and_aborted() {
-        let mut chunks: Vec<String> = vec![r#"{"choices":[{"delta":{"content":"你好"}}]}"#.into()];
-        for _ in 0..9 {
-            chunks.push(r#"{"choices":[{"delta":{"content":"<unused42>"}}]}"#.into());
-        }
-        let port = serve_sse(chunks);
-        let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
-        let cancel = AtomicBool::new(false);
-        let mut events = Vec::new();
-        let r = llm.stream(
-            &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
-            &cancel,
-            |ev| events.push(ev),
-        );
-        assert!(r.is_err(), "连续垃圾应中止请求: {r:?}");
-        assert!(r.unwrap_err().contains("垃圾 token"));
-        let garb: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::Garbage { kind, sample, run, total, limit } => {
-                    Some((*kind, sample.clone(), *run, *total, *limit))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(garb.len(), 8, "应实时上报 8 次垃圾事件");
-        let (kind, sample, run, total, limit) = &garb[0];
-        assert_eq!(*kind, "正文");
-        assert_eq!(sample, "<unused42>");
-        assert_eq!(*run, 1, "连续计数从 1 递增");
-        assert_eq!(*total, 1, "累计计数从 1 递增");
-        assert_eq!(*limit, 8);
-        assert_eq!(garb[7].2, 8, "最后一次连续计数为 8");
-        assert_eq!(garb[7].3, 8, "累计计数与连续一致（全程未被打断）");
-        assert!(
-            events.iter().any(|e| matches!(e, StreamEvent::Delta(d) if d == "你好")),
-            "正常 chunk 仍应送达 Delta"
-        );
-    }
-    #[test]
-    fn stream_reasoning_symbols_never_abort() {
-        let mut chunks: Vec<String> = Vec::new();
-        for _ in 0..9 {
-            chunks.push(r#"{"choices":[{"delta":{"reasoning_content":"/////"}}]}"#.to_string());
-        }
-        for _ in 0..9 {
-            chunks.push(r#"{"choices":[{"delta":{"reasoning_content":"-"}}]}"#.to_string());
-        }
-        let port = serve_sse(chunks);
-        let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
-        let cancel = AtomicBool::new(false);
-        let mut events = Vec::new();
-        let r = llm.stream(
-            &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
-            &cancel,
-            |ev| events.push(ev),
-        );
-        let result = r.expect("思考流垃圾永不中止（limit=0）");
-        let garb: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::Garbage { kind, sample, run, total, limit } => {
-                    Some((*kind, sample.clone(), *run, *total, *limit))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(garb.len(), 9, "5 连 / 的 chunk 各上报一次（仅记录）");
-        let (kind, sample, run, total, limit) = &garb[0];
-        assert_eq!(*kind, "思考流");
-        assert_eq!(sample, "/////");
-        assert_eq!(*run, 1);
-        assert_eq!(*total, 1);
-        assert_eq!(*limit, 0, "思考流 limit=0 = 仅记录不中止");
-        assert_eq!(garb[8].2, 9, "9 连 / 的连续计数到 9 也不中止");
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::Reasoning(s) if s == "-")), "单符号思考增量照常送达");
-        assert_eq!(result.reasoning, "/////".repeat(9) + &"-".repeat(9), "思考流全文收集");
-    }
+    // bug: 测试的垃圾 token 检测已被禁用
+    // #[test]
+    // fn stream_garbage_content_reported_and_aborted() {
+    //     let mut chunks: Vec<String> = vec![r#"{"choices":[{"delta":{"content":"你好"}}]}"#.into()];
+    //     for _ in 0..9 {
+    //         chunks.push(r#"{"choices":[{"delta":{"content":"<unused42>"}}]}"#.into());
+    //     }
+    //     let port = serve_sse(chunks);
+    //     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
+    //     let cancel = AtomicBool::new(false);
+    //     let mut events = Vec::new();
+    //     let r = llm.stream(
+    //         &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
+    //         &cancel,
+    //         |ev| events.push(ev),
+    //     );
+    //     assert!(r.is_err(), "连续垃圾应中止请求: {r:?}");
+    //     assert!(r.unwrap_err().contains("垃圾 token"));
+    //     let garb: Vec<_> = events
+    //         .iter()
+    //         .filter_map(|e| match e {
+    //             StreamEvent::Garbage { kind, sample, run, total, limit } => {
+    //                 Some((*kind, sample.clone(), *run, *total, *limit))
+    //             }
+    //             _ => None,
+    //         })
+    //         .collect();
+    //     assert_eq!(garb.len(), 8, "应实时上报 8 次垃圾事件");
+    //     let (kind, sample, run, total, limit) = &garb[0];
+    //     assert_eq!(*kind, "正文");
+    //     assert_eq!(sample, "<unused42>");
+    //     assert_eq!(*run, 1, "连续计数从 1 递增");
+    //     assert_eq!(*total, 1, "累计计数从 1 递增");
+    //     assert_eq!(*limit, 8);
+    //     assert_eq!(garb[7].2, 8, "最后一次连续计数为 8");
+    //     assert_eq!(garb[7].3, 8, "累计计数与连续一致（全程未被打断）");
+    //     assert!(
+    //         events.iter().any(|e| matches!(e, StreamEvent::Delta(d) if d == "你好")),
+    //         "正常 chunk 仍应送达 Delta"
+    //     );
+    // }
+    // bug: 测试的垃圾 token 检测已被禁用
+    // #[test]
+    // fn stream_reasoning_symbols_never_abort() {
+    //     let mut chunks: Vec<String> = Vec::new();
+    //     for _ in 0..9 {
+    //         chunks.push(r#"{"choices":[{"delta":{"reasoning_content":"/////"}}]}"#.to_string());
+    //     }
+    //     for _ in 0..9 {
+    //         chunks.push(r#"{"choices":[{"delta":{"reasoning_content":"-"}}]}"#.to_string());
+    //     }
+    //     let port = serve_sse(chunks);
+    //     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
+    //     let cancel = AtomicBool::new(false);
+    //     let mut events = Vec::new();
+    //     let r = llm.stream(
+    //         &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
+    //         &cancel,
+    //         |ev| events.push(ev),
+    //     );
+    //     let result = r.expect("思考流垃圾永不中止（limit=0）");
+    //     let garb: Vec<_> = events
+    //         .iter()
+    //         .filter_map(|e| match e {
+    //             StreamEvent::Garbage { kind, sample, run, total, limit } => {
+    //                 Some((*kind, sample.clone(), *run, *total, *limit))
+    //             }
+    //             _ => None,
+    //         })
+    //         .collect();
+    //     assert_eq!(garb.len(), 9, "5 连 / 的 chunk 各上报一次（仅记录）");
+    //     let (kind, sample, run, total, limit) = &garb[0];
+    //     assert_eq!(*kind, "思考流");
+    //     assert_eq!(sample, "/////");
+    //     assert_eq!(*run, 1);
+    //     assert_eq!(*total, 1);
+    //     assert_eq!(*limit, 0, "思考流 limit=0 = 仅记录不中止");
+    //     assert_eq!(garb[8].2, 9, "9 连 / 的连续计数到 9 也不中止");
+    //     assert!(events.iter().any(|e| matches!(e, StreamEvent::Reasoning(s) if s == "-")), "单符号思考增量照常送达");
+    //     assert_eq!(result.reasoning, "/////".repeat(9) + &"-".repeat(9), "思考流全文收集");
+    // }
     #[test]
     fn stream_reasoning_loop_breaks_stream() {
         let mut chunks: Vec<String> = Vec::new();
@@ -1914,78 +1920,79 @@ mod tests {
         let twice = format!("{unit}{unit}然后正常收尾结束。\n");
         assert!(!tail_repeats(&twice, 40, 3), "仅尾部自身 1 次命中不应触发");
     }
-    #[test]
-    fn stream_uniform_newlines_reported_and_aborted() {
-        let mut chunks: Vec<String> = Vec::new();
-        for _ in 0..9 {
-            chunks.push(r#"{"choices":[{"delta":{"content":"\n\n\n\n"}}]}"#.to_string());
-        }
-        let port = serve_sse(chunks);
-        let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
-        let cancel = AtomicBool::new(false);
-        let mut events = Vec::new();
-        let r = llm.stream(
-            &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
-            &cancel,
-            |ev| events.push(ev),
-        );
-        assert!(r.is_err(), "换行刷屏应中止: {r:?}");
-        let garb: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::Garbage { kind, sample, run, .. } => Some((*kind, sample.clone(), *run)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(garb.len(), 8, "应上报 8 次");
-        assert_eq!(garb[0].0, "正文");
-        assert_eq!(garb[0].1, "\n\n\n\n");
-        assert_eq!(garb[0].2, 1);
-    }
-    #[test]
-    fn stream_uniform_letters_reported() {
-        let mut chunks: Vec<String> = Vec::new();
-        for _ in 0..9 {
-            chunks.push(r#"{"choices":[{"delta":{"content":"GGGGGGGG"}}]}"#.to_string());
-        }
-        let port = serve_sse(chunks);
-        let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
-        let cancel = AtomicBool::new(false);
-        let mut events = Vec::new();
-        let r = llm.stream(
-            &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
-            &cancel,
-            |ev| events.push(ev),
-        );
-        assert!(r.is_err(), "字母重复刷屏应中止: {r:?}");
-    }
-    #[test]
-    fn stream_garbage_total_accumulates_across_interruptions() {
-        let mut chunks: Vec<String> = Vec::new();
-        for _ in 0..6 {
-            chunks.push(r#"{"choices":[{"delta":{"content":"<unused42>"}}]}"#.to_string());
-            chunks.push(r#"{"choices":[{"delta":{"content":"正常回复内容"}}]}"#.to_string());
-        }
-        let port = serve_sse(chunks);
-        let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
-        let cancel = AtomicBool::new(false);
-        let mut events = Vec::new();
-        let r = llm.stream(
-            &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
-            &cancel,
-            |ev| events.push(ev),
-        );
-        assert!(r.is_ok(), "被打断的垃圾不应中止: {r:?}");
-        let garb: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::Garbage { run, total, .. } => Some((*run, *total)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(garb.len(), 6, "每次垃圾都上报");
-        assert_eq!(garb[0], (1, 1), "第一次: 连续 1 累计 1");
-        assert_eq!(garb[1], (1, 2), "被打断后: 连续重置为 1，累计到 2");
-        assert_eq!(garb[5], (1, 6), "最后一次: 连续 1 累计 6");
-    }
+    // bug: 测试的垃圾 token 检测已被禁用
+    // #[test]
+    // fn stream_uniform_newlines_reported_and_aborted() {
+    //     let mut chunks: Vec<String> = Vec::new();
+    //     for _ in 0..9 {
+    //         chunks.push(r#"{"choices":[{"delta":{"content":"\n\n\n\n"}}]}"#.to_string());
+    //     }
+    //     let port = serve_sse(chunks);
+    //     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
+    //     let cancel = AtomicBool::new(false);
+    //     let mut events = Vec::new();
+    //     let r = llm.stream(
+    //         &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
+    //         &cancel,
+    //         |ev| events.push(ev),
+    //     );
+    //     assert!(r.is_err(), "换行刷屏应中止: {r:?}");
+    //     let garb: Vec<_> = events
+    //         .iter()
+    //         .filter_map(|e| match e {
+    //             StreamEvent::Garbage { kind, sample, run, .. } => Some((*kind, sample.clone(), *run)),
+    //             _ => None,
+    //         })
+    //         .collect();
+    //     assert_eq!(garb.len(), 8, "应上报 8 次");
+    //     assert_eq!(garb[0].0, "正文");
+    //     assert_eq!(garb[0].1, "\n\n\n\n");
+    //     assert_eq!(garb[0].2, 1);
+    // }
+    // #[test]
+    // fn stream_uniform_letters_reported() {
+    //     let mut chunks: Vec<String> = Vec::new();
+    //     for _ in 0..9 {
+    //         chunks.push(r#"{"choices":[{"delta":{"content":"GGGGGGGG"}}]}"#.to_string());
+    //     }
+    //     let port = serve_sse(chunks);
+    //     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
+    //     let cancel = AtomicBool::new(false);
+    //     let mut events = Vec::new();
+    //     let r = llm.stream(
+    //         &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
+    //         &cancel,
+    //         |ev| events.push(ev),
+    //     );
+    //     assert!(r.is_err(), "字母重复刷屏应中止: {r:?}");
+    // }
+    // #[test]
+    // fn stream_garbage_total_accumulates_across_interruptions() {
+    //     let mut chunks: Vec<String> = Vec::new();
+    //     for _ in 0..6 {
+    //         chunks.push(r#"{"choices":[{"delta":{"content":"<unused42>"}}]}"#.to_string());
+    //         chunks.push(r#"{"choices":[{"delta":{"content":"正常回复内容"}}]}"#.to_string());
+    //     }
+    //     let port = serve_sse(chunks);
+    //     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
+    //     let cancel = AtomicBool::new(false);
+    //     let mut events = Vec::new();
+    //     let r = llm.stream(
+    //         &ChatRequest { messages: vec![Msg::new("user", "hi")], tools: None, max_tokens: None, stream: true },
+    //         &cancel,
+    //         |ev| events.push(ev),
+    //     );
+    //     assert!(r.is_ok(), "被打断的垃圾不应中止: {r:?}");
+    //     let garb: Vec<_> = events
+    //         .iter()
+    //         .filter_map(|e| match e {
+    //             StreamEvent::Garbage { run, total, .. } => Some((*run, *total)),
+    //             _ => None,
+    //         })
+    //         .collect();
+    //     assert_eq!(garb.len(), 6, "每次垃圾都上报");
+    //     assert_eq!(garb[0], (1, 1), "第一次: 连续 1 累计 1");
+    //     assert_eq!(garb[1], (1, 2), "被打断后: 连续重置为 1，累计到 2");
+    //     assert_eq!(garb[5], (1, 6), "最后一次: 连续 1 累计 6");
+    // }
 }
