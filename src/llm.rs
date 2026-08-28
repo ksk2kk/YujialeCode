@@ -1256,7 +1256,7 @@ impl MockClient {
     ) -> Result<ChatResult, String> {
         let summarized = req.messages.iter().any(|m| m.content.contains(compress::SUMMARIZATION_PROMPT));
         if summarized {
-            let text = "用户的目标是测试 YJLcoder。已完成：配置加载、工具注册、会话持久化、上下文压缩。下一步：接入真实模型与 QQ 桥接。".to_string();
+            let text = "用户的目标是测试 Yujiale Code。已完成：配置加载、工具注册、会话持久化、上下文压缩。下一步：接入真实模型与 QQ 桥接。".to_string();
             for chunk in split_chunks(&text) {
                 on_event(StreamEvent::Delta(chunk));
             }

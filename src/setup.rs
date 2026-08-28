@@ -68,7 +68,7 @@ pub fn run_wizard(cfg: &mut Config) {
 fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str, &str)]) {
     println!();
     println!("==============================================");
-    println!("  YJLcoder 配置向导");
+    println!("  Yujiale Code 配置向导");
     println!("  配置将写入 {}", crate::config::config_path().display());
     println!("  提示: 模型服务的最大 token / 上下文会自动从服务端探测，");
     println!("        不需要手动配置。");
@@ -145,7 +145,7 @@ fn run_wizard_on(cfg: &mut Config, input: &mut dyn BufRead, candidates: &[(&str,
         if let Some(m) = &cc.model {
             println!("  模型: {m}");
         }
-        println!("  （仅读取并转换为 YJLcoder 配置，Claude Code 的文件不会被修改）");
+        println!("  （仅读取并转换为 Yujiale Code 配置，Claude Code 的文件不会被修改）");
         if prompt_yes_no("使用该配置？", true, input) {
             apply_cc(cfg, &cc);
             println!("\n已导入 Claude Code 配置。");

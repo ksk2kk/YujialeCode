@@ -2,7 +2,7 @@
 //!
 //! 这个模块故意不把 WebUI token 交给模型。模型只需要调用 `qq_bot {}`，工具会在
 //! 本机创建或接管 NapCat、保存 0600 凭据，并打开 NapCat 自己维护的完整 WebUI
-//! 登录页。YJLcoder 不复制二维码、不刷新页面；只观察登录状态并管理 OneBot 连接。
+//! 登录页。Yujiale Code 不复制二维码、不刷新页面；只观察登录状态并管理 OneBot 连接。
 
 use serde_json::{json, Value};
 use std::fs;
@@ -222,7 +222,7 @@ pub fn execute(
             let (state_name, note) = if state == LoginState::LoggedIn {
                 (
                     "logged_in",
-                    "用户已在 NapCat 原生 WebUI 完成扫码；OneBot 会自动连接 YJLcoder",
+                    "用户已在 NapCat 原生 WebUI 完成扫码；OneBot 会自动连接 Yujiale Code",
                 )
             } else {
                 (
@@ -273,7 +273,7 @@ pub fn execute(
                 } else {
                     "scan_required"
                 },
-                Some("扫码完成后 OneBot 会自动连接 YJLcoder，无需手工复制 token"),
+                Some("扫码完成后 OneBot 会自动连接 Yujiale Code，无需手工复制 token"),
             ))
         }
         "start" => {
@@ -590,7 +590,7 @@ fn parse_login_state(text: &str) -> LoginState {
     state
 }
 
-/// 反向 OneBot WebSocket 只有 QQ 登录完成后才会连接到 YJLcoder 的 6701 端口。
+/// 反向 OneBot WebSocket 只有 QQ 登录完成后才会连接到 Yujiale Code 的 6701 端口。
 /// 这是独立于历史日志的当前态兜底，避免群消息刷屏后成功日志被挤出 tail 窗口。
 fn onebot_connected(args: &Value) -> bool {
     let port = args

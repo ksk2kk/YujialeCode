@@ -543,7 +543,7 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
 
     if stop == CommandStop::Completed {
         // A shell can exit while a background grandchild still owns its pipes.
-        // YJLcoder has no background-task contract yet, so clean that group up
+        // Yujiale Code has no background-task contract yet, so clean that group up
         // instead of leaking it into future sessions.
         terminate_process_group(process_group);
     } else {

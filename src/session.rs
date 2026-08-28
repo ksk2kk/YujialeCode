@@ -123,7 +123,7 @@ impl SessionStore {
 }
 pub fn export_markdown(id: &str, messages: &[Msg]) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# YJLcoder 会话导出: {id}\n\n"));
+    out.push_str(&format!("# Yujiale Code 会话导出: {id}\n\n"));
     out.push_str(&format!(
         "- 导出时间: {}\n- 消息数: {}\n\n",
         crate::time::now_stamp(),
@@ -233,7 +233,7 @@ mod tests {
             Msg::new("tool", "main.c"),
         ];
         let md = export_markdown("main", &msgs);
-        assert!(md.starts_with("# YJLcoder 会话导出: main"), "标题含会话 id");
+        assert!(md.starts_with("# Yujiale Code 会话导出: main"), "标题含会话 id");
         assert!(md.contains("- 导出时间: "), "含导出时间");
         assert!(md.contains("- 消息数: 3"), "含消息数");
         assert!(md.contains("## [0] 用户"), "用户消息");

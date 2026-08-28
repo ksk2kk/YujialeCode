@@ -2100,13 +2100,13 @@ impl Tui {
         let face = mascot_compact(state);
         if self.fixed_header_height() == 1 {
             let text = truncate_width(
-                &format!("YJLcoder v{} · {face} {label} · {}", env!("CARGO_PKG_VERSION"), self.header),
+                &format!("Yujiale Code v{} · {face} {label} · {}", env!("CARGO_PKG_VERSION"), self.header),
                 width,
             );
             return vec![RLine { shade: None, styled: format!("{color}{text}{C_RESET}") }];
         }
         let title = format!(
-            "─── YJLcoder v{} · {label} ",
+            "─── Yujiale Code v{} · {label} ",
             env!("CARGO_PKG_VERSION")
         );
         let title = truncate_width(&title, width.saturating_sub(2));
@@ -2170,7 +2170,7 @@ impl Tui {
             "Fixed header · conversation-only scrolling".to_string(),
             "Read and ls pages without silent truncation".to_string(),
             "".to_string(),
-            "YJLcoder · local-first coding agent".to_string(),
+            "Yujiale Code · local-first coding agent".to_string(),
         ];
         let mut out = vec![RLine { shade: None, styled: format!("{C_GRAY}{top}{C_RESET}") }];
         for index in 0..left.len().max(right.len()) {
@@ -3204,7 +3204,7 @@ mod tests {
         t.set_ctx_estimate(500_000, 1_000_000);
         let welcome = t.build_frame();
         let welcome_plain = strip_ansi(&welcome);
-        assert!(welcome_plain.contains("YJLcoder v"), "欢迎卡品牌");
+        assert!(welcome_plain.contains("Yujiale Code v"), "欢迎卡品牌");
         assert!(welcome_plain.contains("Welcome back!"), "Claude Code 式欢迎卡");
         assert!(welcome_plain.contains("Tips for getting started"), "欢迎卡双栏提示");
         assert!(welcome_plain.contains("Meet Y仔"), "原创吉祥物说明");
@@ -3215,7 +3215,7 @@ mod tests {
         t.begin_assistant();
         t.assistant_delta("正在扫描");
         let frame = t.build_frame();
-        assert!(strip_ansi(&frame).contains("YJLcoder v"), "对话开始后欢迎卡仍固定");
+        assert!(strip_ansi(&frame).contains("Yujiale Code v"), "对话开始后欢迎卡仍固定");
         assert!(strip_ansi(&frame).contains("THINK"), "生成中切换思考状态");
         assert!(strip_ansi(&frame).contains("◔ ◔"), "思考时眼睛改变");
         assert!(frame.contains("\x1b[K"), "整帧重画应逐行清屏");
@@ -3325,7 +3325,7 @@ mod tests {
         let scrolled_header: Vec<&str> = scrolled.lines().take(header_h).collect();
         assert_eq!(bottom_header, scrolled_header, "滚动只能改变欢迎卡下方的聊天视口");
         assert_ne!(bottom, scrolled, "对话区域本身应发生滚动");
-        assert!(scrolled_header.iter().any(|line| line.contains("YJLcoder v")));
+        assert!(scrolled_header.iter().any(|line| line.contains("Yujiale Code v")));
         assert!(!scrolled_header.iter().any(|line| line.contains("对话行")));
     }
     #[test]
@@ -3462,7 +3462,7 @@ mod tests {
         assert_eq!(t.handle_key(Key::CtrlC), Action::None);
         assert!(t.is_asking(), "Ctrl+C 不应打断 ask_user");
         let plain = strip_ansi(&t.build_frame());
-        assert!(plain.contains("YJLcoder v"), "小终端仍保留固定欢迎栏");
+        assert!(plain.contains("Yujiale Code v"), "小终端仍保留固定欢迎栏");
         assert!(plain.contains("选择一个方案"));
         assert!(plain.contains("❯ 1. A"), "选项窗口至少显示当前项");
         assert_eq!(t.handle_key(Key::Esc), Action::Cancel);

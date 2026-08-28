@@ -1579,7 +1579,7 @@ mod tests {
         }));
         assert!(output_looks_broken(&ChatResult::default()));
         assert!(!output_looks_broken(&ChatResult {
-            text: "你好，我是 YJLcoder。".into(),
+            text: "你好，我是 Yujiale Code。".into(),
             ..Default::default()
         }));
         assert!(!output_looks_broken(&ChatResult {
@@ -1650,7 +1650,7 @@ mod tests {
         assert!(events.is_empty(), "chat_only 不应产生工具事件: {events:?}");
         let msgs = agent.store.current().messages;
         assert!(!msgs.iter().any(|m| m.content.contains("【工具结果】")), "不得执行工具");
-        assert!(msgs.iter().any(|m| m.content.contains("无权限")), "应回灌无权限说明");
+        assert!(msgs.iter().any(|m| m.content.contains("只能闲聊")), "应回灌无权限说明");
         let _ = std::fs::remove_dir_all(&d);
     }
     #[test]

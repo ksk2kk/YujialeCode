@@ -100,12 +100,12 @@ fn main() {
                 model_override = args.get(i).cloned();
             }
             "--version" | "-V" => {
-                println!("YJLcoder {}", env!("CARGO_PKG_VERSION"));
+                println!("Yujiale Code {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             "--help" | "-h" => {
                 println!(
-                    "YJLcoder — 极简纯 Rust 本地模型 CLI Agent\n\
+                    "Yujiale Code — 极简纯 Rust 本地模型 CLI Agent\n\
                      \n\
                      用法:\n\
                        yjlcoder                 TUI 模式\n\
@@ -288,7 +288,7 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
         }
     } else {
         tui.push_system(
-            "欢迎使用 YJLcoder。先用方向键选择供应商和模型；API Key 只保存在本机，界面不会回显明文。"
+            "欢迎使用 Yujiale Code。先用方向键选择供应商和模型；API Key 只保存在本机，界面不会回显明文。"
                 .into(),
         );
         tui.open_provider_setup(&cfg);
