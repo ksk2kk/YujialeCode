@@ -51,7 +51,10 @@ pub struct AskAnnotation {
     pub notes: Option<String>,
 }
 /// 照 grok 原版的 outcome 模型：取消是成功结果，不是错误。
+/// ChatAboutThis/SkipInterview 是 grok 协议完整形态（plan 模式专用），
+/// 当前 UI 不触发但保留线型兼容。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum AskOutcome {
     Accepted {
         answers: Vec<(String, Vec<String>)>,
@@ -2054,6 +2057,7 @@ fn memory_write(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
 }
 /// grok 原版文案（format.rs 逐字）：取消不是错误。
 pub const ASK_CANCEL_TEXT: &str = "User declined to answer the questions. Continue with the task using your best judgment, or ask different questions.";
+#[allow(dead_code)]
 pub const ASK_NO_OPERATOR_TEXT: &str = "No user is available to answer questions in this non-interactive session. Continue with your best judgment; do not wait for clarification.";
 fn ask_user(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
     let (questions, outcome) = request_user_answers(args, ctx)?;
@@ -2235,6 +2239,7 @@ pub fn ask_outcome_to_json(outcome: &AskOutcome) -> Value {
         AskOutcome::Cancelled => serde_json::json!({"outcome": "cancelled"}),
     }
 }
+#[allow(dead_code)]
 fn parse_labels_answer(value: &Value) -> Vec<String> {
     match value {
         Value::String(text) => vec![text.clone()],

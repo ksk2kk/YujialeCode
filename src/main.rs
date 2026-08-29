@@ -195,7 +195,6 @@ fn main() {
                 });
         }
         exec_grok_tui(&args);
-        return;
     }
     if legacy_tui && qq_mode {
         run_tui(cfg, llm, true, open_setup);
