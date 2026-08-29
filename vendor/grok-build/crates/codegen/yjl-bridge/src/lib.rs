@@ -852,7 +852,7 @@ impl acp::Agent for YjlAgent {
 impl YjlAgent {
     /// 在桥内执行斜杠命令；结果文本直接作为助手消息回显。
     /// 只覆盖无副作用或作用于会话存储的命令；配置类命令提示用 yjlcoder TUI。
-    fn handle_slash_command(&self, session_id: &str, line: &str) -> String {
+    fn handle_slash_command(&self, _session_id: &str, line: &str) -> String {
         let mut parts = line.trim_start_matches('/').splitn(2, ' ');
         let name = parts.next().unwrap_or_default().to_ascii_lowercase();
         let rest = parts.next().unwrap_or_default().trim().to_string();
@@ -976,7 +976,7 @@ impl YjlAgent {
                 }
             }
             "agents" => {
-                let (action, value) = rest
+                let (action, _value) = rest
                     .split_once(' ')
                     .map(|(a, v)| (a.to_ascii_lowercase(), v.trim()))
                     .unwrap_or_else(|| (rest.to_ascii_lowercase(), ""));

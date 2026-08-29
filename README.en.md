@@ -33,6 +33,20 @@ This project is named after my friend [Yujiale](https://github.com/dawalishi821)
 
 ## Build and Run
 
+**One-line install** (handles Rust / protoc / clone / both builds / installs the `ycode` command):
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/ksk2kk/YujialeCode/main/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/ksk2kk/YujialeCode/main/install.ps1 | iex
+```
+
+**Manual build:**
+
 ```bash
 # 1) Build the main binary
 cargo build --release

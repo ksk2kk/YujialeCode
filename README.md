@@ -42,6 +42,20 @@
 
 ## 构建与运行
 
+**一键安装**（自动处理 Rust / protoc / 克隆 / 双构建 / 安装 `ycode` 命令）：
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/ksk2kk/YujialeCode/main/install.sh | bash
+```
+
+```powershell
+# Windows（PowerShell）
+irm https://raw.githubusercontent.com/ksk2kk/YujialeCode/main/install.ps1 | iex
+```
+
+**手动构建：**
+
 ```bash
 # 1) 构建主程序
 cargo build --release
