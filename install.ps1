@@ -57,6 +57,14 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Die "Rust 安装失败" }
 Info "Rust: $(cargo --version)"
 
+# 确保 ~/.cargo/bin 在用户 PATH（rustup 一般会写；双保险）
+$cargoBin = Join-Path $Home8 ".cargo\bin"
+$userPath0 = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath0 -notlike "*$cargoBin*") -and (Test-Path $cargoBin)) {
+    [Environment]::SetEnvironmentVariable("Path", "$cargoBin;$userPath0", "User")
+    Warn "已把 $cargoBin 加入用户 PATH（新终端生效）"
+}
+
 # ── 4) protoc ────────────────────────────────────────────────────────────
 $ProtoDir = Join-Path $Home8 ".local\bin"
 $ProtoBin = Join-Path $ProtoDir "protoc.exe"

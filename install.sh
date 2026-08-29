@@ -39,6 +39,29 @@ fi
 command -v cargo >/dev/null 2>&1 || die "Rust 安装失败；请手动执行 https://rustup.rs 后重试"
 info "Rust：$(cargo --version)"
 
+# PATH 探测帮手：确保目录写入用户 rc（按 $SHELL 选 zshrc/bashrc + profile）与当前 PATH。
+# 修非交互 shell（curl|bash）下 ZSH_VERSION 恒空的坑：改用 $SHELL 判断。
+ensure_path_entry() {
+    _ep_dir="$1"; _ep_line="$2"
+    _ep_shell_rc="$HOME/.bashrc"
+    case "${SHELL:-bash}" in
+        *zsh)  _ep_shell_rc="$HOME/.zshrc" ;;
+        *fish) _ep_shell_rc="$HOME/.config/fish/config.fish" ;;
+    esac
+    for _ep_rc in "$_ep_shell_rc" "$HOME/.profile"; do
+        [ -f "$_ep_rc" ] || touch "$_ep_rc"
+        if ! grep -qF -- "$_ep_line" "$_ep_rc" 2>/dev/null; then
+            printf '\n%s\n' "$_ep_line" >> "$_ep_rc"
+        fi
+    done
+    case ":$PATH:" in
+        *":$_ep_dir:"*) ;;
+        *) export PATH="$_ep_dir:$PATH" ;;
+    esac
+}
+# ~/.cargo/bin 全局可用（rustup 非交互安装对 zsh 用户常漏写 rc）
+ensure_path_entry "$HOME/.cargo/bin" 'export PATH="$HOME/.cargo/bin:$PATH"'
+
 # ── 3) protoc（Grok UI 构建需要）────────────────────────────────────────
 if ! command -v protoc >/dev/null 2>&1; then
     OS="$(uname -s)"; ARCH="$(uname -m)"
@@ -88,16 +111,9 @@ LAUNCHER
 chmod +x "$HOME/.local/bin/ycode"
 install -m 755 "$REPO_DIR/target/release/yjlcoder" "$HOME/.local/bin/yjlcoder" 2>/dev/null || true
 
-case ":$PATH:" in
-    *":$HOME/.local/bin:"*) PATH_OK=1 ;;
-    *) PATH_OK=0 ;;
-esac
-if [ "$PATH_OK" = "0" ]; then
-    SHELL_RC="$HOME/.bashrc"
-    [ -n "${ZSH_VERSION:-}" ] && SHELL_RC="$HOME/.zshrc"
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
-    warn "已把 ~/.local/bin 写入 $SHELL_RC；请执行: source $SHELL_RC（或重开终端）"
-fi
+# ycode 全局可用：~/.local/bin 写入用户 rc（含 zsh 修正）与当前 PATH
+ensure_path_entry "$HOME/.local/bin" 'export PATH="$HOME/.local/bin:$PATH"'
+info "PATH 已配置：~/.cargo/bin 与 ~/.local/bin 全局可用（新开终端生效；当前终端已直接可用）"
 
 info "安装完成！"
 printf '  启动：\033[1mycode\033[0m（Grok UI，首次进入自动弹配置向导）\n'
