@@ -271,31 +271,98 @@ pub struct Tui {
     sel_start_row: usize,
     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
 }
+/// 终端 raw 模式守卫（跨平台：unix=termios，windows=Console Mode + VT 输入）。
 pub struct RawGuard {
+    #[cfg(unix)]
     orig: libc::termios,
+    #[cfg(windows)]
+    orig_in: u32,
+    #[cfg(windows)]
+    orig_out: u32,
 }
 impl RawGuard {
     pub fn enable() -> Self {
-        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::tcgetattr(0, &mut orig);
+        #[cfg(unix)]
+        {
+            let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::tcgetattr(0, &mut orig);
+            }
+            let mut raw = orig;
+            unsafe {
+                libc::cfmakeraw(&mut raw);
+            }
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, &raw);
+            }
+            RawGuard { orig }
         }
-        let mut raw = orig;
-        unsafe {
-            libc::cfmakeraw(&mut raw);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode,
+                CONSOLE_MODE, DISABLE_NEWLINE_AUTO_RETURN,
+                ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+                ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            unsafe fn mode_of(handle: windows_sys::Win32::Foundation::HANDLE) -> u32 {
+                let mut m: CONSOLE_MODE = 0;
+                if GetConsoleMode(handle, &mut m) == 0 {
+                    return 0;
+                }
+                m
+            }
+            unsafe {
+                let hin = GetStdHandle(STD_INPUT_HANDLE);
+                let hout = GetStdHandle(STD_OUTPUT_HANDLE);
+                let (orig_in, orig_out) = if hin != INVALID_HANDLE_VALUE {
+                    let mi = mode_of(hin);
+                    let mo = if hout != INVALID_HANDLE_VALUE {
+                        mode_of(hout)
+                    } else {
+                        0
+                    };
+                    // VT 输入模式让按键以 ANSI 转义序列到达（与 KeyParser 兼容）
+                    SetConsoleMode(
+                        hin,
+                        mi & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+                            | ENABLE_VIRTUAL_TERMINAL_INPUT,
+                    );
+                    if hout != INVALID_HANDLE_VALUE {
+                        SetConsoleMode(hout, mo | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+                    }
+                    (mi, mo)
+                } else {
+                    (0, 0)
+                };
+                RawGuard { orig_in, orig_out }
+            }
         }
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &raw);
-        }
-        RawGuard { orig }
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Console::{
+                GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            let hin = GetStdHandle(STD_INPUT_HANDLE);
+            if !hin.is_null() {
+                SetConsoleMode(hin, self.orig_in);
+            }
+            let hout = GetStdHandle(STD_OUTPUT_HANDLE);
+            if !hout.is_null() {
+                SetConsoleMode(hout, self.orig_out);
+            }
         }
     }
 }
@@ -381,6 +448,7 @@ fn split_first_paragraph(text: &str) -> (&str, &str) {
     }
 }
 fn term_size() -> (usize, usize) {
+    #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
@@ -388,6 +456,24 @@ fn term_size() -> (usize, usize) {
         } else {
             (80, 24)
         }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO,
+            STD_OUTPUT_HANDLE,
+        };
+        let hout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if hout != INVALID_HANDLE_VALUE {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(hout, &mut info) != 0 {
+                let cols = info.dwSize.X.max(1) as usize;
+                let rows = (info.srWindow.Bottom - info.srWindow.Top + 1).max(1) as usize;
+                return (cols, rows);
+            }
+        }
+        (80, 24)
     }
 }
 impl Default for Tui {

@@ -1270,7 +1270,13 @@ fn terminate_child(child: &mut Child) {
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGTERM);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    #[cfg(not(any(unix, windows)))]
     let _ = child.kill();
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
@@ -1283,7 +1289,13 @@ fn terminate_child(child: &mut Child) {
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    #[cfg(not(any(unix, windows)))]
     let _ = child.kill();
     let _ = child.wait();
 }

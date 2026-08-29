@@ -18,6 +18,7 @@ const FILE_READ_DEFAULT_MAX_LINES: usize = 2_000;
 const FILE_READ_MAX_LINES_PER_PAGE: usize = 2_000;
 const FILE_READ_MAX_SIZE_BYTES: u64 = 256 * 1024;
 const FILE_READ_MAX_OUTPUT_TOKENS: usize = 25_000;
+
 const FILE_LISTDIR_DEFAULT_LIMIT: usize = 200;
 const FILE_LISTDIR_MAX_LIMIT: usize = 1_000;
 const FILE_LISTDIR_MAX_OUTPUT_TOKENS: usize = 25_000;
@@ -517,10 +518,20 @@ fn execute_command(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
             }
         }
     }
-    let mut command = Command::new("sh");
+    #[cfg(unix)]
+    let mut command = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(&cmd);
+        c
+    };
+    #[cfg(windows)]
+    let mut command = {
+        // Windows 无 sh；经 cmd /C 执行（与模型约定的命令语法按平台适配）
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(&cmd);
+        c
+    };
     command
-        .arg("-c")
-        .arg(&cmd)
         .current_dir(cwd)
         // The TUI owns the terminal. Giving the child the same stdin makes both
         // readers race for keystrokes and can freeze either side. Commands are
@@ -796,7 +807,14 @@ fn terminate_process_group(process_group: u32) {
 }
 
 #[cfg(not(unix))]
-fn terminate_process_group(_process_group: u32) {}
+fn terminate_process_group(process_group: u32) {
+    // Windows：taskkill 按进程树终止（等价 unix 的组信号）
+    let _ = Command::new("taskkill")
+        .args(["/PID", &process_group.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
 
 fn terminate_process_tree(child: &mut Child, process_group: u32) {
     #[cfg(unix)]
@@ -3363,9 +3381,12 @@ mod tests {
             .find_map(|line| line.strip_prefix("child="))
             .and_then(|value| value.trim().parse::<i32>().ok())
             .expect("child pid");
-        std::thread::sleep(Duration::from_millis(100));
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "grandchild {pid} survived command timeout");
+        #[cfg(unix)]
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "grandchild {pid} survived command timeout");
+        }
     }
     #[test]
     fn execute_command_never_runs_cat_for_file_reads() {

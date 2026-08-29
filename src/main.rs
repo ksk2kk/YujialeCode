@@ -83,6 +83,19 @@ impl TurnQueue {
 }
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 启动即检测操作系统，按平台选择对应实现（默认 Grok UI 全平台）。
+    let os_name = if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "Unix"
+    };
+    if std::env::var("YCODE_QUIET").is_err() {
+        eprintln!("[ycode] 检测到 {os_name}；默认界面 Grok Build UI（旧手写 TUI：--legacy-tui）");
+    }
     let mut qq_mode = false;
     let mut qq_only = false;
     let mut mock = false;
@@ -206,10 +219,17 @@ fn main() {
 /// exec Grok Build TUI（默认界面）。按优先级定位二进制：
 /// 1) 环境变量 YCODE_TUI_BIN；2) 仓库内 vendor 构建；3) PATH 中的 ycode/xai-grok-pager。
 fn exec_grok_tui(args: &[String]) -> ! {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
+    #[cfg(unix)]
     let manifest_bin = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/vendor/grok-build/target/release/xai-grok-pager"
+    );
+    #[cfg(windows)]
+    let manifest_bin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "\\vendor\\grok-build\\target\\release\\xai-grok-pager.exe"
     );
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(bin) = std::env::var("YCODE_TUI_BIN") {
@@ -235,11 +255,24 @@ fn exec_grok_tui(args: &[String]) -> ! {
                 .filter(|a| !matches!(a.as_str(), "--qq" | "--setup" | "--legacy-tui"))
                 .cloned()
                 .collect();
-            let error = std::process::Command::new(candidate)
-                .args(&forwarded)
-                .exec();
-            eprintln!("启动 Grok UI 失败（{candidate:?}）: {error}");
-            std::process::exit(1);
+            #[cfg(unix)]
+            {
+                let error = std::process::Command::new(candidate)
+                    .args(&forwarded)
+                    .exec();
+                eprintln!("启动 Grok UI 失败（{candidate:?}）: {error}");
+                std::process::exit(1);
+            }
+            #[cfg(windows)]
+            {
+                match std::process::Command::new(candidate).args(&forwarded).status() {
+                    Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+                    Err(error) => {
+                        eprintln!("启动 Grok UI 失败（{candidate:?}）: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     }
     eprintln!(
