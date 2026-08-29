@@ -12,7 +12,9 @@
 
 本项目以我的朋友 [Yujiale](https://github.com/dawalishi821) 的名字命名——YujialeCode 中的 "Yujiale" 正是他的名字。祝 Yujiale 生日快乐！
 
-极简纯 Rust 本地模型 CLI Agent：依赖少（serde / ureq / reqwest / tokio / tungstenite 等 8 个 crate）、手搓 TUI、低系统提示词设计。面向 DeepSeek / Ollama / LM Studio / vLLM 等任意 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊极速响应。
+极简纯 Rust 本地模型 CLI Agent：依赖少（serde / ureq / reqwest / tokio / tungstenite 等 8 个 crate）、低系统提示词设计。面向 DeepSeek / Ollama / LM Studio / vLLM 等任意 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊极速响应。
+
+**界面已升级为 Grok Build TUI**（`ycode` 启动）：整树引入 [xai-org/grok-build](https://github.com/xai-org/grok-build) 的终端 UI（Apache-2.0，见 `vendor/`），由本项目实现的后端桥（`yjl-bridge`）驱动——无任何 x.ai 登录，提问卡片、模型选择器、插件市场、斜杠补全全部可用；首启内置 25 家供应商 + 本地服务自动探测的配置向导。原手写 TUI 保留为 `--legacy-tui`。
 
 ## 特性
 
@@ -27,7 +29,8 @@
 - 容错编辑：`editline` 先精确匹配，再兼容 CRLF、尾随空格、智能引号、Unicode 破折号和特殊空格；只允许唯一命中。
 - 强制 Read 通道：兼容 `Read/read_file/readline` 与 `file_path/offset/limit`；Read 是原生工具列表第一项，默认读取前 2000 行，每页连续完整并给出精确下一页 offset。简单 `cat FILE` 在执行前硬转 Read，复杂 cat 直接拒绝。
 - 不会折叠的目录枚举：`ls/dir/list_directory/listdir` 统一进入连续分页器，默认 200 项、最多 1000 项；简单的 `ls -la` 命令也自动硬转。
-- 结构化提问：`ask_user` 对齐 Claude Code 的 `question/header/options/multiSelect` 协议，支持 1-4 题、单选、多选和自动 Other。
+- 结构化提问：`ask_user_question` 对齐 Grok Build 协议（`question/options[{label,description,preview}]/multi_select`，一屏一题卡片、单选 `(●)` 多选 `[x]`、Other 免输入行、Esc 阶梯取消；取消是成功结果，模型收到"按最佳判断继续"）。
+- Grok Build UI 深度兼容：供应商向导（25 家注册表 + 本地探测，选完自动填端点/密钥/模型）、`/model` 切换真实落盘、`/plugin` 插件市场（安装走 grok 原生编排，装完自动把技能同步给本 agent）、Skills 面板、`/skills` `/cfg show` `/server` `/apikey` `/ctx` `/budget` `/price` `/save` `/ls` `/new` `/use` `/rm` `/stats` `/goal` `/FuckMaster` `/qqadmin` 等斜杠命令全部接入。
 - 前台回合硬串行：生成中继续发送消息会进入 FIFO 队列；Ctrl+C、过程错误和连续 `ask_user` 都不会提前释放回合锁。
 - 控制层防空转：第三次相同调用、连续三次相同结果或连续四次失败会熔断；达到工具上限或模型损坏时执行一次无工具收尾。
 - 大结果外置：普通工具的超长结果完整保存到 `~/.yjlcoder/tool-results/`。
@@ -40,25 +43,26 @@
 ## 构建与运行
 
 ```bash
+# 1) 构建主程序
 cargo build --release
 
-# 配置 API key 后运行
-yjlcoder
+# 2) 构建 Grok UI（需要 protoc；一次即可，~6 分钟）
+cd vendor/grok-build && cargo build --release -p xai-grok-pager-bin && cd ..
 
-# 离线演示（无需 key，TUI/工具循环/压缩全流程可跑）
-yjlcoder --mock
+# 启动（推荐装个短命令：install -m 755 scripts/ycode ~/.local/bin/ycode）
+ycode          # 或 yjlcoder / 直接跑二进制，默认进入 Grok Build UI
 
-# QQ 桥接（后台）+ TUI
-yjlcoder --qq
+# 首次启动自动弹配置向导：本地服务探测 + 25 家供应商（DeepSeek/OpenAI/
+# Anthropic/Gemini/Grok/Kimi/Qwen/GLM/OpenRouter/Groq…），选完自动配置
 
-# 仅 QQ 桥接守护（无 TUI）
-yjlcoder --qq-only
-
-# 临时切换模型
-yjlcoder --model deepseek-v4-flash
+yjlcoder --legacy-tui     # 旧版手写 TUI（弃用，保留备用）
+yjlcoder --mock           # 离线演示（无需 key，旧 TUI 全流程可跑）
+yjlcoder --qq             # Grok UI + 后台 QQ 桥接
+yjlcoder --qq-only        # 仅 QQ 桥接守护（无 TUI）
+yjlcoder --model <name>   # 临时切换模型
 ```
 
-首次运行自动生成 `~/.yjlcoder/config.json`。也可用环境变量 `YJLCODER_HOME` 覆盖配置目录。
+首次运行自动生成 `~/.yjlcoder/config.json`；也可用环境变量 `YJLCODER_HOME` 覆盖配置目录。Grok UI 想看原生 x.ai 模式（需要登录）：`YJL_NATIVE=1 ycode`。
 
 ## 配置
 
@@ -149,6 +153,11 @@ deploy/napcat/start.sh --no-follow
 cargo build                 # 零警告
 cargo test --all-targets    # 单测 + --mock 端到端（工具循环、熔断、自动压缩、TUI 帧断言）
 cargo clippy                # 零警告
+
+# Grok UI 桥接端到端（PTY + mock LLM；需先构建 vendor TUI）
+python3 scripts/e2e_yjl_tui.py          # 基础对话
+python3 scripts/e2e_ask_yjl_tui.py      # ask_user 卡片往返
+python3 scripts/e2e_onboard_yjl_tui.py  # 首启配置向导全流程
 ```
 
 TUI 帧渲染有快照式断言（`frame_visual_elements`），改视觉必须先过它。
@@ -157,7 +166,7 @@ TUI 帧渲染有快照式断言（`frame_visual_elements`），改视觉必须�
 
 ```
 src/
-  main.rs        入口：--mock / --qq / --qq-only / --model，TUI 主循环
+  main.rs        入口：默认 exec Grok UI；--legacy-tui/--mock 旧 TUI；--qq/--qq-only QQ 桥接
   config.rs      ~/.yjlcoder/config.json
   prompt.rs      低系统提示词
   tool_compat.rs 弱模型工具名/参数强制兼容路由
@@ -175,6 +184,17 @@ src/
 
 线程模型：主线程渲染循环 + stdin 输入线程 + 每轮一个 agent 工作线程（`std::sync::mpsc` 通信），QQ 桥接独立线程。其余阻塞 I/O 用 std 线程；仅 llm.rs 用单线程 tokio runtime 跑可取消的 reqwest 流式 SSE 请求。直接依赖 8 个：serde / serde_json / ureq / reqwest / tokio / tungstenite / libc / unicode-width。
 
+### Grok UI 桥接（vendor/grok-build + yjl-bridge）
+
+```
+vendor/grok-build/                     # xai-org/grok-build 整树引入（除三处小接缝外逐字节不变）
+  crates/codegen/yjl-bridge/           # 本项目新增：实现 acp::Agent，把 yjlcoder 后端挂到 TUI 后面
+  crates/codegen/xai-grok-pager/       # TUI 本体；acp/spawn.rs 顶部接缝默认走 yjl-bridge（无登录层）
+patches/yjl-spawn-seam.patch           # 相对上游的全部改动（可重放，升级 vendor 时用）
+```
+
+桥通过进程内 ACP 通道与 TUI 通信：`session/prompt` → `Agent::run_turn`（流式/工具/审批/提问全映射），`x.ai/ask_user_question` / `session/request_permission` 反向弹原生卡片，`x.ai/plugins/*`、`x.ai/skills/list`、`session/set_model` 等扩展方法支撑市场面板与模型切换。上游改动共三处（workspace members +1 行、pager 依赖 +2 行、spawn.rs 接缝 15 行），完整对照见 `THIRD_PARTY_NOTICES.md`。
+
 ## 设计参考
 
 工程设计参考 [claude-code-best/claude-code](https://github.com/claude-code-best/claude-code) 的工具池稳定化、超长工具结果落盘、会话恢复、权限分层和任务状态可观测性；参考 [Exa MCP Server](https://github.com/exa-labs/exa-mcp-server) 的 search/fetch 分层、查询多样化、硬过滤、去重与来源质量策略；参考 [Pi Agent Harness](https://github.com/earendil-works/pi) 的参数预处理、执行状态机、截断防护、容错编辑和大输出落盘思路。固定参考版本见 `THIRD_PARTY_NOTICES.md`。
@@ -183,4 +203,6 @@ src/
 
 本项目采用 [GPL-3.0-only](LICENSE) 协议。
 
-注意：上下文压缩模块移植自 [openai/codex](https://github.com/openai/codex)（Apache-2.0）。Apache-2.0 与 GPLv3 兼容，对应出处声明见上文表格。
+注意：
+- `vendor/grok-build/` 来自 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0，commit `9684fa3`），按第 4 条保留其版权与许可声明；Apache-2.0 与 GPLv3 兼容，组合二进制随本项目以 GPL-3.0-only 提供源码。
+- 上下文压缩模块移植自 [openai/codex](https://github.com/openai/codex)（Apache-2.0），出处声明见上文表格。

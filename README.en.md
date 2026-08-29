@@ -2,7 +2,9 @@
 
 A code agent built for local model enthusiasts. Pure Rust, an extremely minimal system prompt, and smooth operation even at a 30-token speed budget. Fully compatible with Claude-style skills.
 
-A minimal pure-Rust local model CLI agent: few dependencies (8 crates: serde / ureq / reqwest / tokio / tungstenite, etc.), a hand-rolled TUI, and a low-token system prompt design. Works with any OpenAI-compatible endpoint including DeepSeek / Ollama / LM Studio / vLLM. The `--mock` offline demo runs the entire flow without any API key. Optional QQ integration (OneBot v11, NapCat / Lagrange) supports fast group chat and private chat responses.
+A minimal pure-Rust local model CLI agent: few dependencies (8 crates: serde / ureq / reqwest / tokio / tungstenite, etc.), and a low-token system prompt design.
+
+**The UI is now the Grok Build TUI** (launched via `ycode`): the terminal UI from [xai-org/grok-build](https://github.com/xai-org/grok-build) (Apache-2.0, vendored under `vendor/`) driven by this project's backend bridge (`yjl-bridge`) — no x.ai login whatsoever; question cards, model picker, plugin marketplace and slash completions all work, plus a first-run setup wizard with 25 built-in providers and local service auto-detection. The original hand-rolled TUI remains available via `--legacy-tui`. Works with any OpenAI-compatible endpoint including DeepSeek / Ollama / LM Studio / vLLM. The `--mock` offline demo runs the entire flow without any API key. Optional QQ integration (OneBot v11, NapCat / Lagrange) supports fast group chat and private chat responses.
 
 ## Dedication
 
@@ -32,25 +34,26 @@ This project is named after my friend [Yujiale](https://github.com/dawalishi821)
 ## Build and Run
 
 ```bash
+# 1) Build the main binary
 cargo build --release
 
-# Run after configuring your API key
-yjlcoder
+# 2) Build the Grok UI (requires protoc; one-time, ~6 min)
+cd vendor/grok-build && cargo build --release -p xai-grok-pager-bin && cd ..
 
-# Offline demo (no key needed; TUI/tool loop/compression all work)
-yjlcoder --mock
+# Launch (shortcut: install -m 755 scripts/ycode ~/.local/bin/ycode)
+ycode          # or yjlcoder — defaults to the Grok Build UI
 
-# QQ bridge (background) + TUI
-yjlcoder --qq
+# First run opens the setup wizard: local service detection + 25 providers
+# (DeepSeek/OpenAI/Anthropic/Gemini/Grok/Kimi/Qwen/GLM/OpenRouter/Groq...)
 
-# QQ bridge daemon only (no TUI)
-yjlcoder --qq-only
-
-# Temporarily switch models
-yjlcoder --model deepseek-v4-flash
+yjlcoder --legacy-tui     # legacy hand-rolled TUI (deprecated, kept as fallback)
+yjlcoder --mock           # offline demo (no key; runs on the legacy TUI)
+yjlcoder --qq             # Grok UI + background QQ bridge
+yjlcoder --qq-only        # QQ bridge daemon only (no TUI)
+yjlcoder --model <name>   # temporarily switch models
 ```
 
-On first run, `~/.yjlcoder/config.json` is generated automatically. The `YJLCODER_HOME` environment variable overrides the config directory.
+On first run, `~/.yjlcoder/config.json` is generated automatically. The `YJLCODER_HOME` environment variable overrides the config directory. To try the upstream x.ai mode (login required): `YJL_NATIVE=1 ycode`.
 
 ## Configuration
 
