@@ -23,3 +23,9 @@ cd vendor/grok-build && git apply ../../patches/yjl-spawn-seam.patch
 # 或手工按上面三处重放（改动极小）。
 # 3) 重建：cargo build --release -p xai-grok-pager-bin
 ```
+
+## 品牌替换（追加）
+
+用户可见的 "Grok Build" 品牌文案改为 "YujialeCode"（欢迎框徽标/副标题、
+`--help`、`Grok Build TUI` UI 文案，共 4 个文件；对应测试断言同步）。
+详见 git 历史 commit「更换品牌名」。
