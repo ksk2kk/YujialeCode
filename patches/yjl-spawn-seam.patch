@@ -1,0 +1,47 @@
+--- a/Cargo.toml	2026-08-28 23:50:17.357008045 +0800
++++ b/Cargo.toml	2026-08-29 01:15:50.851275031 +0800
+@@ -9,6 +9,7 @@
+     "crates/build/xai-proto-build",
+     "crates/codegen/ptyctl",
+     "crates/codegen/ptyctl-cli",
++    "crates/codegen/yjl-bridge",
+     "crates/codegen/xai-acp-lib",
+     "crates/codegen/xai-agent-lifecycle",
+     "crates/codegen/xai-chat-state",
+--- a/crates/codegen/xai-grok-pager/Cargo.toml	2026-08-28 23:50:17.375747617 +0800
++++ b/crates/codegen/xai-grok-pager/Cargo.toml	2026-08-29 01:15:50.851436475 +0800
+@@ -9,6 +9,8 @@
+ # TTY safety — detach subprocesses from the controlling terminal
+ dunce = { workspace = true }
+ xai-tty-utils = { workspace = true }
++# YJLcoder bridge: run the YJLcoder agent behind this TUI when YJL_TUI=1.
++yjl-bridge = { path = "../yjl-bridge" }
+ xai-grok-version = { workspace = true }
+ 
+ # Shared prompt-queue wire types
+--- a/crates/codegen/xai-grok-pager/src/acp/spawn.rs	2026-08-28 23:50:17.377544337 +0800
++++ b/crates/codegen/xai-grok-pager/src/acp/spawn.rs	2026-08-29 01:39:17.115430768 +0800
+@@ -176,6 +176,23 @@
+     cancel: &CancellationToken,
+     memory_config: Option<xai_grok_shell::config::MemoryConfig>,
+ ) -> Result<SpawnedAgent> {
++    // YJLcoder bridge: this TUI runs the YJLcoder agent by DEFAULT, so the
++    // x.ai login flow is never reachable. The upstream GrokShell path (which
++    // requires x.ai sign-in) is opt-in via YJL_NATIVE=1 and stays exactly as
++    // shipped below.
++    if std::env::var("YJL_NATIVE").as_deref() != Ok("1") {
++        let bridged = yjl_bridge::spawn(cancel).await?;
++        return Ok(SpawnedAgent {
++            thread_handle: bridged.thread_handle,
++            channel: bridged.channel,
++            cancel: bridged.cancel,
++            auth_manager: std::sync::Arc::new(AuthManager::new(
++                &grok_home(),
++                agent_config.grok_com_config.clone(),
++            )),
++        });
++    }
++
+     let auth_manager = std::sync::Arc::new(AuthManager::new(
+         &grok_home(),
+         agent_config.grok_com_config.clone(),

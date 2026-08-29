@@ -127,7 +127,7 @@ fn alias_name(name: &str) -> Option<&'static str> {
         "http" | "get_url" => "http_get",
         "remember" => "memory_write",
         "recall" => "memory_search",
-        "ask" | "clarify" | "ask_user_question" | "askuserquestion" => "ask_user",
+        "ask" | "clarify" | "ask_user" | "askuserquestion" => "ask_user_question",
         "fuckmaster" | "proactive_goal" | "goal_reminder" => "fuck_master",
         "computer" | "computeruse" | "computer-use" | "computer_control" | "gui" => "computer_use",
         "agent" | "subagent" | "background_agent" | "task_agent" => "spawn_agent",
@@ -149,7 +149,7 @@ fn primary_key(op: &str) -> &'static str {
         "web_fetch" | "http_get" | "http_headers" => "url",
         "web_search" | "web_research" | "memory_search" => "query",
         "writefile" | "appendline" | "memory_write" => "content",
-        "ask_user" => "questions",
+        "ask_user_question" => "questions",
         "spawn_agent" => "task",
         "list_agents" | "wait_agent" | "stop_agent" => "id",
         _ => "input",
@@ -303,7 +303,7 @@ fn normalize_keys(op: &str, args: &mut Map<String, Value>, notes: &mut Vec<Strin
         }
         "memory_search" => alias_key(args, "query", &["q", "keyword", "keywords", "text"], notes),
         "memory_write" => alias_key(args, "content", &["text", "data", "body", "value"], notes),
-        "ask_user" => alias_key(args, "questions", &["question", "prompt", "text"], notes),
+        "ask_user_question" => alias_key(args, "questions", &["question", "prompt", "text"], notes),
         "spawn_agent" => {
             alias_key(args, "task", &["prompt", "objective", "request", "description"], notes);
             alias_key(args, "name", &["title", "label"], notes);
@@ -714,7 +714,7 @@ mod tests {
             "AskUserQuestion",
             &json!({"questions":[{"question":"选哪个？","header":"选择","options":[{"label":"A","description":"方案 A"},{"label":"B","description":"方案 B"}],"multiSelect":false}]}),
         );
-        assert_eq!(call.op, "ask_user");
+        assert_eq!(call.op, "ask_user_question");
         assert!(call.args["questions"].is_array());
     }
     #[test]

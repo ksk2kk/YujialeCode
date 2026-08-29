@@ -73,8 +73,10 @@ pub enum Key {
     PasteStart,
     PasteEnd,
     Tab,
+    BackTab,
     CtrlC,
     CtrlD,
+    CtrlF,
     CtrlL,
     CtrlO,
     Esc,
@@ -84,7 +86,7 @@ pub enum Key {
 pub enum Action {
     Submit(String),
     Command(String),
-    AskSubmit(BTreeMap<String, String>),
+    AskSubmit(crate::tools::AskOutcome),
     ConfigSubmit(BTreeMap<String, String>),
     Cancel,
     RetrieveQueued,
@@ -93,18 +95,41 @@ pub enum Action {
     Redraw,
     None,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AskKind {
-    Agent,
-    ProviderConfig,
+/// 单选至多一项，多选零或多项（照 grok question_view 的选择模型）。
+#[derive(Clone, Debug)]
+enum AskSelection {
+    Single(Option<usize>),
+    Multi(BTreeSet<usize>),
 }
-#[derive(Debug, Clone)]
+/// 提问卡片：一屏一题 tab 式，每题独立的游标/滚动/选择/自由输入状态。
 struct AskUi {
     questions: Vec<AskQuestion>,
-    current: usize,
-    answers: BTreeMap<String, String>,
-    focus: usize,
-    checked: BTreeSet<usize>,
+    active_tab: usize,
+    cursor: Vec<usize>,
+    scroll: Vec<usize>,
+    selection: Vec<AskSelection>,
+    freeform: Vec<String>,
+    freeform_selected: Vec<bool>,
+    input_mode: bool,
+    fullscreen: bool,
+    notice: Option<String>,
+}
+enum FormFocus {
+    Fields,
+    Actions,
+}
+enum FormFieldRuntime {
+    Text { draft: String },
+    Toggle { on: bool },
+    Choice { options: Vec<String>, index: usize },
+}
+/// Provider 配置表单（照 grok elicitation：字段区 + 保存/取消动作区）。
+struct FormUi {
+    title: String,
+    fields: Vec<(crate::tools::FormFieldSpec, FormFieldRuntime)>,
+    cursor: usize,
+    focus: FormFocus,
+    action: usize,
     notice: Option<String>,
 }
 struct PermUi {
@@ -126,11 +151,16 @@ struct CommandToken {
     end: usize,
     prefix: String,
 }
+#[derive(Clone, Copy)]
+enum AskHit {
+    Option(usize),
+    Other,
+}
 struct AskPanel {
     lines: Vec<String>,
     cursor: Option<(usize, usize, char)>,
+    hits: Vec<(usize, AskHit)>,
 }
-type AskPanelRow = (String, Option<String>, Option<(usize, char)>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MascotState {
     Idle,
@@ -223,7 +253,10 @@ pub struct Tui {
     commands: &'static [(&'static str, &'static str)],
     command_completion: Option<CommandCompletion>,
     asking: Option<AskUi>,
-    ask_kind: AskKind,
+    form: Option<FormUi>,
+    input_mode_form: bool,
+    ask_panel_top: Option<usize>,
+    ask_panel_hits: Vec<(usize, AskHit)>,
     perm_prompt: Option<PermUi>,
     mascot_state: MascotState,
     last_tool_op: Option<String>,
@@ -263,6 +296,87 @@ impl Drop for RawGuard {
     fn drop(&mut self) {
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+fn adjust_form_field(
+    _spec: &crate::tools::FormFieldKind,
+    runtime: &mut FormFieldRuntime,
+    forward: bool,
+) {
+    match runtime {
+        FormFieldRuntime::Toggle { on } => *on = !*on,
+        FormFieldRuntime::Choice { options, index } => {
+            if options.is_empty() {
+                return;
+            }
+            let last = options.len() - 1;
+            *index = if forward {
+                if *index >= last {
+                    0
+                } else {
+                    *index + 1
+                }
+            } else if *index == 0 {
+                last
+            } else {
+                *index - 1
+            };
+        }
+        FormFieldRuntime::Text { .. } => {}
+    }
+}
+fn spec_hides_input(spec: &crate::tools::FormFieldSpec) -> bool {
+    matches!(
+        &spec.kind,
+        crate::tools::FormFieldKind::Text { masked: true, .. }
+    )
+}
+fn spec_placeholder(spec: &crate::tools::FormFieldSpec) -> &str {
+    match &spec.kind {
+        crate::tools::FormFieldKind::Text { placeholder, .. } => placeholder,
+        _ => "",
+    }
+}
+/// 按显示宽度折行（字符级，CJK 安全）。
+fn wrap_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for word in text.split('\n') {
+        for ch in word.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(0);
+            if used + cw > width && used > 0 {
+                lines.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            current.push(ch);
+            used += cw;
+        }
+        if used > 0 {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+/// 首段与其余段落拆分（首段即标题，照 grok question chrome）。
+fn split_first_paragraph(text: &str) -> (&str, &str) {
+    match text.find("\n\n") {
+        Some(index) => (&text[..index], &text[index + 2..]),
+        None => {
+            // 单换行也视为段落分隔（模型输出常见）
+            match text.find('\n') {
+                Some(index) => (&text[..index], &text[index + 1..]),
+                None => (text, ""),
+            }
         }
     }
 }
@@ -314,7 +428,10 @@ impl Tui {
             commands: &[],
             command_completion: None,
             asking: None,
-            ask_kind: AskKind::Agent,
+            form: None,
+            input_mode_form: false,
+            ask_panel_top: None,
+            ask_panel_hits: Vec::new(),
             perm_prompt: None,
             mascot_state: MascotState::Idle,
             last_tool_op: None,
@@ -331,30 +448,70 @@ impl Tui {
         }
     }
     pub fn ask(&mut self, questions: Vec<AskQuestion>) {
-        self.ask_kind = AskKind::Agent;
-        self.open_ask(questions);
-    }
-    pub fn open_provider_setup(&mut self, cfg: &crate::config::Config) {
-        self.ask_kind = AskKind::ProviderConfig;
-        self.open_ask(crate::setup::provider_questions(cfg));
-    }
-    fn open_ask(&mut self, questions: Vec<AskQuestion>) {
+        let count = questions.len();
         self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
+        let selection = questions
+            .iter()
+            .map(|question| if question.multi_select {
+                AskSelection::Multi(BTreeSet::new())
+            } else {
+                AskSelection::Single(None)
+            })
+            .collect();
         self.asking = Some(AskUi {
             questions,
-            current: 0,
-            answers: BTreeMap::new(),
-            focus: 0,
-            checked: BTreeSet::new(),
+            active_tab: 0,
+            cursor: vec![0; count],
+            scroll: vec![0; count],
+            selection,
+            freeform: vec![String::new(); count],
+            freeform_selected: vec![false; count],
+            input_mode: false,
+            fullscreen: false,
             notice: None,
         });
         self.mascot_event(MascotEvent::Ask);
     }
+    pub fn open_provider_setup(&mut self, cfg: &crate::config::Config) {
+        let fields = crate::setup::provider_form_specs(cfg)
+            .into_iter()
+            .map(|spec| {
+                let runtime = match &spec.kind {
+                    crate::tools::FormFieldKind::Text { .. } => {
+                        FormFieldRuntime::Text {
+                            draft: String::new(),
+                        }
+                    }
+                    crate::tools::FormFieldKind::Toggle { on } => {
+                        FormFieldRuntime::Toggle { on: *on }
+                    }
+                    crate::tools::FormFieldKind::Choice { options, index } => {
+                        FormFieldRuntime::Choice {
+                            options: options.clone(),
+                            index: *index,
+                        }
+                    }
+                };
+                (spec, runtime)
+            })
+            .collect();
+        self.command_completion = None;
+        self.input.clear();
+        self.cursor = 0;
+        self.form = Some(FormUi {
+            title: crate::setup::PROVIDER_FORM_TITLE.to_string(),
+            fields,
+            cursor: 0,
+            focus: FormFocus::Fields,
+            action: 0,
+            notice: None,
+        });
+    }
     pub fn finish_ask(&mut self) {
         self.asking = None;
-        self.ask_kind = AskKind::Agent;
+        self.form = None;
         self.command_completion = None;
         self.input.clear();
         self.cursor = 0;
@@ -363,7 +520,7 @@ impl Tui {
         }
     }
     pub fn is_asking(&self) -> bool {
-        self.asking.is_some()
+        self.asking.is_some() || self.form.is_some()
     }
     pub fn open_perm_prompt(&mut self, req: crate::tools::PermRequest) {
         self.command_completion = None;
@@ -776,7 +933,11 @@ impl Tui {
     }
     pub fn submit(&mut self) -> Option<Action> {
         if self.asking.is_some() {
-            return Some(self.submit_ask());
+            return Some(self.submit_ask_card());
+        }
+        if self.form.is_some() {
+            // 表单里 Enter 交给表单处理，不触发输入提交
+            return Some(Action::None);
         }
         self.command_completion = None;
         let text = std::mem::take(&mut self.input);
@@ -795,251 +956,928 @@ impl Tui {
             Some(Action::Submit(text))
         }
     }
-    fn submit_ask(&mut self) -> Action {
-        let Some((focus, option_count, multi_select)) = self.asking.as_ref().and_then(|asking| {
-            let question = asking.questions.get(asking.current)?;
-            Some((asking.focus, question.options.len(), question.multi_select))
-        }) else {
-            return Action::None;
+    // ===== 提问卡片（照 grok question_view：一屏一题、Other 常驻、Esc 阶梯） =====
+    fn ask_view_rows(&self) -> usize {
+        let Some(asking) = self.asking.as_ref() else {
+            return 3;
         };
-        let other_index = option_count;
-        if multi_select {
-            if focus == other_index + 1 {
-                return self.submit_multi_ask();
-            }
-            if focus == other_index && self.input.trim().is_empty() {
-                self.set_ask_notice("请先在 Other 中输入内容");
-                return Action::None;
-            }
-            if let Some(asking) = self.asking.as_mut() {
-                if !asking.checked.remove(&focus) {
-                    asking.checked.insert(focus);
-                }
-                asking.notice = None;
-            }
-            return Action::None;
-        }
-        let answer = if focus < option_count {
-            self.asking
-                .as_ref()
-                .and_then(|asking| asking.questions.get(asking.current))
-                .and_then(|question| question.options.get(focus))
-                .map(|option| option.label.clone())
+        let cap = if asking.fullscreen {
+            self.h.saturating_sub(self.fixed_header_height() + 4)
         } else {
-            let custom = self.input.trim();
-            if custom.is_empty() {
-                self.set_ask_notice("请在 Other 中输入内容");
-                None
-            } else {
-                Some(custom.to_string())
-            }
+            (self.h / 3).max(8)
         };
-        match answer {
-            Some(answer) => self.commit_ask_answer(answer),
-            None => Action::None,
-        }
+        cap.saturating_sub(6).max(3)
     }
-    fn submit_multi_ask(&mut self) -> Action {
-        let Some(asking) = self.asking.as_ref() else { return Action::None };
-        let Some(question) = asking.questions.get(asking.current) else { return Action::None };
-        let other_index = question.options.len();
-        let mut answers = Vec::new();
-        for index in &asking.checked {
-            if let Some(option) = question.options.get(*index) {
-                answers.push(option.label.clone());
-            } else if *index == other_index && !self.input.trim().is_empty() {
-                answers.push(self.input.trim().to_string());
-            }
-        }
-        if answers.is_empty() {
-            self.set_ask_notice("请至少选择一项");
-            return Action::None;
-        }
-        self.commit_ask_answer(answers.join(", "))
-    }
-    fn commit_ask_answer(&mut self, answer: String) -> Action {
-        self.command_completion = None;
-        self.input.clear();
-        self.cursor = 0;
-        self.hist_pos = None;
-        let (header, completed) = {
-            let asking = self.asking.as_mut().expect("提问状态刚确认存在");
-            let question = &asking.questions[asking.current];
-            let header = question.header.clone();
-            asking.answers.insert(question.question.clone(), answer.clone());
-            asking.current += 1;
-            asking.focus = if answer == "DeepSeek"
-                && asking
-                    .questions
-                    .get(asking.current)
-                    .is_some_and(|next| next.header == "API Key")
-            {
-                asking.questions[asking.current].options.len()
-            } else {
-                0
-            };
-            asking.checked.clear();
-            asking.notice = None;
-            (header, asking.current >= asking.questions.len())
+    fn clamp_ask_cursor_visible(&mut self) {
+        let visible = self.ask_view_rows();
+        let Some(asking) = self.asking.as_mut() else {
+            return;
         };
-        let visible_answer = if self.ask_kind == AskKind::ProviderConfig
-            && header == "API Key"
-            && !matches!(
-                answer.as_str(),
-                "保留当前密钥" | "清除密钥" | "本地服务无需密钥"
-            )
-        {
-            "已安全填写（不回显）"
+        let tab = asking.active_tab.min(asking.questions.len().saturating_sub(1));
+        asking.active_tab = tab;
+        let rows = asking.questions[tab].options.len() + 1;
+        let cursor = asking.cursor[tab].min(rows - 1);
+        asking.cursor[tab] = cursor;
+        let scroll = &mut asking.scroll[tab];
+        if rows <= visible {
+            *scroll = 0;
         } else {
-            &answer
-        };
-        self.push_user(format!("[{header}] {visible_answer}"));
-        if completed {
-            let answers = self.asking.as_ref().map(|asking| asking.answers.clone()).unwrap_or_default();
-            match self.ask_kind {
-                AskKind::Agent => Action::AskSubmit(answers),
-                AskKind::ProviderConfig => Action::ConfigSubmit(answers),
+            if cursor < *scroll {
+                *scroll = cursor;
             }
-        } else {
-            self.mascot_event(MascotEvent::Ask);
-            Action::None
+            if cursor >= *scroll + visible {
+                *scroll = cursor + 1 - visible;
+            }
+            *scroll = (*scroll).min(rows - visible);
         }
     }
-    fn set_ask_notice(&mut self, notice: &str) {
-        if let Some(asking) = self.asking.as_mut() {
-            asking.notice = Some(notice.to_string());
-        }
-    }
-    fn ask_focus_is_other(&self) -> bool {
-        self.asking.as_ref().is_some_and(|asking| {
-            asking
-                .questions
-                .get(asking.current)
-                .is_some_and(|question| asking.focus == question.options.len())
-        })
-    }
-    fn move_ask_focus(&mut self, delta: i32) {
-        let Some(asking) = self.asking.as_mut() else { return };
-        let Some(question) = asking.questions.get(asking.current) else { return };
-        let last = question.options.len() + usize::from(question.multi_select);
-        asking.focus = if delta < 0 {
-            asking.focus.saturating_sub(1)
+    fn move_ask_cursor(&mut self, delta: i32) {
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        let rows = asking.questions[tab].options.len() + 1;
+        let cursor = &mut asking.cursor[tab];
+        *cursor = if delta < 0 {
+            cursor.saturating_sub((-delta) as usize)
         } else {
-            (asking.focus + 1).min(last)
+            (*cursor + delta as usize).min(rows - 1)
         };
         asking.notice = None;
+        self.clamp_ask_cursor_visible();
+    }
+    fn ask_toggle_option(&mut self, index: usize) {
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        // 照 grok：选中选项即清除 Other
+        asking.freeform_selected[tab] = false;
+        match &mut asking.selection[tab] {
+            AskSelection::Single(current) => {
+                *current = if *current == Some(index) { None } else { Some(index) };
+            }
+            AskSelection::Multi(set) => {
+                if !set.remove(&index) {
+                    set.insert(index);
+                }
+            }
+        }
+        asking.notice = None;
+    }
+    fn ask_toggle_other(&mut self) {
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        let selected = !asking.freeform_selected[tab];
+        asking.freeform_selected[tab] = selected;
+        if selected {
+            // 单选 Other 与选项互斥（照 grok）
+            if let AskSelection::Single(current) = &mut asking.selection[tab] {
+                *current = None;
+            }
+        }
+        asking.notice = None;
+    }
+    fn ask_activate_row(&mut self) -> Action {
+        let Some(asking) = self.asking.as_ref() else {
+            return Action::None;
+        };
+        let tab = asking.active_tab;
+        let option_count = asking.questions[tab].options.len();
+        let cursor = asking.cursor[tab];
+        if cursor == option_count {
+            self.ask_toggle_other();
+        } else {
+            self.ask_toggle_option(cursor);
+        }
+        Action::None
+    }
+    fn ask_enter_input_mode(&mut self) {
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        asking.freeform_selected[tab] = true;
+        if let AskSelection::Single(current) = &mut asking.selection[tab] {
+            *current = None;
+        }
+        asking.input_mode = true;
+        asking.notice = None;
+        self.input = asking.freeform[tab].clone();
+        self.cursor = self.input.chars().count();
+    }
+    fn ask_exit_input_mode(&mut self) {
+        let text = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        asking.freeform[tab] = text.trim().to_string();
+        asking.freeform_selected[tab] = !asking.freeform[tab].is_empty();
+        asking.input_mode = false;
+    }
+    fn ask_advance_or_submit(&mut self) -> Action {
+        let has_next = self
+            .asking
+            .as_ref()
+            .is_some_and(|asking| asking.active_tab + 1 < asking.questions.len());
+        if has_next {
+            let Some(asking) = self.asking.as_mut() else {
+                return Action::None;
+            };
+            asking.active_tab += 1;
+            asking.input_mode = false;
+            asking.notice = None;
+            self.clamp_ask_cursor_visible();
+            Action::None
+        } else {
+            self.submit_ask_card()
+        }
+    }
+    /// 照 grok：Enter 选中当前行（幂等）并前进。
+    fn ask_select_row(&mut self, index: usize) {
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        asking.freeform_selected[tab] = false;
+        match &mut asking.selection[tab] {
+            AskSelection::Single(current) => *current = Some(index),
+            AskSelection::Multi(set) => {
+                set.insert(index);
+            }
+        }
+        asking.notice = None;
+    }
+    fn ask_enter(&mut self) -> Action {
+        let Some(asking) = self.asking.as_ref() else {
+            return Action::None;
+        };
+        let tab = asking.active_tab;
+        let option_count = asking.questions[tab].options.len();
+        let cursor = asking.cursor[tab];
+        if cursor == option_count {
+            if asking.freeform[tab].trim().is_empty() {
+                self.ask_enter_input_mode();
+                Action::None
+            } else {
+                self.ask_advance_or_submit()
+            }
+        } else {
+            self.ask_select_row(cursor);
+            self.ask_advance_or_submit()
+        }
+    }
+    fn ask_current_has_selection(&self) -> bool {
+        let Some(asking) = self.asking.as_ref() else {
+            return false;
+        };
+        let tab = asking.active_tab;
+        let picked = match &asking.selection[tab] {
+            AskSelection::Single(current) => current.is_some(),
+            AskSelection::Multi(set) => !set.is_empty(),
+        };
+        picked || asking.freeform_selected[tab]
+    }
+    fn ask_clear_current_selection(&mut self) {
+        let Some(asking) = self.asking.as_mut() else {
+            return;
+        };
+        let tab = asking.active_tab;
+        asking.selection[tab] = match asking.questions[tab].multi_select {
+            true => AskSelection::Multi(BTreeSet::new()),
+            false => AskSelection::Single(None),
+        };
+        asking.freeform_selected[tab] = false;
+        asking.notice = None;
+    }
+    /// 照 grok build_accepted_response：未答题省略；Other 走 ["Other"]+notes；
+    /// preview 注记仅单选。
+    fn submit_ask_card(&mut self) -> Action {
+        let Some(asking) = self.asking.as_ref() else {
+            return Action::None;
+        };
+        let mut answers: Vec<(String, Vec<String>)> = Vec::new();
+        let mut annotations: Vec<(String, crate::tools::AskAnnotation)> = Vec::new();
+        let mut transcript: Vec<String> = Vec::new();
+        for (tab, question) in asking.questions.iter().enumerate() {
+            let mut labels: Vec<String> = Vec::new();
+            let mut preview: Option<String> = None;
+            match &asking.selection[tab] {
+                AskSelection::Single(Some(index)) => {
+                    if let Some(option) = question.options.get(*index) {
+                        labels.push(option.label.clone());
+                        preview.clone_from(&option.preview);
+                    }
+                }
+                AskSelection::Multi(set) => {
+                    for index in set {
+                        if let Some(option) = question.options.get(*index) {
+                            labels.push(option.label.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let notes = if asking.freeform_selected[tab] {
+                asking.freeform[tab].trim().to_string()
+            } else {
+                String::new()
+            };
+            if labels.is_empty() && !notes.is_empty() {
+                labels.push("Other".into());
+            }
+            if labels.is_empty() {
+                continue;
+            }
+            if preview.is_some() || !notes.is_empty() {
+                annotations.push((
+                    question.question.clone(),
+                    crate::tools::AskAnnotation {
+                        preview,
+                        notes: (!notes.is_empty()).then_some(notes),
+                    },
+                ));
+            }
+            transcript.push(format!("[{}] {}", question.question, labels.join("，")));
+            answers.push((question.question.clone(), labels));
+        }
+        if answers.is_empty() {
+            let Some(asking) = self.asking.as_mut() else {
+                return Action::None;
+            };
+            asking.notice = Some("请至少回答一题，或 Ctrl-C 取消".into());
+            return Action::None;
+        }
+        for line in transcript {
+            self.push_user(line);
+        }
+        Action::AskSubmit(crate::tools::AskOutcome::Accepted {
+            answers,
+            annotations,
+        })
+    }
+    fn cancel_ask_card(&mut self) -> Action {
+        Action::AskSubmit(crate::tools::AskOutcome::Cancelled)
+    }
+    fn ask_copy_selection(&mut self) -> Action {
+        let Some(asking) = self.asking.as_ref() else {
+            return Action::None;
+        };
+        let tab = asking.active_tab;
+        let text = match &asking.selection[tab] {
+            AskSelection::Single(Some(index)) => asking.questions[tab]
+                .options
+                .get(*index)
+                .map(|option| {
+                    if option.description.is_empty() {
+                        option.label.clone()
+                    } else {
+                        format!("{}：{}", option.label, option.description)
+                    }
+                })
+                .unwrap_or_default(),
+            AskSelection::Multi(set) => set
+                .iter()
+                .filter_map(|index| asking.questions[tab].options.get(*index))
+                .map(|option| option.label.clone())
+                .collect::<Vec<_>>()
+                .join("，"),
+            _ => String::new(),
+        };
+        if text.is_empty() {
+            return Action::None;
+        }
+        match crate::clipboard_copy::copy_to_clipboard(&text) {
+            Ok(lease) => {
+                self.clipboard_lease = lease;
+                self.copied_notice = Some("已复制选中项".into());
+            }
+            Err(error) => {
+                self.copied_notice = Some(format!("复制失败: {error}"));
+            }
+        }
+        Action::None
     }
     fn handle_ask_key(&mut self, key: Key) -> Action {
-        match key {
-            Key::Enter => self.submit_ask(),
-            Key::Up => {
-                self.move_ask_focus(-1);
-                Action::None
-            }
-            Key::Down | Key::Tab => {
-                self.move_ask_focus(1);
-                Action::None
-            }
-            Key::Backspace if self.ask_focus_is_other() => {
-                if self.cursor > 0 {
-                    let end = self.cursor_byte();
-                    let start = self.input[..end].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-                    self.input.replace_range(start..end, "");
-                    self.cursor -= 1;
+        let input_mode = self
+            .asking
+            .as_ref()
+            .is_some_and(|asking| asking.input_mode);
+        if input_mode {
+            // 输入态：按键全部进入 Other 编辑器（照 grok InputMode）
+            return match key {
+                Key::Enter => {
+                    self.ask_exit_input_mode();
+                    self.ask_advance_or_submit()
                 }
-                self.sync_other_selection();
-                Action::None
-            }
-            Key::Delete if self.ask_focus_is_other() => {
-                let byte = self.cursor_byte();
-                if byte < self.input.len() {
-                    self.input.remove(byte);
-                }
-                self.sync_other_selection();
-                Action::None
-            }
-            Key::Left if self.ask_focus_is_other() => {
-                self.cursor = self.cursor.saturating_sub(1);
-                Action::None
-            }
-            Key::Right if self.ask_focus_is_other() => {
-                self.cursor = (self.cursor + 1).min(self.input.chars().count());
-                Action::None
-            }
-            Key::Home if self.ask_focus_is_other() => {
-                self.cursor = 0;
-                Action::None
-            }
-            Key::End if self.ask_focus_is_other() => {
-                self.cursor = self.input.chars().count();
-                Action::None
-            }
-            Key::Char(c) if self.ask_focus_is_other() => {
-                let c = if c == '\n' { ' ' } else { c };
-                self.input.insert(self.cursor_byte(), c);
-                self.cursor += 1;
-                self.sync_other_selection();
-                Action::None
-            }
-            Key::Char(' ') => {
-                let is_multi = self.asking.as_ref().and_then(|asking| {
-                    asking.questions.get(asking.current).map(|question| question.multi_select)
-                }).unwrap_or(false);
-                if is_multi {
-                    self.submit_ask()
-                } else {
+                Key::Esc => {
+                    self.ask_exit_input_mode();
                     Action::None
                 }
+                Key::Backspace => {
+                    if self.cursor > 0 {
+                        let end = self.cursor_byte();
+                        let start = self.input[..end]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        self.input.replace_range(start..end, "");
+                        self.cursor -= 1;
+                    }
+                    Action::None
+                }
+                Key::Delete => {
+                    let byte = self.cursor_byte();
+                    if byte < self.input.len() {
+                        self.input.remove(byte);
+                    }
+                    Action::None
+                }
+                Key::Left => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    Action::None
+                }
+                Key::Right => {
+                    self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                    Action::None
+                }
+                Key::Home => {
+                    self.cursor = 0;
+                    Action::None
+                }
+                Key::End => {
+                    self.cursor = self.input.chars().count();
+                    Action::None
+                }
+                Key::Char(c) => {
+                    let c = if c == '\n' { ' ' } else { c };
+                    self.input.insert(self.cursor_byte(), c);
+                    self.cursor += 1;
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
+        let tab = self
+            .asking
+            .as_ref()
+            .map(|asking| asking.active_tab)
+            .unwrap_or(0);
+        let option_count = self
+            .asking
+            .as_ref()
+            .and_then(|asking| asking.questions.get(tab))
+            .map(|question| question.options.len())
+            .unwrap_or(0);
+        match key {
+            Key::Enter => self.ask_enter(),
+            Key::Char(' ') => self.ask_activate_row(),
+            Key::Up | Key::Char('k') => {
+                self.move_ask_cursor(-1);
+                Action::None
             }
-            Key::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let index = c.to_digit(10).unwrap_or(0) as usize - 1;
-                let Some(option_count) = self.asking.as_ref().and_then(|asking| {
-                    let question = asking.questions.get(asking.current)?;
-                    Some(question.options.len())
-                }) else {
+            Key::Down | Key::Char('j') => {
+                self.move_ask_cursor(1);
+                Action::None
+            }
+            Key::Tab => {
+                let rows = option_count + 1;
+                let Some(asking) = self.asking.as_mut() else {
                     return Action::None;
                 };
-                if index > option_count {
+                asking.cursor[tab] = (asking.cursor[tab] + 1) % rows;
+                asking.notice = None;
+                Action::None
+            }
+            Key::BackTab => {
+                let rows = option_count + 1;
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.cursor[tab] =
+                    (asking.cursor[tab] + rows - 1) % rows;
+                asking.notice = None;
+                Action::None
+            }
+            Key::Char('g') => {
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.cursor[tab] = 0;
+                self.clamp_ask_cursor_visible();
+                Action::None
+            }
+            Key::Char('G') => {
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.cursor[tab] = option_count;
+                self.clamp_ask_cursor_visible();
+                Action::None
+            }
+            Key::Char('h') | Key::Char('[') | Key::Left => {
+                // 上一题（不循环，照 grok）
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                if asking.input_mode {
+                    asking.input_mode = false;
+                    let text = std::mem::take(&mut self.input);
+                    self.cursor = 0;
+                    asking.freeform[tab] = text.trim().to_string();
+                    asking.freeform_selected[tab] = !asking.freeform[tab].is_empty();
+                }
+                asking.active_tab = asking.active_tab.saturating_sub(1);
+                self.clamp_ask_cursor_visible();
+                Action::None
+            }
+            Key::Char('l') | Key::Char(']') | Key::Right => {
+                // 下一题（不循环，照 grok）
+                let Some(asking) = self.asking.as_ref() else {
+                    return Action::None;
+                };
+                if asking.active_tab + 1 >= asking.questions.len() {
                     return Action::None;
                 }
-                if let Some(asking) = self.asking.as_mut() {
-                    asking.focus = index;
-                    asking.notice = None;
+                if asking.input_mode {
+                    self.ask_exit_input_mode();
                 }
-                if index < option_count {
-                    self.submit_ask()
-                } else {
-                    Action::None
-                }
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.active_tab += 1;
+                self.clamp_ask_cursor_visible();
+                Action::None
             }
             Key::PageUp | Key::WheelUp => {
-                self.scroll += self.chat_height().saturating_sub(1).max(1);
+                let step = self.ask_view_rows().max(1);
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.scroll[tab] = asking.scroll[tab].saturating_sub(step);
                 Action::None
             }
+            Key::MouseDown { row, .. } => self.handle_ask_mouse(row),
             Key::PageDown | Key::WheelDown => {
-                self.scroll = self.scroll.saturating_sub(self.chat_height().saturating_sub(1).max(1));
+                let step = self.ask_view_rows().max(1);
+                let rows = option_count + 1;
+                let visible = self.ask_view_rows();
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                let max_scroll = rows.saturating_sub(visible);
+                asking.scroll[tab] = (asking.scroll[tab] + step).min(max_scroll);
                 Action::None
             }
-            Key::Esc => Action::Cancel,
+            Key::Char('z') => {
+                // 直达 Other 并进入输入（照 grok）
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.cursor[tab] = option_count;
+                self.ask_enter_input_mode();
+                Action::None
+            }
+            Key::Char(c) if !c.is_ascii_control() && self.ask_cursor_on_other() => {
+                // 游标停在 Other 上直接打字：进入输入态并接收该字符（照 grok）
+                self.ask_enter_input_mode();
+                self.input.insert(self.cursor_byte(), c);
+                self.cursor += 1;
+                Action::None
+            }
+            Key::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let row = c.to_digit(10).unwrap_or(0) as usize - 1;
+                self.ask_jump_row(row, option_count)
+            }
+            Key::Char(c @ 'a'..='f') => {
+                let row = 9 + (c as u8 - b'a') as usize;
+                self.ask_jump_row(row, option_count)
+            }
+            Key::Char('y') => self.ask_copy_selection(),
+            Key::Char('X') => self.cancel_ask_card(),
+            Key::CtrlC => self.cancel_ask_card(),
+            Key::CtrlF => {
+                let Some(asking) = self.asking.as_mut() else {
+                    return Action::None;
+                };
+                asking.fullscreen = !asking.fullscreen;
+                Action::Redraw
+            }
+            Key::Esc => {
+                // 阶梯：退出输入 → 清当前题选择 → 取消回合
+                let in_input = self
+                    .asking
+                    .as_ref()
+                    .is_some_and(|asking| asking.input_mode);
+                if in_input {
+                    self.ask_exit_input_mode();
+                    return Action::None;
+                }
+                if self.ask_current_has_selection() {
+                    self.ask_clear_current_selection();
+                    return Action::None;
+                }
+                Action::Cancel
+            }
             Key::CtrlD => Action::Quit,
             Key::CtrlL => Action::Redraw,
             _ => Action::None,
         }
     }
-    fn sync_other_selection(&mut self) {
-        let has_text = !self.input.trim().is_empty();
-        if let Some(asking) = self.asking.as_mut() {
-            let Some(question) = asking.questions.get(asking.current) else { return };
-            if question.multi_select {
-                let other = question.options.len();
-                if has_text {
-                    asking.checked.insert(other);
+    fn ask_cursor_on_other(&self) -> bool {
+        let Some(asking) = self.asking.as_ref() else {
+            return false;
+        };
+        let tab = asking.active_tab;
+        asking.cursor[tab] == asking.questions[tab].options.len()
+    }
+    fn ask_jump_row(&mut self, row: usize, option_count: usize) -> Action {
+        if row > option_count {
+            return Action::None;
+        }
+        let Some(asking) = self.asking.as_mut() else {
+            return Action::None;
+        };
+        asking.cursor[asking.active_tab] = row;
+        asking.notice = None;
+        if row == option_count {
+            self.ask_enter_input_mode();
+            Action::None
+        } else {
+            self.ask_select_row(row);
+            self.ask_advance_or_submit()
+        }
+    }
+    fn handle_ask_mouse(&mut self, row: usize) -> Action {
+        let Some(top) = self.ask_panel_top else {
+            return Action::None;
+        };
+        if row < top {
+            return Action::None;
+        }
+        let line = row - top;
+        let hit = self
+            .ask_panel_hits
+            .iter()
+            .find(|(panel_line, _)| *panel_line == line)
+            .map(|(_, hit)| *hit);
+        let Some(hit) = hit else {
+            return Action::None;
+        };
+        let tab = self
+            .asking
+            .as_ref()
+            .map(|asking| asking.active_tab)
+            .unwrap_or(0);
+        let option_count = self
+            .asking
+            .as_ref()
+            .and_then(|asking| asking.questions.get(tab))
+            .map(|question| question.options.len())
+            .unwrap_or(0);
+        let Some(asking) = self.asking.as_mut() else {
+            return Action::None;
+        };
+        match hit {
+            AskHit::Option(index) => {
+                asking.cursor[tab] = index;
+                asking.notice = None;
+                self.ask_toggle_option(index);
+            }
+            AskHit::Other => {
+                asking.cursor[tab] = option_count;
+                asking.notice = None;
+                let selected = asking.freeform_selected[tab];
+                let text = asking.freeform[tab].clone();
+                if selected && !text.is_empty() {
+                    self.ask_toggle_other();
                 } else {
-                    asking.checked.remove(&other);
+                    self.ask_enter_input_mode();
                 }
             }
-            asking.notice = None;
         }
+        Action::None
+    }
+    // ===== 配置表单（照 grok elicitation_view：Fields/Editing/Actions 三态） =====
+    fn form_editing(&self) -> bool {
+        self.input_mode_form
+    }
+    fn handle_form_key(&mut self, key: Key) -> Action {
+        let Some(form) = self.form.as_ref() else {
+            return Action::None;
+        };
+        let field_count = form.fields.len();
+        if field_count == 0 {
+            return Action::None;
+        }
+        let editing = self.form_editing();
+        if editing {
+            // 编辑态：按键全部进入字段编辑器
+            return match key {
+                Key::Enter => {
+                    let draft = self.input.trim().to_string();
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.input_mode_form = false;
+                    let Some(form) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    if let Some((_, FormFieldRuntime::Text { draft: slot })) =
+                        form.fields.get_mut(form.cursor)
+                    {
+                        *slot = draft;
+                    }
+                    // 保存后前进到下一字段（最后一个字段 → 动作区）
+                    if form.cursor + 1 < form.fields.len() {
+                        form.cursor += 1;
+                    } else {
+                        form.focus = FormFocus::Actions;
+                    }
+                    Action::None
+                }
+                Key::Esc => {
+                    let draft = self.input.trim().to_string();
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.input_mode_form = false;
+                    let Some(form) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    if let Some((_, FormFieldRuntime::Text { draft: slot })) =
+                        form.fields.get_mut(form.cursor)
+                    {
+                        *slot = draft;
+                    }
+                    Action::None
+                }
+                Key::Backspace => {
+                    if self.cursor > 0 {
+                        let end = self.cursor_byte();
+                        let start = self.input[..end]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        self.input.replace_range(start..end, "");
+                        self.cursor -= 1;
+                    }
+                    Action::None
+                }
+                Key::Delete => {
+                    let byte = self.cursor_byte();
+                    if byte < self.input.len() {
+                        self.input.remove(byte);
+                    }
+                    Action::None
+                }
+                Key::Left => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    Action::None
+                }
+                Key::Right => {
+                    self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                    Action::None
+                }
+                Key::Home => {
+                    self.cursor = 0;
+                    Action::None
+                }
+                Key::End => {
+                    self.cursor = self.input.chars().count();
+                    Action::None
+                }
+                Key::Char(c) => {
+                    let c = if c == '\n' { ' ' } else { c };
+                    self.input.insert(self.cursor_byte(), c);
+                    self.cursor += 1;
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
+        let on_actions = matches!(self.form.as_ref().map(|f| &f.focus), Some(FormFocus::Actions));
+        match key {
+            Key::Up | Key::Char('k') => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if on_actions {
+                    form.focus = FormFocus::Fields;
+                    form.cursor = form.fields.len().saturating_sub(1);
+                } else {
+                    form.cursor = form.cursor.saturating_sub(1);
+                }
+                form.notice = None;
+                Action::None
+            }
+            Key::Down | Key::Char('j') => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if !on_actions {
+                    if form.cursor + 1 < form.fields.len() {
+                        form.cursor += 1;
+                    } else {
+                        form.focus = FormFocus::Actions;
+                    }
+                }
+                form.notice = None;
+                Action::None
+            }
+            Key::Tab => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if form.cursor + 1 < form.fields.len() {
+                    form.cursor += 1;
+                    form.focus = FormFocus::Fields;
+                } else {
+                    form.focus = FormFocus::Actions;
+                }
+                Action::None
+            }
+            Key::BackTab => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if matches!(form.focus, FormFocus::Actions) {
+                    form.focus = FormFocus::Fields;
+                } else {
+                    form.cursor = form.cursor.saturating_sub(1);
+                }
+                Action::None
+            }
+            Key::Left | Key::Char('h') => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if on_actions {
+                    form.action = 0;
+                } else if let Some((spec, runtime)) = form.fields.get_mut(form.cursor) {
+                    adjust_form_field(&spec.kind, runtime, false);
+                }
+                Action::None
+            }
+            Key::Right | Key::Char('l') => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if on_actions {
+                    form.action = 1;
+                } else if let Some((spec, runtime)) = form.fields.get_mut(form.cursor) {
+                    adjust_form_field(&spec.kind, runtime, true);
+                }
+                Action::None
+            }
+            Key::Char(' ') => {
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if !on_actions {
+                    if let Some((spec, runtime)) = form.fields.get_mut(form.cursor) {
+                        adjust_form_field(&spec.kind, runtime, true);
+                    }
+                }
+                Action::None
+            }
+            Key::Enter => {
+                if on_actions {
+                    let action = self.form.as_ref().map(|form| form.action).unwrap_or(1);
+                    if action == 0 {
+                        let values = self.form_values();
+                        self.form = None;
+                        self.input.clear();
+                        self.cursor = 0;
+                        Action::ConfigSubmit(values)
+                    } else {
+                        self.form = None;
+                        self.input.clear();
+                        self.cursor = 0;
+                        Action::None
+                    }
+                } else {
+                    let cursor = self.form.as_ref().map(|form| form.cursor).unwrap_or(0);
+                    let is_text = self.form.as_ref().is_some_and(|form| {
+                        matches!(
+                            form.fields.get(cursor).map(|(_, runtime)| runtime),
+                            Some(FormFieldRuntime::Text { .. })
+                        )
+                    });
+                    if is_text {
+                        let draft = self
+                            .form
+                            .as_ref()
+                            .and_then(|form| form.fields.get(cursor))
+                            .and_then(|(_, runtime)| match runtime {
+                                FormFieldRuntime::Text { draft } => Some(draft.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        self.input = draft;
+                        self.cursor = self.input.chars().count();
+                        self.input_mode_form = true;
+                        Action::None
+                    } else {
+                        let Some(form) = self.form.as_mut() else {
+                            return Action::None;
+                        };
+                        if let Some((spec, runtime)) = form.fields.get_mut(form.cursor) {
+                            adjust_form_field(&spec.kind, runtime, true);
+                        }
+                        Action::None
+                    }
+                }
+            }
+            Key::Char(c) if !c.is_ascii_control() && !on_actions => {
+                // 直接打字进入文本字段编辑
+                let cursor = self.form.as_ref().map(|form| form.cursor).unwrap_or(0);
+                let is_text = self.form.as_ref().is_some_and(|form| {
+                    matches!(
+                        form.fields.get(cursor).map(|(_, runtime)| runtime),
+                        Some(FormFieldRuntime::Text { .. })
+                    )
+                });
+                if is_text {
+                    let c = if c == '\n' { ' ' } else { c };
+                    self.input_mode_form = true;
+                    self.input.insert(self.cursor_byte(), c);
+                    self.cursor += 1;
+                }
+                Action::None
+            }
+            Key::Esc => {
+                // 阶梯：编辑 → 字段区 → 动作区 → 关闭表单
+                if self.form_editing() {
+                    let draft = self.input.trim().to_string();
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.input_mode_form = false;
+                    let Some(form) = self.form.as_mut() else {
+                        return Action::None;
+                    };
+                    if let Some((_, FormFieldRuntime::Text { draft: slot })) =
+                        form.fields.get_mut(form.cursor)
+                    {
+                        *slot = draft;
+                    }
+                    return Action::None;
+                }
+                let on_actions_now = matches!(
+                    self.form.as_ref().map(|f| &f.focus),
+                    Some(FormFocus::Actions)
+                );
+                let Some(form) = self.form.as_mut() else {
+                    return Action::None;
+                };
+                if on_actions_now {
+                    self.form = None;
+                    self.input.clear();
+                    self.cursor = 0;
+                } else {
+                    form.focus = FormFocus::Actions;
+                }
+                Action::None
+            }
+            Key::CtrlC => {
+                self.form = None;
+                self.input.clear();
+                self.cursor = 0;
+                Action::None
+            }
+            Key::CtrlD => Action::Quit,
+            Key::CtrlL => Action::Redraw,
+            _ => Action::None,
+        }
+    }
+    fn form_values(&self) -> BTreeMap<String, String> {
+        let Some(form) = self.form.as_ref() else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for (spec, runtime) in &form.fields {
+            match runtime {
+                FormFieldRuntime::Text { draft } => {
+                    let value = draft.trim();
+                    if !value.is_empty() {
+                        out.insert(spec.key.clone(), value.to_string());
+                    }
+                }
+                FormFieldRuntime::Toggle { on } => {
+                    out.insert(spec.key.clone(), if *on { "1".into() } else { "0".into() });
+                }
+                FormFieldRuntime::Choice { options, index } => {
+                    if let Some(option) = options.get(*index) {
+                        out.insert(spec.key.clone(), option.clone());
+                    }
+                }
+            }
+        }
+        out
     }
     fn cursor_byte(&self) -> usize {
         self.input
@@ -1263,6 +2101,9 @@ impl Tui {
         if self.asking.is_some() {
             return self.handle_ask_key(key);
         }
+        if self.form.is_some() {
+            return self.handle_form_key(key);
+        }
         match key {
             Key::Enter => {
                 if self.in_paste {
@@ -1331,6 +2172,7 @@ impl Tui {
                     self.hist_move(1)
                 }
             }
+            Key::BackTab | Key::CtrlF => Action::None,
             Key::Tab => {
                 if self.in_paste {
                     self.command_completion = None;
@@ -1712,188 +2554,209 @@ impl Tui {
             .len()
     }
     fn build_ask_panel(&self, max_lines: usize) -> AskPanel {
+        let empty = AskPanel { lines: Vec::new(), cursor: None, hits: Vec::new() };
         let Some(asking) = self.asking.as_ref() else {
-            return AskPanel { lines: Vec::new(), cursor: None };
+            return empty;
         };
-        let Some(question) = asking.questions.get(asking.current) else {
-            return AskPanel { lines: Vec::new(), cursor: None };
+        let Some(question) = asking.questions.get(asking.active_tab) else {
+            return empty;
         };
         if max_lines == 0 {
-            return AskPanel { lines: Vec::new(), cursor: None };
+            return empty;
         }
         let width = self.w.max(10);
+        let tab = asking.active_tab;
         let option_count = question.options.len();
-        let other_index = option_count;
-        let max_index_width = (option_count + 1).to_string().len();
-        let mut rows: Vec<AskPanelRow> = Vec::new();
+        let cursor = asking.cursor[tab].min(option_count);
+        // 面板高度上限：普通 = max(屏幕1/3, 8)，全屏 = 可用全部（照 grok）
+        let height_cap = if asking.fullscreen {
+            max_lines
+        } else {
+            (self.h / 3).max(8).min(max_lines)
+        };
+        let is_multi = question.multi_select;
+        let shortcut_of = |row: usize| -> String {
+            if row < option_count {
+                if row < 9 {
+                    char::from(b'1' + row as u8).to_string()
+                } else {
+                    char::from(b'a' + (row - 9) as u8).to_string()
+                }
+            } else {
+                "z".to_string()
+            }
+        };
+        let label_col = question
+            .options
+            .iter()
+            .map(|option| option.label.width())
+            .max()
+            .unwrap_or(0)
+            .min(width * 6 / 10)
+            .max(4);
+        let selected_of = |index: usize| -> bool {
+            match &asking.selection[tab] {
+                AskSelection::Single(current) => *current == Some(index),
+                AskSelection::Multi(set) => set.contains(&index),
+            }
+        };
+        let prefix_width = 6usize; // 快捷键(1)+空格(1)+标记(3)+空格(1)
+        // 选项行：聚焦行整段换行说明，未聚焦行折叠一行（照 grok）
+        let mut option_lines: Vec<(String, usize)> = Vec::new(); // (行文本, 选项下标)
+        let mut focused_detail: Vec<String> = Vec::new();
         for (index, option) in question.options.iter().enumerate() {
-            let focused = asking.focus == index;
-            let checked = question.multi_select && asking.checked.contains(&index);
-            let pointer = if focused { "❯" } else { " " };
-            let number = format!("{}.", index + 1);
-            let number = format!("{number:<width$}", width = max_index_width + 2);
-            let check = if question.multi_select {
-                if checked { "[✓] " } else { "[ ] " }
+            let selected = selected_of(index);
+            let focused = cursor == index;
+            let mark = if is_multi {
+                if selected { "[x]" } else { "[ ]" }
             } else {
-                ""
+                if selected { "(●)" } else { "(○)" }
             };
-            let prefix_width = 2 + number.width() + check.width();
-            let label = truncate_width(&option.label, width.saturating_sub(prefix_width));
-            let color = if checked { C_GREEN } else if focused { C_SUGGEST } else { C_ASST };
-            let row = format!(
-                "{color}{pointer}{C_RESET} {C_DIM}{number}{C_RESET}{color}{check}{label}{C_RESET}"
+            let color = if selected { C_GREEN } else if focused { C_SUGGEST } else { C_ASST };
+            let label_pad = truncate_width(&option.label, label_col);
+            let pad = " ".repeat(label_col.saturating_sub(label_pad.width()));
+            let mut line = format!(
+                "{C_DIM}{} {C_RESET}{color}{mark}{C_RESET} {color}{}{C_RESET}{pad}",
+                shortcut_of(index),
+                label_pad
             );
-            let description = if option.description.is_empty() {
-                None
-            } else {
-                let pad = " ".repeat(prefix_width);
-                let text = truncate_width(&option.description, width.saturating_sub(prefix_width));
-                let desc_color = if focused { C_SUGGEST } else { C_DIM };
-                Some(format!("{pad}{desc_color}{text}{C_RESET}"))
-            };
-            rows.push((row, description, None));
+            if !option.description.is_empty() {
+                if focused {
+                    focused_detail = wrap_width(&option.description, width.saturating_sub(prefix_width))
+                        .into_iter()
+                        .map(|text| format!("{C_DIM}{}{text}{C_RESET}", " ".repeat(prefix_width)))
+                        .collect();
+                } else {
+                    let remaining = width.saturating_sub(prefix_width + label_pad.width() + pad.width());
+                    let desc = truncate_width(&option.description, remaining.saturating_sub(1));
+                    let cut = desc.width() < option.description.width();
+                    line.push_str(&format!(
+                        "{pad}{C_DIM}{desc}{}{C_RESET}",
+                        if cut { "…" } else { "" }
+                    ));
+                }
+            }
+            option_lines.push((line, index));
         }
-        let other_focused = asking.focus == other_index;
-        let other_checked = question.multi_select && asking.checked.contains(&other_index);
-        let pointer = if other_focused { "❯" } else { " " };
-        let number = format!("{}.", other_index + 1);
-        let number = format!("{number:<width$}", width = max_index_width + 2);
-        let check = if question.multi_select {
-            if other_checked { "[✓] " } else { "[ ] " }
+        // Other 常驻底部行
+        let other_selected = asking.freeform_selected[tab];
+        let other_focused = cursor == option_count;
+        let other_mark = if is_multi {
+            if other_selected { "[x]" } else { "[ ]" }
         } else {
-            ""
+            if other_selected { "(●)" } else { "(○)" }
         };
-        let prefix_width = 2 + number.width() + check.width();
-        let secret_input = self.ask_kind == AskKind::ProviderConfig && question.header == "API Key";
-        let custom = if self.input.is_empty() {
-            if secret_input { "Paste API key (hidden).".to_string() } else { "Type something.".to_string() }
-        } else if secret_input {
-            "•".repeat(self.input.chars().count())
-        } else {
-            self.input.clone()
-        };
-        let custom = truncate_width(&custom, width.saturating_sub(prefix_width));
-        let color = if other_checked {
+        let other_color = if other_selected {
             C_GREEN
         } else if other_focused {
             C_SUGGEST
-        } else if self.input.is_empty() {
+        } else {
             C_DIM
-        } else {
-            C_ASST
         };
-        let other_row = format!(
-            "{color}{pointer}{C_RESET} {C_DIM}{number}{C_RESET}{color}{check}{custom}{C_RESET}"
+        let freeform = asking.freeform[tab].clone();
+        let (other_value, other_cursor) = if other_focused && asking.input_mode {
+            let masked = false; // 提问无秘密字段
+            let before: String = self.input.chars().take(self.cursor).collect();
+            let before = if masked { "•".repeat(before.chars().count()) } else { before };
+            let ch = self.input.chars().nth(self.cursor).unwrap_or(' ');
+            (
+                if self.input.is_empty() {
+                    "输入自定义答案…".to_string()
+                } else {
+                    self.input.clone()
+                },
+                Some((prefix_width + before.width() + 1, ch)),
+            )
+        } else if !freeform.is_empty() {
+            (freeform.clone(), None)
+        } else {
+            ("输入自定义答案…".to_string(), None)
+        };
+        let other_line = format!(
+            "{C_DIM}z {C_RESET}{other_color}{other_mark}{C_RESET} {C_DIM}Other：{C_RESET}{other_color}{}{C_RESET}",
+            truncate_width(&other_value, width.saturating_sub(prefix_width + 8))
         );
-        let other_cursor = if other_focused {
-            let before = if secret_input {
-                "•".repeat(self.cursor)
-            } else {
-                self.input.chars().take(self.cursor).collect()
-            };
-            let col = prefix_width + before.width() + 1;
-            let ch = if self.input.is_empty() {
-                if secret_input { 'P' } else { 'T' }
-            } else if secret_input {
-                '•'
-            } else {
-                self.input.chars().nth(self.cursor).unwrap_or(' ')
-            };
-            Some((col.min(width), ch))
-        } else {
-            None
-        };
-        rows.push((other_row, None, other_cursor));
-        if question.multi_select {
-            let submit_index = other_index + 1;
-            let focused = asking.focus == submit_index;
-            let label = if asking.current + 1 == asking.questions.len() { "Submit" } else { "Next" };
-            let pointer = if focused { "❯" } else { " " };
-            let color = if focused { C_SUGGEST } else { C_ASST };
-            rows.push((
-                format!("{color}{pointer}     {C_BOLD}{label}{C_RESET}"),
-                None,
-                None,
-            ));
-        }
-        let tab_count = asking.questions.len().max(1);
-        let tab_width = width.saturating_sub(4).checked_div(tab_count).unwrap_or(width).max(5);
-        let mut nav = String::new();
-        if asking.questions.len() > 1 || question.multi_select {
-            if asking.current == 0 {
-                nav.push_str(&format!("{C_DIM}← {C_RESET}"));
-            } else {
-                nav.push_str("← ");
-            }
-        }
-        for (index, item) in asking.questions.iter().enumerate() {
-            let answered = asking.answers.contains_key(&item.question);
-            let mark = if answered { "☒" } else { "☐" };
-            let header = truncate_width(&item.header, tab_width.saturating_sub(4));
-            if index == asking.current {
-                nav.push_str(&format!("{C_BG_ASK_TAB} {mark} {header} {C_RESET}"));
-            } else {
-                nav.push_str(&format!(" {mark} {header} "));
-            }
-        }
-        if asking.questions.len() > 1 || question.multi_select {
-            if asking.current + 1 >= asking.questions.len() {
-                nav.push_str(&format!("{C_DIM} →{C_RESET}"));
-            } else {
-                nav.push_str(" →");
-            }
-        }
-        let compact_height = 6 + rows.len();                                         
-        let description_count = rows.iter().filter(|(_, desc, _)| desc.is_some()).count();
-        let expanded = compact_height + description_count <= max_lines;
-        let all_rows_fit = compact_height <= max_lines;
-        let (row_start, row_end, include_blank) = if all_rows_fit {
-            (0, rows.len(), true)
-        } else {
-            let visible_count = max_lines.saturating_sub(5).max(1).min(rows.len());
-            let max_start = rows.len().saturating_sub(visible_count);
-            let start = asking.focus.saturating_sub(visible_count / 2).min(max_start);
-            (start, start + visible_count, false)
-        };
-        let mut lines = Vec::new();
-        let mut cursor = None;
-        lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
-        lines.push(nav);
-        lines.push(format!(
-            "{C_BOLD}{}{C_RESET}",
-            truncate_width(&question.question, width)
+        // 卡片 chrome：首段=标题（加粗），其余暗淡并封顶 5 行（照 grok）
+        let (head, body) = split_first_paragraph(&question.question);
+        let tab_label = format!("[{}/{}]", tab + 1, asking.questions.len());
+        let mut chrome: Vec<String> = Vec::new();
+        chrome.push(format!(
+            "{C_DIM}{tab_label}{C_RESET} {C_BOLD}{}{C_RESET}",
+            truncate_width(head, width.saturating_sub(tab_label.width() + 1))
         ));
-        if include_blank {
-            lines.push(String::new());
+        if !body.trim().is_empty() {
+            let body_cap = if asking.fullscreen { usize::MAX } else { 5 };
+            let mut body_lines = wrap_width(body.trim(), width.saturating_sub(1));
+            if body_lines.len() > body_cap {
+                body_lines.truncate(body_cap);
+                if let Some(last) = body_lines.last_mut() {
+                    if asking.fullscreen {
+                        last.push_str(&format!("{C_DIM} …{C_RESET}"));
+                    } else {
+                        last.push_str(&format!("{C_DIM} … Ctrl-F 展开{C_RESET}"));
+                    }
+                }
+            }
+            for text in body_lines {
+                chrome.push(format!("{C_DIM}{text}{C_RESET}"));
+            }
         }
-        for (row_index, (row, description, row_cursor)) in rows
+        chrome.push(String::new());
+        // 高度预算 → 选项区滚动窗口（Other 常驻，照 grok）
+        let fixed_h = 1 + chrome.len() + 1 + 1 + 1; // 上边线 + chrome + Other行 + 下边线 + 页脚
+        let visible = height_cap
+            .saturating_sub(fixed_h)
+            .max(1)
+            .min(option_lines.len().max(1));
+        let mut scroll = asking.scroll[tab].min(option_lines.len().saturating_sub(visible));
+        if cursor < scroll {
+            scroll = cursor;
+        }
+        if cursor >= scroll + visible {
+            scroll = cursor + 1 - visible;
+        }
+        let window: Vec<&(String, usize)> = option_lines
             .iter()
-            .enumerate()
-            .skip(row_start)
-            .take(row_end.saturating_sub(row_start))
-        {
+            .skip(scroll)
+            .take(visible)
+            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        let mut hits: Vec<(usize, AskHit)> = Vec::new();
+        let mut panel_cursor = None;
+        lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
+        lines.extend(chrome);
+        if scroll > 0 {
+            lines.push(format!("{C_DIM}  ↑ 还有 {} 项{C_RESET}", scroll));
+        }
+        for (text, index) in &window {
             let panel_row = lines.len();
-            lines.push(row.clone());
-            if row_index == row_start && row_start > 0 {
-                lines[panel_row].push_str(&format!(" {C_DIM}↑{C_RESET}"));
-            }
-            if row_index + 1 == row_end && row_end < rows.len() {
-                lines[panel_row].push_str(&format!(" {C_DIM}↓{C_RESET}"));
-            }
-            if let Some((col, ch)) = row_cursor {
-                cursor = Some((panel_row, *col, *ch));
-            }
-            if expanded {
-                if let Some(description) = description {
-                    lines.push(description.clone());
+            lines.push(text.clone());
+            hits.push((panel_row, AskHit::Option(*index)));
+            if cursor == *index {
+                for detail in &focused_detail {
+                    let detail_row = lines.len();
+                    lines.push(detail.clone());
+                    hits.push((detail_row, AskHit::Option(*index)));
                 }
             }
         }
+        let other_row_index = lines.len();
+        lines.push(other_line);
+        hits.push((other_row_index, AskHit::Other));
+        if let Some((col, ch)) = other_cursor {
+            panel_cursor = Some((other_row_index, col.min(width), ch));
+        }
+        if scroll + visible < option_lines.len() {
+            lines.push(format!(
+                "{C_DIM}  ↓ 还有 {} 项{C_RESET}",
+                option_lines.len() - scroll - visible
+            ));
+        }
         lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
-        let help = if question.multi_select {
-            "Enter/Space to select · ↑/↓ to navigate · Enter on Submit · Esc to cancel"
+        let help = if asking.input_mode {
+            "输入自定义答案 · Enter 确认 · Esc 返回"
         } else {
-            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+            "j/k 移动 · h/l 切题 · 空格 选择 · Enter 确认 · y 复制 · Ctrl-C 取消"
         };
         let footer = match asking.notice.as_deref() {
             Some(notice) => format!("{C_WARN}⚠ {notice}{C_RESET} {C_DIM}· {help}{C_RESET}"),
@@ -1902,9 +2765,144 @@ impl Tui {
         lines.push(footer);
         if lines.len() > max_lines {
             lines.truncate(max_lines);
-            cursor = cursor.filter(|(row, _, _)| *row < max_lines);
+            hits.retain(|(row, _)| *row < max_lines);
+            panel_cursor = panel_cursor.filter(|(row, _, _)| *row < max_lines);
         }
-        AskPanel { lines, cursor }
+        AskPanel { lines, cursor: panel_cursor, hits }
+    }
+    fn form_panel_height(&self) -> usize {
+        if self.form.is_none() {
+            return 0;
+        }
+        self.build_form_panel(self.h.saturating_sub(self.fixed_header_height()))
+            .lines
+            .len()
+    }
+    fn build_form_panel(&self, max_lines: usize) -> AskPanel {
+        let empty = AskPanel { lines: Vec::new(), cursor: None, hits: Vec::new() };
+        let Some(form) = self.form.as_ref() else {
+            return empty;
+        };
+        if max_lines == 0 {
+            return empty;
+        }
+        let width = self.w.max(10);
+        let on_actions = matches!(form.focus, FormFocus::Actions);
+        let editing = self.form_editing();
+        let mut lines: Vec<String> = Vec::new();
+        let mut panel_cursor = None;
+        lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
+        lines.push(format!("{C_BOLD}{}{C_RESET}", truncate_width(&form.title, width)));
+        lines.push(format!(
+            "{C_DIM}j/k 移动 · Enter 编辑/切换 · Tab 下一项 · Esc 下一区{C_RESET}"
+        ));
+        lines.push(String::new());
+        let title_col = form
+            .fields
+            .iter()
+            .map(|(spec, _)| spec.title.width())
+            .max()
+            .unwrap_or(0)
+            .min(width * 4 / 10)
+            .max(4);
+        // 底部预算：上边线+标题+帮助+空行(4) + 空行+动作+提示?+下边线(≥3)，保证动作区可见
+        let mut field_budget = max_lines
+            .saturating_sub(7)
+            .max(1);
+        let mut fields_truncated = false;
+        for (index, (spec, runtime)) in form.fields.iter().enumerate() {
+            let cost = 1
+                + usize::from(!on_actions && form.cursor == index)
+                + usize::from(fields_truncated);
+            if cost > field_budget {
+                fields_truncated = true;
+                continue;
+            }
+            field_budget -= cost;
+            let focused = !on_actions && form.cursor == index;
+            let mark = if focused { "❯" } else { " " };
+            let color = if focused { C_SUGGEST } else { C_ASST };
+            let title_pad = truncate_width(&spec.title, title_col);
+            let pad = " ".repeat(title_col.saturating_sub(title_pad.width()));
+            let (shown, empty_value) = match runtime {
+                FormFieldRuntime::Text { draft } => {
+                    let live = focused && editing;
+                    let text = if live { self.input.clone() } else { draft.clone() };
+                    if spec_hides_input(spec) {
+                        if text.is_empty() {
+                            (spec_placeholder(spec).to_string(), true)
+                        } else {
+                            ("•".repeat(text.chars().count()), false)
+                        }
+                    } else if text.is_empty() {
+                        (spec_placeholder(spec).to_string(), true)
+                    } else {
+                        (text, false)
+                    }
+                }
+                FormFieldRuntime::Toggle { on } => {
+                    (if *on { "[x] 开启".into() } else { "[ ] 关闭".into() }, false)
+                }
+                FormFieldRuntime::Choice { options, index } => {
+                    let current = options.get(*index).cloned().unwrap_or_default();
+                    (format!("‹ {current} ›"), current.is_empty())
+                }
+            };
+            if focused && editing {
+                let before: String = self.input.chars().take(self.cursor).collect();
+                let ch = self.input.chars().nth(self.cursor).unwrap_or(' ');
+                let shown_before = if spec_hides_input(spec) {
+                    "•".repeat(before.chars().count())
+                } else {
+                    before
+                };
+                panel_cursor = Some((
+                    lines.len() + 1,
+                    2 + title_pad.width() + pad.width() + 1 + shown_before.width() + 1,
+                    ch,
+                ));
+            }
+            let value_color = if empty_value { C_DIM } else { color };
+            lines.push(format!(
+                "{mark} {color}{}{C_RESET}{pad}{C_DIM}│{C_RESET} {value_color}{}{C_RESET}",
+                title_pad,
+                truncate_width(&shown, width.saturating_sub(title_col + 6))
+            ));
+            if focused {
+                lines.push(format!(
+                    "  {C_DIM}{}{C_RESET}",
+                    truncate_width(&spec.hint, width.saturating_sub(4))
+                ));
+            }
+        }
+        lines.push(String::new());
+        if fields_truncated {
+            lines.push(format!("{C_DIM}  … 还有更多字段（j/k 滚动）{C_RESET}"));
+        }
+        let actions: [(&str, usize); 2] = [("保存", 0), ("取消", 1)];
+        let mut action_line = String::from("  ");
+        for (label, index) in actions {
+            let active = on_actions && form.action == index;
+            if active {
+                action_line.push_str(&format!("{C_BG_ASK_TAB} [{label}] {C_RESET} "));
+            } else {
+                action_line.push_str(&format!("{C_DIM}[{label}]{C_RESET} "));
+            }
+        }
+        if on_actions {
+            action_line
+                .push_str(&format!("{C_DIM} ←/→ 切换 · Enter 执行{C_RESET}"));
+        }
+        lines.push(action_line);
+        if let Some(notice) = &form.notice {
+            lines.push(format!("{C_WARN}⚠ {notice}{C_RESET}"));
+        }
+        lines.push(format!("{C_GRAY}{}{C_RESET}", "─".repeat(width)));
+        if lines.len() > max_lines {
+            lines.truncate(max_lines);
+            panel_cursor = panel_cursor.filter(|(row, _, _)| *row < max_lines);
+        }
+        AskPanel { lines, cursor: panel_cursor, hits: Vec::new() }
     }
     fn perm_panel_height(&self) -> usize {
         if self.perm_prompt.is_none() {
@@ -1916,10 +2914,10 @@ impl Tui {
     }
     fn build_perm_panel(&self, max_lines: usize) -> AskPanel {
         let Some(ui) = self.perm_prompt.as_ref() else {
-            return AskPanel { lines: Vec::new(), cursor: None };
+            return AskPanel { lines: Vec::new(), cursor: None, hits: Vec::new() };
         };
         if max_lines == 0 {
-            return AskPanel { lines: Vec::new(), cursor: None };
+            return AskPanel { lines: Vec::new(), cursor: None, hits: Vec::new() };
         }
         let width = self.w.max(10);
         let mut lines = Vec::new();
@@ -1966,12 +2964,15 @@ impl Tui {
         if lines.len() > max_lines {
             lines.truncate(max_lines);
         }
-        AskPanel { lines, cursor: None }
+        AskPanel { lines, cursor: None, hits: Vec::new() }
     }
     fn chat_height(&self) -> usize {
-        if self.asking.is_some() || self.perm_prompt.is_some() {
+        if self.asking.is_some() || self.form.is_some() || self.perm_prompt.is_some() {
             return self.h.saturating_sub(
-                self.fixed_header_height() + self.ask_panel_height() + self.perm_panel_height(),
+                self.fixed_header_height()
+                    + self.ask_panel_height()
+                    + self.form_panel_height()
+                    + self.perm_panel_height(),
             );
         }
         self.h.saturating_sub(
@@ -2336,14 +3337,19 @@ impl Tui {
         }
         let ask_panel = self.build_ask_panel(self.h.saturating_sub(welcome_h));
         let ask_h = ask_panel.lines.len();
+        let form_panel = self.build_form_panel(self.h.saturating_sub(welcome_h));
+        let form_h = form_panel.lines.len();
         let perm_panel = self.build_perm_panel(self.h.saturating_sub(welcome_h));
         let perm_h = perm_panel.lines.len();
-        let normal_bottom_h = if self.asking.is_some() || self.perm_prompt.is_some() {
+        let bottom_open = self.asking.is_some() || self.form.is_some() || self.perm_prompt.is_some();
+        let normal_bottom_h = if bottom_open {
             0
         } else {
-            3 + vis_in + popup_h                      
+            3 + vis_in + popup_h
         };
-        let chat_h = self.h.saturating_sub(welcome_h + ask_h + perm_h + normal_bottom_h);
+        let chat_h = self
+            .h
+            .saturating_sub(welcome_h + ask_h + form_h + perm_h + normal_bottom_h);
         let mut lines = self.render_lines();
         if self.streaming {
             if let Some(last) = lines.iter_mut().rev().find(|r| !r.styled.is_empty()) {
@@ -2399,6 +3405,8 @@ impl Tui {
             out.push_str(&format!("\x1b[K{}\x1b[0m\r\n", status_line.styled));
         }
         if self.asking.is_some() {
+            self.ask_panel_top = Some(welcome_h + chat_h + 1);
+            self.ask_panel_hits = ask_panel.hits.clone();
             for (index, line) in ask_panel.lines.iter().enumerate() {
                 out.push_str(&format!("\x1b[K{line}\x1b[0m"));
                 if index + 1 < ask_panel.lines.len() {
@@ -2411,6 +3419,23 @@ impl Tui {
             }
             return out;
         }
+        if self.form.is_some() {
+            self.ask_panel_top = None;
+            self.ask_panel_hits.clear();
+            for (index, line) in form_panel.lines.iter().enumerate() {
+                out.push_str(&format!("\x1b[K{line}\x1b[0m"));
+                if index + 1 < form_panel.lines.len() {
+                    out.push_str("\r\n");
+                }
+            }
+            if let Some((panel_row, col, cursor_char)) = form_panel.cursor {
+                let row = welcome_h + chat_h + panel_row + 1;
+                out.push_str(&format!("\x1b[{row};{col}H{C_CURSOR}{cursor_char}\x1b[0m"));
+            }
+            return out;
+        }
+        self.ask_panel_top = None;
+        self.ask_panel_hits.clear();
         if self.perm_prompt.is_some() {
             for (index, line) in perm_panel.lines.iter().enumerate() {
                 out.push_str(&format!("\x1b[K{line}\x1b[0m"));
@@ -2822,6 +3847,7 @@ impl KeyParser {
                     "[D" => Key::Left,
                     "[H" => Key::Home,
                     "[F" => Key::End,
+                    "[Z" => Key::BackTab,
                     "[5~" => Key::PageUp,
                     "[6~" => Key::PageDown,
                     "[3~" => Key::Delete,
@@ -2841,6 +3867,7 @@ impl KeyParser {
             0x7f | 0x08 => Key::Backspace,
             0x03 => Key::CtrlC,
             0x04 => Key::CtrlD,
+            0x06 => Key::CtrlF,
             0x0c => Key::CtrlL,
             0x0f => Key::CtrlO,
             0x1b => Key::Esc,
@@ -3263,7 +4290,6 @@ mod tests {
         assert_eq!(t.mascot_state, MascotState::Idle);
         t.ask(vec![AskQuestion {
             question: "继续吗？".into(),
-            header: "确认".into(),
             options: vec![AskOption {
                 label: "继续".into(),
                 description: "继续执行".into(),
@@ -3337,10 +4363,9 @@ mod tests {
         t.ask(vec![
             AskQuestion {
                 question: "使用哪种认证方式？".into(),
-                header: "认证".into(),
                 options: vec![
                     AskOption {
-                        label: "OAuth（推荐）".into(),
+                        label: "OAuth".into(),
                         description: "标准协议，支持多个提供商".into(),
                         preview: None,
                     },
@@ -3354,7 +4379,6 @@ mod tests {
             },
             AskQuestion {
                 question: "启用哪些能力？".into(),
-                header: "能力".into(),
                 options: vec![
                     AskOption { label: "日志".into(), description: "记录运行信息".into(), preview: None },
                     AskOption { label: "指标".into(), description: "采集性能数据".into(), preview: None },
@@ -3364,36 +4388,53 @@ mod tests {
             },
         ]);
         let first = strip_ansi(&t.build_frame());
-        assert!(first.contains("☐ 认证"), "应显示 Claude Code 式问题页签");
+        assert!(first.contains("[1/2]"), "应显示一屏一题的 tab 计数");
         assert!(first.contains("使用哪种认证方式？"));
-        assert!(first.contains("❯ 1. OAuth（推荐）"));
-        assert!(first.contains("标准协议，支持多个提供商"), "说明在选项下一行");
-        assert!(first.contains("3. Type something."), "Other 本身就是输入行");
-        assert!(!first.contains("Try \"ask about this project\""), "Ask overlay 必须隐藏普通输入框");
-        assert!(first.contains("Enter to select · ↑/↓ to navigate · Esc to cancel"));
+        assert!(first.contains("(○)"), "单选用圆点标记（照 grok）");
+        assert!(first.contains("标准协议，支持多个提供商"), "聚焦行展开完整说明");
+        assert!(first.contains("Other："), "Other 常驻底部（照 grok）");
+        assert!(first.contains("Ctrl-C 取消"));
+        // 空格切换选中，Enter 选择并前进（照 grok）
         assert_eq!(t.handle_key(Key::Down), Action::None);
-        assert_eq!(t.handle_key(Key::Enter), Action::None, "第一题后进入第二题");
+        assert_eq!(t.handle_key(Key::Char(' ')), Action::None);
+        let selected = strip_ansi(&t.build_frame());
+        assert!(selected.contains("(●)"), "选中项显示实心圆点");
+        assert_eq!(t.handle_key(Key::Enter), Action::None, "Enter 选择并进入下一题");
         let second = strip_ansi(&t.build_frame());
-        assert!(second.contains("☒ 认证"));
-        assert!(second.contains("☐ 能力"));
-        assert!(second.contains("❯ 1. [ ] 日志"));
-        assert!(second.contains("Submit"));
-        assert_eq!(t.handle_key(Key::Enter), Action::None);        
-        assert_eq!(t.handle_key(Key::Down), Action::None);      
-        assert_eq!(t.handle_key(Key::Down), Action::None);      
-        assert_eq!(t.handle_key(Key::Char(' ')), Action::None);        
-        assert_eq!(t.handle_key(Key::Down), Action::None);         
+        assert!(second.contains("[2/2]"));
+        assert!(second.contains("[ ]"), "多选用方框标记");
+        // 多选：空格勾两个，再到 Other 输入备注
+        assert_eq!(t.handle_key(Key::Char(' ')), Action::None);
+        assert_eq!(t.handle_key(Key::Down), Action::None);
+        assert_eq!(t.handle_key(Key::Down), Action::None);
+        assert_eq!(t.handle_key(Key::Char(' ')), Action::None);
+        assert_eq!(t.handle_key(Key::Down), Action::None);
         for c in "自定义".chars() {
             let _ = t.handle_key(Key::Char(c));
         }
         let with_other = strip_ansi(&t.build_frame());
-        assert!(with_other.contains("❯ 4. [✓] 自定义"), "Other 行内输入并自动勾选");
-        assert_eq!(t.handle_key(Key::Down), Action::None);          
-        let Action::AskSubmit(answers) = t.handle_key(Key::Enter) else {
-            panic!("最后一题应提交结构化答案");
+        assert!(with_other.contains("[x]"), "Other 输入后自动勾选");
+        eprintln!(
+            "DBG sel={:?} ff={:?} ffs={:?} input={:?} im={} tab={}",
+            t.asking.as_ref().map(|a| a.selection.clone()),
+            t.asking.as_ref().map(|a| a.freeform.clone()),
+            t.asking.as_ref().map(|a| a.freeform_selected.clone()),
+            t.input,
+            t.asking.as_ref().map(|a| a.input_mode).unwrap_or(false),
+            t.asking.as_ref().map(|a| a.active_tab).unwrap_or(0),
+        );
+        let Action::AskSubmit(outcome) = t.handle_key(Key::Enter) else {
+            panic!("最后一题 Enter 应提交结构化答案");
         };
-        assert_eq!(answers["使用哪种认证方式？"], "JWT");
-        assert_eq!(answers["启用哪些能力？"], "日志, 告警, 自定义");
+        let crate::tools::AskOutcome::Accepted { answers, annotations } = outcome else {
+            panic!("应为 accepted outcome");
+        };
+        assert_eq!(
+            answers[0],
+            ("使用哪种认证方式？".to_string(), vec!["JWT".to_string()])
+        );
+        assert_eq!(answers[1].1, vec!["日志".to_string(), "告警".to_string()]);
+        assert_eq!(annotations[0].1.notes.as_deref(), Some("自定义"));
     }
     #[test]
     fn structured_ask_ignores_typing_on_options_and_accepts_inline_other() {
@@ -3401,7 +4442,6 @@ mod tests {
         let mut t = Tui::new();
         t.ask(vec![AskQuestion {
             question: "怎么处理？".into(),
-            header: "处理".into(),
             options: vec![
                 AskOption { label: "自动".into(), description: "自动处理".into(), preview: None },
                 AskOption { label: "手动".into(), description: "人工处理".into(), preview: None },
@@ -3413,35 +4453,62 @@ mod tests {
         assert_eq!(t.input, "", "焦点不在 Other 时不能把字符写进普通输入框");
         let _ = t.handle_key(Key::Down);
         let _ = t.handle_key(Key::Down);
+        assert!(t
+            .asking
+            .as_ref()
+            .is_some_and(|asking| asking.cursor[0] == 2), "游标停在 Other 行");
         for c in "稍后再决定".chars() {
             let _ = t.handle_key(Key::Char(c));
         }
+        assert!(t
+            .asking
+            .as_ref()
+            .is_some_and(|asking| asking.input_mode), "Other 上打字直接进入输入态");
         let frame = strip_ansi(&t.build_frame());
-        assert!(frame.contains("❯ 3. 稍后再决定"));
-        assert!(!frame.contains("Try \"ask about this project\""));
-        let Action::AskSubmit(answers) = t.handle_key(Key::Enter) else {
+        assert!(frame.contains("稍后再决定"));
+        let Action::AskSubmit(outcome) = t.handle_key(Key::Enter) else {
             panic!("自由文本应作为 Other 提交");
         };
-        assert_eq!(answers["怎么处理？"], "稍后再决定");
+        let crate::tools::AskOutcome::Accepted { answers, annotations } = outcome else {
+            panic!("应为 accepted outcome");
+        };
+        assert_eq!(answers[0].1, vec!["Other".to_string()]);
+        assert_eq!(annotations[0].1.notes.as_deref(), Some("稍后再决定"));
     }
     #[test]
     fn provider_setup_reuses_ask_ui_but_returns_config_action() {
         let mut t = Tui::new();
         t.open_provider_setup(&crate::config::Config::default());
+        let frame = strip_ansi(&t.build_frame());
+        assert!(frame.contains("模型服务配置"));
+        assert!(frame.contains("API Key"));
+        eprintln!("FORM FRAME:\n{frame}");
+        assert!(frame.contains("[保存]"), "动作区包含保存/取消");
+        // 移动到 API Key 字段并进入编辑
+        assert_eq!(t.handle_key(Key::Down), Action::None);
+        assert_eq!(t.handle_key(Key::Down), Action::None);
         assert_eq!(t.handle_key(Key::Enter), Action::None);
         for c in "sk-hidden-test".chars() {
             assert_eq!(t.handle_key(Key::Char(c)), Action::None);
         }
-        assert!(!strip_ansi(&t.build_frame()).contains("sk-hidden-test"));
-        assert_eq!(t.handle_key(Key::Enter), Action::None);
-        assert!(!strip_ansi(&t.build_frame()).contains("sk-hidden-test"));
-        assert_eq!(t.handle_key(Key::Enter), Action::None);
+        assert!(
+            !strip_ansi(&t.build_frame()).contains("sk-hidden-test"),
+            "密钥编辑时必须打点隐藏"
+        );
+        assert_eq!(t.handle_key(Key::Enter), Action::None, "Enter 保存草稿并前进");
+        assert!(
+            !strip_ansi(&t.build_frame()).contains("sk-hidden-test"),
+            "草稿保存后仍然隐藏"
+        );
+        // Esc 阶梯：字段区 → 动作区；Enter 执行保存
+        assert_eq!(t.handle_key(Key::Esc), Action::None);
         let Action::ConfigSubmit(answers) = t.handle_key(Key::Enter) else {
-            panic!("供应商配置最后一步应返回独立配置动作");
+            panic!("动作区保存应返回独立配置动作");
         };
-        assert_eq!(answers[crate::setup::PROVIDER_QUESTION], "DeepSeek");
-        assert_eq!(answers[crate::setup::MODEL_QUESTION], "DeepSeek V4 Flash");
-        assert_eq!(answers[crate::setup::AGENT_QUESTION], "开启（单并发）");
+        assert_eq!(answers[crate::setup::KEY_PROVIDER], "DeepSeek");
+        assert_eq!(answers[crate::setup::KEY_API_KEY], "sk-hidden-test");
+        assert_eq!(answers[crate::setup::KEY_MODEL], "deepseek-v4-flash");
+        assert!(t.form.is_none(), "提交后表单关闭");
     }
     #[test]
     fn structured_ask_escape_cancels_and_tiny_terminal_keeps_header() {
@@ -3451,7 +4518,6 @@ mod tests {
         t.h = 14;
         t.ask(vec![AskQuestion {
             question: "选择一个方案".into(),
-            header: "方案".into(),
             options: vec![
                 AskOption { label: "A".into(), description: "说明 A".into(), preview: None },
                 AskOption { label: "B".into(), description: "说明 B".into(), preview: None },
@@ -3459,13 +4525,33 @@ mod tests {
             ],
             multi_select: false,
         }]);
-        assert_eq!(t.handle_key(Key::CtrlC), Action::None);
-        assert!(t.is_asking(), "Ctrl+C 不应打断 ask_user");
+        // 照 grok：Ctrl-C 提交取消（成功结果），关闭由主循环完成
+        assert_eq!(
+            t.handle_key(Key::CtrlC),
+            Action::AskSubmit(crate::tools::AskOutcome::Cancelled)
+        );
+        assert!(t.is_asking(), "卡片由主循环在收到取消后关闭");
+        t.finish_ask();
+        // Esc 阶梯：有选择先清选择
+        t.ask(vec![AskQuestion {
+            question: "选择一个方案".into(),
+            options: vec![
+                AskOption { label: "A".into(), description: "说明 A".into(), preview: None },
+                AskOption { label: "B".into(), description: "说明 B".into(), preview: None },
+                AskOption { label: "C".into(), description: "说明 C".into(), preview: None },
+            ],
+            multi_select: false,
+        }]);
+        assert_eq!(t.handle_key(Key::Down), Action::None);
+        assert_eq!(t.handle_key(Key::Char(' ')), Action::None);
+        assert!(strip_ansi(&t.build_frame()).contains("(●) B"));
+        assert_eq!(t.handle_key(Key::Esc), Action::None, "第一级 Esc 清除当前选择");
+        assert!(strip_ansi(&t.build_frame()).contains("(○) B"), "选择已被清除");
+        assert_eq!(t.handle_key(Key::Esc), Action::Cancel, "无选择时 Esc 取消回合");
         let plain = strip_ansi(&t.build_frame());
         assert!(plain.contains("Yujiale Code v"), "小终端仍保留固定欢迎栏");
         assert!(plain.contains("选择一个方案"));
-        assert!(plain.contains("❯ 1. A"), "选项窗口至少显示当前项");
-        assert_eq!(t.handle_key(Key::Esc), Action::Cancel);
+        assert!(plain.contains("(○)"), "选项窗口至少显示当前项");
     }
     #[test]
     fn strip_tool_blocks_removes_blocks() {

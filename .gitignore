@@ -14,3 +14,7 @@ __pycache__/
 /deploy/napcat/config/onebot11_*.json
 /deploy/napcat/config/passkey.json
 /deploy/napcat/config/webui.json
+
+# Grok Build vendor：只提交源码，不提交构建产物（62GB+）
+/vendor/grok-build/target/
+/vendor/grok-build/.cargo/

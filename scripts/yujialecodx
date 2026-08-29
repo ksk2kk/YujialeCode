@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# YujialeCodX — Yujiale Code 的 Grok Build TUI 前端（默认 YJLcoder agent 驱动，无登录层）。
+# 安装：install -m 755 scripts/yujialecodx ~/.local/bin/yujialecodx
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$ROOT/vendor/grok-build/target/release/xai-grok-pager"
+if [ ! -x "$BIN" ]; then
+    echo "YujialeCodX: 未找到 TUI 二进制 $BIN" >&2
+    echo "  先构建: cd $ROOT/vendor/grok-build && cargo build --release -p xai-grok-pager-bin" >&2
+    exit 1
+fi
+exec "$BIN" "$@"

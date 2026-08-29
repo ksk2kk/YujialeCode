@@ -3,7 +3,7 @@ use crate::llm::Llm;
 use crate::registry::{list_categories_text, list_category_text};
 use crate::session::SessionStore;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufRead, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
@@ -32,10 +32,10 @@ pub struct AskOption {
     pub description: String,
     pub preview: Option<String>,
 }
+/// 单个提问；照 grok 原版不设 header，问题文本首段即标题。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskQuestion {
     pub question: String,
-    pub header: String,
     pub options: Vec<AskOption>,
     pub multi_select: bool,
 }
@@ -44,10 +44,53 @@ pub struct AskRequest {
     pub id: u64,
     pub questions: Vec<AskQuestion>,
 }
+/// 每题注记：单选附选中项 preview，Other 自由输入进 notes。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AskAnnotation {
+    pub preview: Option<String>,
+    pub notes: Option<String>,
+}
+/// 照 grok 原版的 outcome 模型：取消是成功结果，不是错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskOutcome {
+    Accepted {
+        answers: Vec<(String, Vec<String>)>,
+        annotations: Vec<(String, AskAnnotation)>,
+    },
+    ChatAboutThis {
+        partial_answers: Vec<(String, String)>,
+    },
+    SkipInterview {
+        partial_answers: Vec<(String, String)>,
+    },
+    Cancelled,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskAnswer {
     pub id: u64,
-    pub answers: BTreeMap<String, String>,
+    pub outcome: AskOutcome,
+}
+/// 表单字段（照 grok elicitation 表单的字段类型：文本/开关/单选）。
+#[derive(Debug, Clone)]
+pub enum FormFieldKind {
+    Text {
+        masked: bool,
+        placeholder: String,
+    },
+    Toggle {
+        on: bool,
+    },
+    Choice {
+        options: Vec<String>,
+        index: usize,
+    },
+}
+#[derive(Debug, Clone)]
+pub struct FormFieldSpec {
+    pub key: String,
+    pub title: String,
+    pub hint: String,
+    pub kind: FormFieldKind,
 }
 pub struct AskHandle<'a> {
     pub tx: &'a Sender<AskRequest>,
@@ -134,7 +177,7 @@ pub const KNOWN_OPS: &[&str] = &[
     "add_admin",
     "memory_search",
     "memory_write",
-    "ask_user",
+    "ask_user_question",
     "goal",
     "fuck_master",
     "computer_use",
@@ -322,7 +365,7 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "add_admin" => qq_add_admin(args, ctx),
         "memory_search" => memory_search(args, ctx),
         "memory_write" => memory_write(args, ctx),
-        "ask_user" => ask_user(args, ctx),
+        "ask_user_question" => ask_user(args, ctx),
         "goal" => crate::goal::execute_tool(ctx.cfg, ctx.store.current_id(), args),
         "fuck_master" => crate::fuck_master::execute_tool(ctx.cfg, ctx.store.current_id(), args),
         "computer_use" => crate::computer_use::execute(
@@ -2009,58 +2052,36 @@ fn memory_write(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         Err(e) => Err(format!("记忆文件打开失败: {e}")),
     }
 }
+/// grok 原版文案（format.rs 逐字）：取消不是错误。
+pub const ASK_CANCEL_TEXT: &str = "User declined to answer the questions. Continue with the task using your best judgment, or ask different questions.";
+pub const ASK_NO_OPERATOR_TEXT: &str = "No user is available to answer questions in this non-interactive session. Continue with your best judgment; do not wait for clarification.";
 fn ask_user(args: &Value, ctx: &mut ToolCtx) -> Result<String, String> {
-    let (question_order, answers) = request_user_answers(args, ctx)?;
-    let mut ordered_answers: Vec<(&String, &String)> = question_order
-        .iter()
-        .filter_map(|question| answers.get(question).map(|answer| (question, answer)))
-        .collect();
-    ordered_answers.extend(
-        answers
-            .iter()
-            .filter(|(question, _)| !question_order.contains(question)),
-    );
-    let answers_text = ordered_answers
-        .into_iter()
-        .map(|(question, answer)| {
-            format!(
-                "{}={}",
-                serde_json::to_string(question).unwrap_or_else(|_| format!("\"{question}\"")),
-                serde_json::to_string(answer).unwrap_or_else(|_| format!("\"{answer}\""))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "User has answered your questions: {answers_text}. You can now continue with the user's answers in mind."
-    ))
+    let (questions, outcome) = request_user_answers(args, ctx)?;
+    Ok(format_ask_outcome(&outcome, &questions))
 }
 fn request_user_answers(
     args: &Value,
     ctx: &mut ToolCtx,
-) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+) -> Result<(Vec<AskQuestion>, AskOutcome), String> {
     let handle = ctx
         .ask
         .as_ref()
-        .ok_or("当前模式不支持提问（ask_user 仅 TUI 交互可用）")?;
+        .ok_or("当前模式不支持提问（ask_user_question 仅 TUI 交互可用）")?;
     let questions = parse_ask_questions(args)?;
-    let question_order: Vec<String> = questions
-        .iter()
-        .map(|question| question.question.clone())
-        .collect();
     let id = handle.seq.fetch_add(1, Ordering::Relaxed);
     handle
         .tx
-        .send(AskRequest { id, questions })
+        .send(AskRequest {
+            id,
+            questions: questions.clone(),
+        })
         .map_err(|_| "提问通道已关闭".to_string())?;
     loop {
         if handle.cancel.load(Ordering::Relaxed) {
-            return Err("提问被取消".into());
+            return Ok((questions, AskOutcome::Cancelled));
         }
         match handle.rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(a) if a.id == id => {
-                return Ok((question_order, a.answers));
-            }
+            Ok(a) if a.id == id => return Ok((questions, a.outcome)),
             Ok(_) => continue,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Err("提问通道已断开".into()),
@@ -2068,13 +2089,215 @@ fn request_user_answers(
     }
 }
 pub(crate) fn ask_user_answers(args: &Value, ctx: &mut ToolCtx) -> Result<Value, String> {
-    let (_, answers) = request_user_answers(args, ctx)?;
-    Ok(Value::Object(
-        answers
-            .into_iter()
-            .map(|(question, answer)| (question, Value::String(answer)))
+    let (_, outcome) = request_user_answers(args, ctx)?;
+    Ok(ask_outcome_to_json(&outcome))
+}
+fn json_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+}
+fn format_ask_accepted(outcome: &AskOutcome) -> String {
+    let AskOutcome::Accepted { answers, annotations } = outcome else {
+        return String::new();
+    };
+    let entries = answers
+        .iter()
+        .map(|(question, labels)| {
+            let mut entry = format!(
+                "{}={}",
+                json_quote(question),
+                labels
+                    .iter()
+                    .map(|label| json_quote(label))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if let Some((_, ann)) = annotations.iter().find(|(q, _)| q == question) {
+                if let Some(preview) = &ann.preview {
+                    entry.push_str(&format!("\nselected preview:\n{preview}"));
+                }
+                if let Some(notes) = &ann.notes {
+                    entry.push_str(&format!("\nuser notes: {notes}"));
+                }
+            }
+            entry
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "User has answered your questions: {entries}. You can now continue with the user's answers in mind."
+    )
+}
+/// 照 grok format.rs：chat_about_this / skip_interview 的完整回填文案。
+fn format_ask_interview(
+    kind: &str,
+    questions: &[AskQuestion],
+    partial: &[(String, String)],
+) -> String {
+    let answer_of = |question: &AskQuestion| -> Option<&String> {
+        partial
+            .iter()
+            .find(|(q, _)| q == &question.question)
+            .map(|(_, a)| a)
+    };
+    let mut out = if kind == "chat" {
+        String::from(
+            "The user wants to clarify these questions.\n    \
+             This means they may have additional information, context or questions for you.\n    \
+             Take their response into account and then reformulate the questions if appropriate.\n    \
+             Start by asking them what they would like to clarify.\n\n    Questions asked:",
+        )
+    } else {
+        String::from(
+            "The user has indicated they have provided enough answers for the plan interview.\n\
+             Stop asking clarifying questions and proceed to finish the plan with the information you have.\n\
+             \nQuestions asked and answers provided:",
+        )
+    };
+    for question in questions {
+        out.push_str(&format!("\n- {}", json_quote(&question.question)));
+        match answer_of(question) {
+            Some(answer) if kind == "chat" => out.push_str(&format!("\n  Answer: {answer}")),
+            Some(answer) => out.push_str(&format!(" / Answer: {answer}")),
+            None => out.push_str(if kind == "chat" {
+                "\n  (No answer provided)"
+            } else {
+                " / (No answer provided)"
+            }),
+        }
+    }
+    out
+}
+pub fn format_ask_outcome(outcome: &AskOutcome, questions: &[AskQuestion]) -> String {
+    match outcome {
+        AskOutcome::Accepted { .. } => format_ask_accepted(outcome),
+        AskOutcome::Cancelled => ASK_CANCEL_TEXT.to_string(),
+        AskOutcome::ChatAboutThis { partial_answers } => {
+            format_ask_interview("chat", questions, partial_answers)
+        }
+        AskOutcome::SkipInterview { partial_answers } => {
+            format_ask_interview("skip", questions, partial_answers)
+        }
+    }
+}
+fn labels_value(labels: &[String]) -> Value {
+    Value::Array(labels.iter().map(|label| Value::String(label.clone())).collect())
+}
+/// grok ACP ext 响应线型：
+/// {"outcome":"accepted","answers":{题:[标签…]},"annotations":{题:{preview?,notes?}}}
+pub fn ask_outcome_to_json(outcome: &AskOutcome) -> Value {
+    match outcome {
+        AskOutcome::Accepted { answers, annotations } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("outcome".into(), Value::String("accepted".into()));
+            let map = answers
+                .iter()
+                .map(|(question, labels)| (question.clone(), labels_value(labels)))
+                .collect();
+            obj.insert("answers".into(), Value::Object(map));
+            if !annotations.is_empty() {
+                let ann = annotations
+                    .iter()
+                    .map(|(question, a)| {
+                        let mut entry = serde_json::Map::new();
+                        if let Some(preview) = &a.preview {
+                            entry.insert("preview".into(), Value::String(preview.clone()));
+                        }
+                        if let Some(notes) = &a.notes {
+                            entry.insert("notes".into(), Value::String(notes.clone()));
+                        }
+                        (question.clone(), Value::Object(entry))
+                    })
+                    .collect();
+                obj.insert("annotations".into(), Value::Object(ann));
+            }
+            Value::Object(obj)
+        }
+        AskOutcome::ChatAboutThis { partial_answers } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("outcome".into(), Value::String("chat_about_this".into()));
+            let map = partial_answers
+                .iter()
+                .map(|(question, answer)| (question.clone(), Value::String(answer.clone())))
+                .collect();
+            obj.insert("partial_answers".into(), Value::Object(map));
+            Value::Object(obj)
+        }
+        AskOutcome::SkipInterview { partial_answers } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("outcome".into(), Value::String("skip_interview".into()));
+            let map = partial_answers
+                .iter()
+                .map(|(question, answer)| (question.clone(), Value::String(answer.clone())))
+                .collect();
+            obj.insert("partial_answers".into(), Value::Object(map));
+            Value::Object(obj)
+        }
+        AskOutcome::Cancelled => serde_json::json!({"outcome": "cancelled"}),
+    }
+}
+fn parse_labels_answer(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => vec![text.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
             .collect(),
-    ))
+        _ => Vec::new(),
+    }
+}
+fn parse_partial_answers(obj: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    obj.get("partial_answers")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(q, a)| a.as_str().map(|a| (q.clone(), a.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+/// 解析 grok 线型；兼容旧版字符串答案与缺省 outcome（视为 accepted）。
+pub fn ask_outcome_from_json(value: &Value) -> Result<AskOutcome, String> {
+    let obj = value.as_object().ok_or("ask outcome 必须是对象")?;
+    match obj.get("outcome").and_then(Value::as_str).unwrap_or("accepted") {
+        "cancelled" => Ok(AskOutcome::Cancelled),
+        "chat_about_this" => Ok(AskOutcome::ChatAboutThis {
+            partial_answers: parse_partial_answers(obj),
+        }),
+        "skip_interview" => Ok(AskOutcome::SkipInterview {
+            partial_answers: parse_partial_answers(obj),
+        }),
+        _ => {
+            let answers_obj = obj
+                .get("answers")
+                .and_then(Value::as_object)
+                .ok_or("accepted outcome 缺少 answers 对象")?;
+            let answers = answers_obj
+                .iter()
+                .map(|(question, value)| (question.clone(), parse_labels_answer(value)))
+                .collect();
+            let annotations = obj
+                .get("annotations")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(question, value)| {
+                            let entry = value.as_object()?;
+                            let preview = entry.get("preview").and_then(Value::as_str).map(String::from);
+                            let notes = entry.get("notes").and_then(Value::as_str).map(String::from);
+                            if preview.is_none() && notes.is_none() {
+                                return None;
+                            }
+                            Some((
+                                question.clone(),
+                                AskAnnotation { preview, notes },
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(AskOutcome::Accepted { answers, annotations })
+        }
+    }
 }
 fn parse_ask_questions(args: &Value) -> Result<Vec<AskQuestion>, String> {
     let raw_questions: Vec<Value> = match args.get("questions") {
@@ -2089,14 +2312,13 @@ fn parse_ask_questions(args: &Value) -> Result<Vec<AskQuestion>, String> {
     };
     if raw_questions.is_empty() {
         return Err(
-            "ask_user 需要 questions（Claude Code 结构化问题数组；旧版字符串数组也兼容）".into(),
+            "ask_user_question 需要 questions（数组，每题含 question 与 options）".into(),
         );
     }
     let mut questions = Vec::new();
-    let mut used_questions = HashSet::new();
-    for (index, raw) in raw_questions.into_iter().take(4).enumerate() {
-        let (question, header, options, multi_select) = match raw {
-            Value::String(question) => (question, format!("问题{}", index + 1), Vec::new(), false),
+    for raw in raw_questions.into_iter().take(4) {
+        let (question, options, multi_select) = match raw {
+            Value::String(question) => (question, Vec::new(), false),
             Value::Object(object) => {
                 let question = object
                     .get("question")
@@ -2106,45 +2328,32 @@ fn parse_ask_questions(args: &Value) -> Result<Vec<AskQuestion>, String> {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let header = object
-                    .get("header")
-                    .or_else(|| object.get("title"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
                 let options = parse_ask_options(object.get("options"));
                 let multi_select = object
-                    .get("multiSelect")
-                    .or_else(|| object.get("multi_select"))
+                    .get("multi_select")
+                    .or_else(|| object.get("multiSelect"))
                     .and_then(boolish)
                     .unwrap_or(false);
-                (question, header, options, multi_select)
+                (question, options, multi_select)
             }
             _ => continue,
         };
-        if question.trim().is_empty() {
+        let question = question.trim().to_string();
+        if question.is_empty() {
             continue;
         }
-        let mut unique_question = question.trim().to_string();
-        if !used_questions.insert(unique_question.clone()) {
-            unique_question = format!("{}（{}）", unique_question, index + 1);
-            used_questions.insert(unique_question.clone());
+        // 照 grok：重复问题文本直接拒绝，不做改名兼容
+        if questions.iter().any(|existing: &AskQuestion| existing.question == question) {
+            return Err(format!("Duplicate question text: {question}"));
         }
-        let header = if header.trim().is_empty() {
-            format!("问题{}", index + 1)
-        } else {
-            header.chars().take(12).collect()
-        };
         questions.push(AskQuestion {
-            question: unique_question,
-            header,
+            question,
             options,
             multi_select,
         });
     }
     if questions.is_empty() {
-        return Err("ask_user 的问题文本不能为空".into());
+        return Err("ask_user_question 的问题文本不能为空".into());
     }
     Ok(questions)
 }
@@ -2194,7 +2403,7 @@ fn parse_ask_options(raw: Option<&Value>) -> Vec<AskOption> {
         };
         if !option.label.is_empty() && labels.insert(option.label.clone()) {
             options.push(option);
-            if options.len() >= 4 {
+            if options.len() >= 6 {
                 break;
             }
         }
@@ -2310,12 +2519,11 @@ mod tests {
         t.with_ask(ask_tx, answer_rx);
         let args = serde_json::json!({"questions": [{
             "question": "你想看哪个配置文件？",
-            "header": "配置文件",
             "options": [
                 {"label": "用户配置", "description": "读取当前用户配置"},
                 {"label": "项目配置", "description": "读取项目内配置", "preview": "config.json"}
             ],
-            "multiSelect": false
+            "multi_select": false
         }]});
         let h = std::thread::spawn(move || {
             let req = ask_rx
@@ -2324,7 +2532,6 @@ mod tests {
             assert_eq!(req.id, 0);
             assert_eq!(req.questions.len(), 1);
             assert_eq!(req.questions[0].question, "你想看哪个配置文件？");
-            assert_eq!(req.questions[0].header, "配置文件");
             assert_eq!(
                 req.questions[0].options[1].preview.as_deref(),
                 Some("config.json")
@@ -2332,7 +2539,16 @@ mod tests {
             answer_tx
                 .send(AskAnswer {
                     id: req.id,
-                    answers: BTreeMap::from([("你想看哪个配置文件？".into(), "项目配置".into())]),
+                    outcome: crate::tools::AskOutcome::Accepted {
+                        answers: vec![("你想看哪个配置文件？".into(), vec!["项目配置".into()])],
+                        annotations: vec![(
+                            "你想看哪个配置文件？".into(),
+                            AskAnnotation {
+                                preview: Some("config.json".into()),
+                                notes: None,
+                            },
+                        )],
+                    },
                 })
                 .unwrap();
         });
@@ -2340,7 +2556,7 @@ mod tests {
         h.join().unwrap();
         assert_eq!(
             r,
-            "User has answered your questions: \"你想看哪个配置文件？\"=\"项目配置\". You can now continue with the user's answers in mind."
+            "User has answered your questions: \"你想看哪个配置文件？\"=\"项目配置\"\nselected preview:\nconfig.json. You can now continue with the user's answers in mind."
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2542,13 +2758,16 @@ mod tests {
             answer_tx
                 .send(AskAnswer {
                     id: 99,
-                    answers: BTreeMap::from([("第一个问题".into(), "错轮".into())]),
+                    outcome: crate::tools::AskOutcome::Cancelled,
                 })
                 .unwrap();
             answer_tx
                 .send(AskAnswer {
                     id: req.id,
-                    answers: BTreeMap::from([("第一个问题".into(), "回答一".into())]),
+                    outcome: crate::tools::AskOutcome::Accepted {
+                        answers: vec![("第一个问题".into(), vec!["回答一".into()])],
+                        annotations: Vec::new(),
+                    },
                 })
                 .unwrap();
         });
@@ -2563,23 +2782,30 @@ mod tests {
             "questions": [
                 {
                     "text": "选择哪些功能？",
-                    "title": "这是一个超过十二字符的标题",
+                    "title": "旧版标题字段会被忽略",
                     "options": "日志,指标,日志,告警,备份,额外",
                     "multi_select": "yes"
                 },
-                {"question": "选择哪些功能？", "options": [{"name":"自动"}, {"label":"手动","desc":"自己控制"}]}
+                {"question": "选一个。", "options": [{"name":"自动"}, {"label":"手动","desc":"自己控制"}]}
             ]
         }))
         .unwrap();
         assert_eq!(questions.len(), 2);
-        assert_eq!(questions[0].header.chars().count(), 12);
-        assert_eq!(questions[0].options.len(), 4, "去重并限制为 4 个选项");
+        assert_eq!(questions[0].options.len(), 5, "字符串选项去重后全部保留");
         assert!(questions[0].multi_select);
-        assert_ne!(
-            questions[0].question, questions[1].question,
-            "重复问题文本必须变成唯一键"
-        );
         assert_eq!(questions[1].options[1].description, "自己控制");
+    }
+    #[test]
+    fn ask_user_rejects_duplicate_question_text() {
+        // 照 grok：重复问题文本直接拒绝
+        let error = parse_ask_questions(&serde_json::json!({
+            "questions": [
+                {"question": "选择哪些功能？", "options": [{"label":"自动"}]},
+                {"question": "选择哪些功能？", "options": [{"label":"手动"}]}
+            ]
+        }))
+        .unwrap_err();
+        assert_eq!(error, "Duplicate question text: 选择哪些功能？");
     }
     #[test]
     fn ask_user_without_channel_errors() {
@@ -2601,6 +2827,82 @@ mod tests {
         let r = ask_user(&serde_json::json!({}), &mut t.ctx());
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+    #[test]
+    fn ask_user_cancel_is_successful_result() {
+        // 照 grok：取消是成功结果，回填"继续用最佳判断"文案
+        let tmp = std::env::temp_dir().join(format!("yjlcoder-ask5-{}", std::process::id()));
+        let mut t = TestCtx::new(tmp.clone());
+        let (ask_tx, _ask_rx) = std::sync::mpsc::channel();
+        let (_answer_tx, answer_rx) = std::sync::mpsc::channel();
+        t.with_ask(ask_tx, answer_rx);
+        t.cancel.store(true, Ordering::Relaxed);
+        let r = ask_user(
+            &serde_json::json!({"questions": [{"question": "去哪？"}]}),
+            &mut t.ctx(),
+        )
+        .unwrap();
+        assert_eq!(r, ASK_CANCEL_TEXT);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    #[test]
+    fn ask_outcome_wire_json_round_trip() {
+        // grok ACP ext 响应线型：accepted + answers + annotations
+        let accepted = AskOutcome::Accepted {
+            answers: vec![("Which database?".into(), vec!["Redis".into()])],
+            annotations: vec![(
+                "Which database?".into(),
+                AskAnnotation {
+                    preview: Some("<div>redis preview</div>".into()),
+                    notes: Some("nvm".into()),
+                },
+            )],
+        };
+        let json = ask_outcome_to_json(&accepted);
+        assert_eq!(json["outcome"], "accepted");
+        assert_eq!(
+            json["answers"]["Which database?"],
+            serde_json::json!(["Redis"])
+        );
+        assert_eq!(json["annotations"]["Which database?"]["notes"], "nvm");
+        assert_eq!(ask_outcome_from_json(&json).unwrap(), accepted);
+        // 兼容旧版字符串答案（照 grok 的 string-or-vec 宽松解析）
+        let legacy = serde_json::json!({"answers": {"Which cache?": "Only hot-path caches"}});
+        match ask_outcome_from_json(&legacy).unwrap() {
+            AskOutcome::Accepted { answers, annotations } => {
+                assert_eq!(answers[0].1, vec!["Only hot-path caches"]);
+                assert!(annotations.is_empty());
+            }
+            _ => panic!("缺省 outcome 应视为 accepted"),
+        }
+        assert_eq!(
+            ask_outcome_to_json(&AskOutcome::Cancelled)["outcome"],
+            "cancelled"
+        );
+        assert_eq!(ask_outcome_from_json(&serde_json::json!({"outcome": "cancelled"})).unwrap(), AskOutcome::Cancelled);
+        match ask_outcome_from_json(&serde_json::json!({"outcome": "chat_about_this", "partial_answers": {"q": "a"}})).unwrap() {
+            AskOutcome::ChatAboutThis { partial_answers } => {
+                assert_eq!(partial_answers, vec![("q".into(), "a".into())]);
+            }
+            _ => panic!("chat_about_this 解析失败"),
+        }
+        match ask_outcome_from_json(&serde_json::json!({"outcome": "skip_interview", "partial_answers": {}})).unwrap() {
+            AskOutcome::SkipInterview { partial_answers } => assert!(partial_answers.is_empty()),
+            _ => panic!("skip_interview 解析失败"),
+        }
+        // interview 文案包含题与答案
+        let chat_text = format_ask_outcome(
+            &AskOutcome::ChatAboutThis {
+                partial_answers: vec![("Which database?".into(), "Redis".into())],
+            },
+            &[AskQuestion {
+                question: "Which database?".into(),
+                options: Vec::new(),
+                multi_select: false,
+            }],
+        );
+        assert!(chat_text.contains("The user wants to clarify these questions."));
+        assert!(chat_text.contains("Answer: Redis"));
     }
     #[test]
     fn glob_match_basic() {

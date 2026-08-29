@@ -6,6 +6,35 @@
 YJLcoder 的系统提示词与品牌为独立实现。本项目的工具工程设计参考了以下
 开源项目；固定提交号用于复现本轮设计审计。
 
+## Grok Build（xai-org/grok-build）—— 直接引入（vendor + 补丁）
+
+- Repository: https://github.com/xai-org/grok-build
+- Vendored commit: `9684fa3cdbf2995e30ea8b9b637f1db008f144fc`
+- Copyright 2023-2026 SpaceXAI
+- License: Apache-2.0（完整文本见 `vendor/grok-build/LICENSE`，随源码原样保留）
+
+### 引入方式
+
+TUI（`crates/codegen/xai-grok-pager` 及其依赖子树）整树逐字节引入于
+`vendor/grok-build/`，上游文件除下述三处外不做任何修改；两处新文件为我们
+所有（GPL-3.0-only，随本项目整体分发）：
+
+1. `crates/codegen/yjl-bridge/`（新增）：实现 `acp::Agent`，把 YJLcoder 的
+   Agent/会话/工具挂到该 TUI 后面。
+2. 上游改动共三处（见 `patches/yjl-spawn-seam.patch`，可重放）：
+   workspace members 注册桥、xai-grok-pager 依赖桥、`acp/spawn.rs` 顶部的
+   接缝开关。**默认（无任何环境变量）即走 yjl-bridge，x.ai 登录层不可达**；
+   仅显式设置 `YJL_NATIVE=1` 时才进入 grok 原生 MvpAgent 路径（其代码逐字
+   保留，需要 x.ai 登录）。
+
+### 许可证说明
+
+Apache-2.0 代码并入 GPL-3.0-only 项目：按 Apache-2.0 第 4 条保留上游
+版权与许可声明（本文件 + vendor 内原样 LICENSE/NOTICE），按第 6 条以
+GPL-3.0-only 分发组合作品；上游文件本身未改动，仍为 Apache-2.0。
+组合二进制（`vendor/grok-build/target/release/xai-grok-pager`，含桥）
+按 GPL-3.0-only 提供源码。
+
 ## Claude Code Best（仅接口与交互设计参考）
 
 - Repository: https://github.com/claude-code-best/claude-code

@@ -212,11 +212,16 @@ fn confirm_background(
         }]
     });
     let answers = crate::tools::ask_user_answers(&questions, ctx)?;
-    Ok(answers.as_object().is_some_and(|answers| {
-        answers
-            .values()
-            .any(|value| value.as_str() == Some("确认启动"))
-    }))
+    Ok(answers
+        .get("answers")
+        .and_then(Value::as_object)
+        .is_some_and(|entries| {
+            entries.values().any(|value| {
+                value.as_array().is_some_and(|labels| {
+                    labels.iter().any(|label| label.as_str() == Some("确认启动"))
+                })
+            })
+        }))
 }
 
 fn help_text(plugin: &Plugin, only: Option<&str>) -> String {
@@ -538,7 +543,7 @@ fn run_foreground(
                                 "protocol": PROTOCOL,
                                 "type": "user_response",
                                 "request_id": event.get("request_id"),
-                                "answers": answers
+                                "outcome": answers
                             });
                             writeln!(stdin, "{response}")
                                 .and_then(|_| stdin.flush())
@@ -1324,7 +1329,7 @@ import json, sys
 json.loads(sys.stdin.readline())
 question = "请输入测试配置值"
 print(json.dumps({"type":"request_user","request_id":"ask-1","questions":[{"header":"测试配置","question":question,"options":[]}]}), flush=True)
-answer = json.loads(sys.stdin.readline())["answers"][question]
+answer = json.loads(sys.stdin.readline())["outcome"]["answers"][question][0]
 print(json.dumps({"type":"result","ok":True,"status":"completed","summary":"configured","data":{"answer":answer}}), flush=True)
 "#;
 
@@ -1435,15 +1440,16 @@ print(json.dumps({"type":"result","ok":True,"status":"completed","summary":"conf
         let responder = std::thread::spawn(move || {
             let request: crate::tools::AskRequest =
                 request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            let mut answers = std::collections::BTreeMap::new();
-            answers.insert(
-                request.questions[0].question.clone(),
-                "configured-value".to_string(),
-            );
             answer_tx
                 .send(crate::tools::AskAnswer {
                     id: request.id,
-                    answers,
+                    outcome: crate::tools::AskOutcome::Accepted {
+                        answers: vec![(
+                            request.questions[0].question.clone(),
+                            vec!["configured-value".to_string()],
+                        )],
+                        annotations: Vec::new(),
+                    },
                 })
                 .unwrap();
         });

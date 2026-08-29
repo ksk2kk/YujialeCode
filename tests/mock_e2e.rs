@@ -570,15 +570,17 @@ fn ask_user_blocks_until_answer_then_continues() {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("模型应发出提问请求");
         assert_eq!(req.questions.len(), 2);
-        assert_eq!(req.questions[0].header, "目的地");
         assert_eq!(req.questions[0].options[0].label, "北京");
         answer_tx
             .send(AskAnswer {
                 id: req.id,
-                answers: std::collections::BTreeMap::from([
-                    ("你想去哪？".into(), "北京".into()),
-                    ("什么时候出发？".into(), "明天".into()),
-                ]),
+                outcome: yjlcoder::tools::AskOutcome::Accepted {
+                    answers: vec![
+                        ("你想去哪？".into(), vec!["北京".into()]),
+                        ("什么时候出发？".into(), vec!["明天".into()]),
+                    ],
+                    annotations: Vec::new(),
+                },
             })
             .unwrap();
     });

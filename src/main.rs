@@ -87,6 +87,7 @@ fn main() {
     let mut qq_only = false;
     let mut mock = false;
     let mut setup_flag = false;
+    let mut legacy_tui = false;
     let mut model_override: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -95,6 +96,7 @@ fn main() {
             "--qq-only" => qq_only = true,
             "--mock" => mock = true,
             "--setup" => setup_flag = true,
+            "--legacy-tui" => legacy_tui = true,
             "--model" => {
                 i += 1;
                 model_override = args.get(i).cloned();
@@ -108,10 +110,11 @@ fn main() {
                     "Yujiale Code — 极简纯 Rust 本地模型 CLI Agent\n\
                      \n\
                      用法:\n\
-                       yjlcoder                 TUI 模式\n\
-                       yjlcoder --setup         配置向导（探测本地服务 / 导入 Claude Code 配置）\n\
-                       yjlcoder --mock          离线演示（无需 API key）\n\
-                       yjlcoder --qq            TUI + QQ 桥接\n\
+                       yjlcoder                 启动 TUI（Grok Build UI，默认）\n\
+                       yjlcoder --legacy-tui    旧版手写 TUI（弃用）\n\
+                       yjlcoder --setup         首启进配置向导（Grok UI 内）\n\
+                       yjlcoder --mock          离线演示（旧 TUI；无需 API key）\n\
+                       yjlcoder --qq            Grok UI + QQ 桥接\n\
                        yjlcoder --qq-only       QQ 桥接守护\n\
                        yjlcoder --model <name>  临时切换模型\n\
                      \n\
@@ -175,7 +178,75 @@ fn main() {
         plugins::shutdown_all();
         return;
     }
+    // 默认 TUI = Grok Build UI（vendor 的 xai-grok-pager，由 yjl-bridge 驱动）。
+    // 旧手写 TUI 仅在 --legacy-tui / --mock 显式要求时启用。
+    if !legacy_tui && !mock {
+        if qq_mode {
+            // QQ 桥接与 Grok UI 并行：后台线程跑 qq::run，主进程 exec 进 TUI
+            let qq_cfg = cfg.clone();
+            let qq_llm = llm.clone();
+            let _ = std::thread::Builder::new()
+                .name("qq-bridge".into())
+                .spawn(move || {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    if let Err(e) = qq::run(qq_cfg, qq_llm, cancel) {
+                        eprintln!("QQ 桥接启动失败: {e}");
+                    }
+                });
+        }
+        exec_grok_tui(&args);
+        return;
+    }
+    if legacy_tui && qq_mode {
+        run_tui(cfg, llm, true, open_setup);
+        return;
+    }
     run_tui(cfg, llm, qq_mode, open_setup);
+}
+
+/// exec Grok Build TUI（默认界面）。按优先级定位二进制：
+/// 1) 环境变量 YCODE_TUI_BIN；2) 仓库内 vendor 构建；3) PATH 中的 ycode/xai-grok-pager。
+fn exec_grok_tui(args: &[String]) -> ! {
+    use std::os::unix::process::CommandExt;
+    let manifest_bin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/vendor/grok-build/target/release/xai-grok-pager"
+    );
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(bin) = std::env::var("YCODE_TUI_BIN") {
+        candidates.push(bin.into());
+    }
+    candidates.push(manifest_bin.into());
+    candidates.push("xai-grok-pager".into());
+    for candidate in &candidates {
+        let is_pathlike = candidate.components().count() > 1;
+        let exists = if is_pathlike {
+            candidate.is_file()
+        } else {
+            std::env::var_os("PATH")
+                .map(|paths| {
+                    std::env::split_paths(&paths).any(|dir| dir.join(candidate).is_file())
+                })
+                .unwrap_or(false)
+        };
+        if exists {
+            let forwarded: Vec<String> = args
+                .iter()
+                .skip(1)
+                .filter(|a| !matches!(a.as_str(), "--qq" | "--setup" | "--legacy-tui"))
+                .cloned()
+                .collect();
+            let error = std::process::Command::new(candidate)
+                .args(&forwarded)
+                .exec();
+            eprintln!("启动 Grok UI 失败（{candidate:?}）: {error}");
+            std::process::exit(1);
+        }
+    }
+    eprintln!(
+        "未找到 Grok UI 二进制。先构建：\n  cd vendor/grok-build && cargo build --release -p xai-grok-pager-bin\n或设置 YCODE_TUI_BIN 指向它。"
+    );
+    std::process::exit(1);
 }
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "查看命令帮助"),
@@ -451,9 +522,9 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
                             tui.retrieve_queued(text);
                         }
                     }
-                    Action::AskSubmit(answers) => {
+                    Action::AskSubmit(outcome) => {
                         if let (Some(atx), Some(id)) = (cur_answer_tx.as_ref(), cur_ask_id.take()) {
-                            let _ = atx.send(AskAnswer { id, answers });
+                            let _ = atx.send(AskAnswer { id, outcome });
                         }
                         tui.finish_ask();
                     }
