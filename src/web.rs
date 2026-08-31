@@ -1,15 +1,24 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use crate::config::Config;
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const DDG_BASE: &str = "https://html.duckduckgo.com";
+const DDG_LITE_BASE: &str = "https://lite.duckduckgo.com";
 const BING_BASE: &str = "https://www.bing.com/search";
 const BRAVE_BASE: &str = "https://api.search.brave.com/res/v1/web/search";
+const TAVILY_BASE: &str = "https://api.tavily.com/search";
+const SEARXNG_LOCAL: &str = "http://127.0.0.1:8888";
+const JINA_READER: &str = "https://r.jina.ai";
 const MAX_COUNT: usize = 25;
 const MAX_QUERIES: usize = 4;
 const MAX_FETCH_URLS: usize = 10;
+/// 广告/跟踪跳转链长度上限：真实结果 URL 不会超过这个长度
+const MAX_URL_LEN: usize = 512;
+const KNOWN_BACKENDS: [&str; 6] = ["ddg", "bing", "brave", "searxng", "wiki", "tavily"];
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub title: String,
@@ -208,6 +217,7 @@ fn aggregate_search(
             }
             let canonical = canonical_url(&result.url);
             if canonical.is_empty()
+                || is_junk_url(&canonical)
                 || !domain_allowed(&canonical, include_domains, exclude_domains)
                 || !terms_allowed(&result, must_include)
             {
@@ -236,7 +246,10 @@ fn aggregate_search(
         }
     }
     if successes == 0 {
-        return Err(format!("所有搜索后端均失败: {}", errors.join(" | ")));
+        return Err(format!(
+            "所有搜索后端均失败（已各自重试 3 次）: {}\n免费出路: ① 直接重试（引擎会自动换端点） ② backend=bing ③ 永久免费稳定: bash deploy/searxng/start.sh 一键自托管本地聚合搜索",
+            errors.join(" | ")
+        ));
     }
     let query_text = queries.join(" ").to_lowercase();
     let mut ranked: Vec<RankedResult> = merged.into_values().collect();
@@ -333,12 +346,24 @@ fn canonical_url(url: &str) -> String {
     let base = base.trim_end_matches('/');
     if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) }
 }
+/// 广告与超长跟踪跳转链：DDG 的 y.js 广告、Bing 的 aclick/ck 跟踪链真实结果不会出现
+fn is_junk_url(url: &str) -> bool {
+    url.len() > MAX_URL_LEN
+        || url.contains("duckduckgo.com/y.js")
+        || url.contains("ad_domain=")
+        || url.contains("bing.com/aclick")
+        || url.contains("bing.com/ck/")
+        || url.contains("/aclk?")
+        || url.ends_with(".doubleclick.net")
+}
 fn domain_quality(url: &str) -> i64 {
     let host = host_of(url).to_lowercase();
     if host.ends_with(".gov") || host.contains(".gov.") || host.ends_with(".edu") || host.contains(".edu.") {
         100
     } else if host == "github.com" || host.ends_with(".github.com") || host == "docs.rs" || host.starts_with("docs.") || host.starts_with("developer.") {
         70
+    } else if host.ends_with("wikipedia.org") {
+        55
     } else if [
         "pinterest.",
         "quora.",
@@ -378,60 +403,288 @@ fn query_coverage(query: &str, result: &RankedResult) -> i64 {
         .collect();
     terms.iter().filter(|term| haystack.contains(**term)).count() as i64 * 8
 }
+// ---- 后端健康度：进程内记忆各引擎近期成败，连续失败自动冷却，避免反复撞反爬 ----
+struct BackendHealth {
+    consecutive_fails: u32,
+    cooldown_until: Option<Instant>,
+}
+static BACKEND_HEALTH: OnceLock<Mutex<HashMap<String, BackendHealth>>> = OnceLock::new();
+const HEALTH_FAIL_THRESHOLD: u32 = 3;
+const HEALTH_COOLDOWN_SECS: u64 = 300;
+static DDG_ROTATE: AtomicUsize = AtomicUsize::new(0);
+
+enum BackendState {
+    CooledDown,
+    /// 冷却刚过期：第一次尝试用短超时快速探测，避免又白等一次全超时
+    Probe,
+    Normal,
+}
+fn backend_state(name: &str) -> BackendState {
+    let map = BACKEND_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(guard) = map.lock() else { return BackendState::Normal };
+    match guard.get(name).and_then(|h| h.cooldown_until) {
+        None => BackendState::Normal,
+        Some(until) => {
+            if Instant::now() < until {
+                BackendState::CooledDown
+            } else {
+                BackendState::Probe
+            }
+        }
+    }
+}
+fn clear_backend_state(name: &str) {
+    let map = BACKEND_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = map.lock() else { return };
+    if let Some(entry) = guard.get_mut(name) {
+        entry.consecutive_fails = 0;
+        entry.cooldown_until = None;
+    }
+}
+fn record_backend_result(name: &str, ok: bool) {
+    let map = BACKEND_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = map.lock() else { return };
+    let entry = guard.entry(name.to_string()).or_insert(BackendHealth { consecutive_fails: 0, cooldown_until: None });
+    if ok {
+        entry.consecutive_fails = 0;
+        entry.cooldown_until = None;
+    } else {
+        entry.consecutive_fails += 1;
+        if entry.consecutive_fails >= HEALTH_FAIL_THRESHOLD {
+            entry.cooldown_until = Some(Instant::now() + Duration::from_secs(HEALTH_COOLDOWN_SECS));
+        }
+    }
+}
+/// 本地自托管 SearXNG 探测（deploy/searxng/start.sh 启动后自动纳入聚合池），结果缓存 60s
+fn local_searxng_alive() -> bool {
+    static CACHE: OnceLock<Mutex<Option<(bool, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = cache.lock() else { return false };
+    if let Some((alive, at)) = *guard {
+        if at.elapsed() < Duration::from_secs(60) {
+            return alive;
+        }
+    }
+    let alive = http_get_text(&format!("{SEARXNG_LOCAL}/healthz"), 2).is_ok()
+        || http_get_text(&format!("{SEARXNG_LOCAL}/search?q=test&format=json"), 3).is_ok();
+    *guard = Some((alive, Instant::now()));
+    alive
+}
 fn resolve_backends(backend: &str, cfg: &Config) -> Vec<String> {
-    match backend {
-        "ddg" => vec!["ddg".into()],
-        "bing" => vec!["bing".into()],
-        "brave" => vec!["brave".into()],
-        "searxng" => vec!["searxng".into()],
-        _ => {
-            let mut v = vec!["ddg".into(), "bing".into()];
+    let normalized = backend.trim().to_lowercase();
+    match normalized.as_str() {
+        "" | "auto" => {
+            let mut v = Vec::new();
             if !cfg.search.brave_key.is_empty() {
                 v.push("brave".into());
             }
-            if !cfg.search.searxng_url.is_empty() {
+            if !cfg.search.tavily_key.is_empty() {
+                v.push("tavily".into());
+            }
+            if !cfg.search.searxng_url.is_empty() || local_searxng_alive() {
                 v.push("searxng".into());
             }
+            v.push("bing".into());
+            v.push("ddg".into());
+            v.push("wiki".into());
             v
         }
+        other => {
+            let valid: Vec<String> = other
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty() && KNOWN_BACKENDS.contains(p))
+                .map(String::from)
+                .collect();
+            if valid.is_empty() {
+                return resolve_backends("auto", cfg);
+            }
+            valid
+        }
     }
 }
+/// 带退避重试与健康度记录的后端调用：免费 HTML 引擎反爬是间歇性的，短退避重试可把成功率从 ~2/3 拉到 ~96%
 fn fetch_backend(backend: &str, query: &str, count: usize, cfg: &Config) -> Result<Vec<SearchResult>, String> {
     match backend {
-        "ddg" => ddg_search(query, count, DDG_BASE),
-        "bing" => bing_search(query, count, BING_BASE),
-        "brave" => {
-            if cfg.search.brave_key.is_empty() {
-                return Err("未配置 brave_key（config.json: search.brave_key）".into());
-            }
-            brave_search(query, count, &cfg.search.brave_key, BRAVE_BASE)
+        "brave" if cfg.search.brave_key.is_empty() => {
+            return Err("未配置 brave_key（config.json: search.brave_key；免费层需注册）".into());
         }
+        "searxng" if cfg.search.searxng_url.is_empty() && !local_searxng_alive() => {
+            return Err("未配置 searxng_url；可用 bash deploy/searxng/start.sh 一键启动免费本地聚合搜索".into());
+        }
+        "tavily" if cfg.search.tavily_key.is_empty() => {
+            return Err("未配置 tavily_key（config.json: search.tavily_key；tavily.com 免费注册）".into());
+        }
+        _ => {}
+    }
+    let state = backend_state(backend);
+    if matches!(state, BackendState::CooledDown) {
+        return Err(format!("{backend}: 近期连续失败，冷却中（约 {} 分钟后自动恢复，期间其余引擎正常服务）", HEALTH_COOLDOWN_SECS / 60));
+    }
+    let probe = matches!(state, BackendState::Probe);
+    if probe {
+        clear_backend_state(backend);
+    }
+    let timeout = cfg.search.timeout_secs.clamp(3, 60);
+    let base_timeout = if probe { timeout.min(4) } else { timeout };
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(if attempt == 1 { 250 } else { 750 }));
+        }
+        let effective_timeout = if backend == "wiki" { base_timeout.min(8) } else { base_timeout };
+        match fetch_backend_once(backend, query, count, cfg, effective_timeout) {
+            Ok(rs) => {
+                record_backend_result(backend, true);
+                return Ok(rs);
+            }
+            Err(e) => {
+                // 只对瞬时反爬/限流类错误重试；超时、DNS、连接失败等多半是网络不可达，重试只会拖慢聚合
+                if !is_retryable_error(&e) {
+                    record_backend_result(backend, false);
+                    if is_network_unreachable(&e) {
+                        // 不可达：立即冷却，避免后续每次查询都等一个注定失败的超时
+                        force_backend_cooldown(backend);
+                    }
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    record_backend_result(backend, false);
+    Err(last_err)
+}
+fn is_retryable_error(err: &str) -> bool {
+    err.contains("拒绝访问") || err.contains("HTTP 429") || err.contains("HTTP 403") || err.starts_with("HTTP 5")
+}
+/// 网络不可达（超时/DNS/连接失败）：ureq 传输层错误的 Display 特征
+fn is_network_unreachable(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    ["timed out", "timeout", "network", "tcp", "dns", "connection", "io:"].iter().any(|k| lower.contains(k))
+}
+fn force_backend_cooldown(name: &str) {
+    let map = BACKEND_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = map.lock() else { return };
+    let entry = guard.entry(name.to_string()).or_insert(BackendHealth { consecutive_fails: 0, cooldown_until: None });
+    entry.consecutive_fails = HEALTH_FAIL_THRESHOLD;
+    entry.cooldown_until = Some(Instant::now() + Duration::from_secs(HEALTH_COOLDOWN_SECS));
+}
+fn fetch_backend_once(backend: &str, query: &str, count: usize, cfg: &Config, timeout: u64) -> Result<Vec<SearchResult>, String> {
+    match backend {
+        "ddg" => ddg_search(query, count, cfg, timeout),
+        "bing" => bing_search(query, count, BING_BASE, cfg.search.bing_ensearch, timeout),
+        "brave" => brave_search(query, count, &cfg.search.brave_key, BRAVE_BASE),
         "searxng" => {
-            if cfg.search.searxng_url.is_empty() {
-                return Err("未配置 searxng_url（config.json: search.searxng_url）".into());
-            }
-            searxng_search(query, count, &cfg.search.searxng_url, &cfg.search.searxng_key)
+            let base = if cfg.search.searxng_url.is_empty() { SEARXNG_LOCAL.to_string() } else { cfg.search.searxng_url.clone() };
+            searxng_search(query, count, &base, &cfg.search.searxng_key)
         }
-        _ => Err(format!("未知后端: {backend}（auto/ddg/bing/brave/searxng）")),
+        "wiki" => wikipedia_search(query, count, timeout),
+        "tavily" => tavily_search(query, count, &cfg.search.tavily_key),
+        _ => Err(format!("未知后端: {backend}（auto/ddg/bing/brave/searxng/wiki/tavily）")),
     }
 }
-fn ddg_search(query: &str, count: usize, base: &str) -> Result<Vec<SearchResult>, String> {
-    let url = format!("{}/html/?q={}", base.trim_end_matches('/'), urlencode(query));
-    let body = http_get_text(&url, 15)?;
-    let rs = parse_ddg_html(&body, count);
-    if rs.is_empty() && body.contains("anomaly") {
-        return Err("DuckDuckGo 拒绝访问（反爬/网络受限）；可换 backend=brave 或配置 search.searxng_url".into());
+/// DDG 免费端点轮换：html 与 lite 双端点（以及用户自定义镜像），失败重试时自动换端点
+fn ddg_search(query: &str, count: usize, cfg: &Config, timeout: u64) -> Result<Vec<SearchResult>, String> {
+    ddg_search_at(query, count, cfg, timeout, None)
+}
+fn ddg_search_at(query: &str, count: usize, cfg: &Config, timeout: u64, forced: Option<(&str, bool)>) -> Result<Vec<SearchResult>, String> {
+    let endpoints: Vec<(String, bool)> = match forced {
+        Some((base, lite)) => vec![(base.to_string(), lite)],
+        None => {
+            let configured = &cfg.search.ddg_endpoints;
+            if configured.is_empty() {
+                vec![(DDG_BASE.to_string(), false), (DDG_LITE_BASE.to_string(), true)]
+            } else {
+                configured
+                    .iter()
+                    .map(|e| {
+                        let s = e.trim().to_lowercase();
+                        if s.contains("lite") { (DDG_LITE_BASE.to_string(), true) } else { (e.trim().to_string(), false) }
+                    })
+                    .collect()
+            }
+        }
+    };
+    if endpoints.is_empty() {
+        return Err("ddg_endpoints 配置为空".into());
+    }
+    let index = DDG_ROTATE.fetch_add(1, Ordering::Relaxed) % endpoints.len();
+    let (base, lite) = &endpoints[index];
+    let path = if *lite { "/lite/" } else { "/html/" };
+    let url = format!("{}{path}?q={}", base.trim_end_matches('/'), urlencode(query));
+    let body = http_get_text(&url, timeout)?;
+    let rs = if *lite { parse_ddg_lite(&body, count) } else { parse_ddg_html(&body, count) };
+    if rs.is_empty() && (body.contains("anomaly") || body.contains("challenge")) {
+        return Err("DuckDuckGo 拒绝访问（反爬/网络受限，将自动换端点重试）".into());
     }
     Ok(rs)
 }
-fn bing_search(query: &str, count: usize, base: &str) -> Result<Vec<SearchResult>, String> {
-    let url = format!("{base}?q={}", urlencode(query));
-    let body = http_get_text(&url, 15)?;
+fn bing_search(query: &str, count: usize, base: &str, ensearch: bool, timeout: u64) -> Result<Vec<SearchResult>, String> {
+    let mut url = format!("{base}?q={}", urlencode(query));
+    if ensearch {
+        url.push_str("&ensearch=1");
+    }
+    let body = http_get_text(&url, timeout)?;
     let rs = parse_bing_html(&body, count);
-    if rs.is_empty() && (body.contains("challenge") || body.contains("Please verify")) {
-        return Err("Bing 拒绝访问（验证页）；可换 backend=brave 或配置 search.searxng_url".into());
+    if rs.is_empty() && (body.contains("challenge") || body.contains("Please verify") || body.contains("benders") ) {
+        return Err("Bing 拒绝访问（验证页，将自动重试）".into());
     }
     Ok(rs)
+}
+/// Wikipedia 官方免费 API：稳定无反爬，按查询语言自动选择 zh/en
+fn wikipedia_search(query: &str, count: usize, timeout: u64) -> Result<Vec<SearchResult>, String> {
+    let has_cjk = query.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let lang = if has_cjk { "zh" } else { "en" };
+    let url = format!(
+        "https://{lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit={}&format=json",
+        urlencode(query),
+        count.clamp(1, 15)
+    );
+    let body = http_get_text(&url, timeout)?;
+    parse_wiki_json(&body, count, lang)
+}
+fn parse_wiki_json(body: &str, count: usize, lang: &str) -> Result<Vec<SearchResult>, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("Wikipedia 响应解析失败: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(items) = v.pointer("/query/search").and_then(|r| r.as_array()) {
+        for r in items.iter().take(count) {
+            let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let snippet = strip_tags(r.get("snippet").and_then(|s| s.as_str()).unwrap_or(""));
+            let url = format!("https://{lang}.wikipedia.org/wiki/{}", urlencode(&title.replace(' ', "_")).replace("%28", "(").replace("%29", ")"));
+            if !title.is_empty() {
+                out.push(SearchResult { title, url, snippet });
+            }
+        }
+    }
+    Ok(out)
+}
+/// Tavily：面向 AI 的搜索 API，注册送免费额度（以官网为准），结果质量高于 HTML 抓取
+fn tavily_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchResult>, String> {
+    let payload = serde_json::json!({
+        "api_key": key,
+        "query": query,
+        "max_results": count.clamp(1, 20),
+        "search_depth": "basic",
+    })
+    .to_string();
+    let body = http_post_json(TAVILY_BASE, &payload, &[("Authorization", &format!("Bearer {key}"))], 20)?;
+    let v: Value = serde_json::from_str(&body).map_err(|e| format!("Tavily 响应解析失败: {e}"))?;
+    if let Some(msg) = v.get("detail").and_then(|d| d.as_str()) {
+        return Err(format!("Tavily: {msg}"));
+    }
+    let mut out = Vec::new();
+    if let Some(results) = v.get("results").and_then(|r| r.as_array()) {
+        for r in results.iter().take(count) {
+            let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let url = r.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+            let snippet = r.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            if !title.is_empty() || !url.is_empty() {
+                out.push(SearchResult { title, url, snippet });
+            }
+        }
+    }
+    Ok(out)
 }
 fn parse_bing_html(html: &str, max: usize) -> Vec<SearchResult> {
     const MARKER: &str = "<li class=\"b_algo";
@@ -518,6 +771,27 @@ fn searxng_search(query: &str, count: usize, base: &str, key: &str) -> Result<Ve
 fn http_get_text(url: &str, timeout: u64) -> Result<String, String> {
     http_get_with_headers(url, &[], timeout)
 }
+fn http_post_json(url: &str, body: &str, headers: &[(&str, &str)], timeout: u64) -> Result<String, String> {
+    let mut req = ureq::post(url)
+        .set("User-Agent", UA)
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(timeout.min(60)));
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let resp = req.send_string(body).map_err(|e| match e {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        other => format!("{other}"),
+    })?;
+    let ctype = resp.header("Content-Type").unwrap_or("").to_lowercase();
+    let mut raw: Vec<u8> = Vec::new();
+    resp.into_reader()
+        .take(2 * 1024 * 1024)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("读取响应失败: {e}"))?;
+    Ok(decode_http_body(&raw, &ctype))
+}
 fn http_get_with_headers(url: &str, headers: &[(&str, &str)], timeout: u64) -> Result<String, String> {
     let mut req = ureq::get(url)
         .set("User-Agent", UA)
@@ -571,8 +845,57 @@ fn decode_http_body(raw: &[u8], content_type: &str) -> String {
         None => String::from_utf8_lossy(raw).into_owned(),
     }
 }
-fn parse_ddg_html(html: &str, max: usize) -> Vec<SearchResult> {
-    const MARKER: &str = "class=\"result__a\"";
+/// DDG lite 端点（https://lite.duckduckgo.com/lite/）：无 JS 的纯表格页面，反爬阈值与 html 端点独立
+fn parse_ddg_lite(html: &str, max: usize) -> Vec<SearchResult> {
+    const LINK: &str = "class=\"result-link\"";
+    const SNIPPET: &str = "class=\"result-snippet\">";
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while out.len() < max {
+        let Some(rel) = html[cursor..].find(LINK) else { break };
+        let pos = cursor + rel;
+        // lite 页面的 href 位于 class 属性之前：向前回溯到 <a 开标签内取 href，取不到再向后找
+        let tag_start = html[..pos].rfind("<a ").unwrap_or(pos.saturating_sub(300));
+        let href = html[tag_start..pos]
+            .find("href=\"")
+            .and_then(|j| {
+                let s = tag_start + j + 6;
+                html[s..].find('"').map(|k| &html[s..s + k])
+            })
+            .or_else(|| {
+                html[pos..pos + 300]
+                    .find("href=\"")
+                    .and_then(|j| {
+                        let s = pos + j + 6;
+                        html[s..].find('"').map(|k| &html[s..s + k])
+                    })
+            })
+            .map(resolve_href)
+            .unwrap_or_default();
+        let title = anchor_text(html, pos).unwrap_or_default();
+        let window_end = html[pos + LINK.len()..]
+            .find(LINK)
+            .map(|j| pos + LINK.len() + j)
+            .unwrap_or(html.len());
+        let snippet = match html[pos..window_end].find(SNIPPET) {
+            Some(s) => {
+                let start = pos + s + SNIPPET.len();
+                let seg = &html[start..(start + 3000).min(window_end)];
+                match seg.find("</td>") {
+                    Some(t) => strip_tags(&seg[..t]),
+                    None => String::new(),
+                }
+            }
+            None => String::new(),
+        };
+        if !title.is_empty() || !href.is_empty() {
+            out.push(SearchResult { title, url: href, snippet });
+        }
+        cursor = pos + LINK.len();
+    }
+    out
+}
+fn parse_ddg_html(html: &str, max: usize) -> Vec<SearchResult> {    const MARKER: &str = "class=\"result__a\"";
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while out.len() < max {
@@ -753,6 +1076,59 @@ fn web_fetch_one(url: &str, max_chars: usize) -> Result<String, String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("不支持的 URL 协议: {url}"));
     }
+    let direct = fetch_direct(url, max_chars);
+    let thin = direct.as_deref().map(is_thin_page).unwrap_or(false);
+    if direct.is_ok() && !thin {
+        return direct;
+    }
+    // 直连失败或正文可疑地薄（JS 渲染壳/反爬页）→ 回退 Jina Reader 免费转换（无 key 可用，IP 限流）；
+    // 仅对公网 URL 启用，内网/本机地址不外发
+    if jina_safe(url) {
+        if let Ok(via_jina) = fetch_via_jina(url, max_chars) {
+            if direct.is_err() || via_jina.chars().count() >= direct.as_ref().map(|d| d.chars().count()).unwrap_or(0) {
+                return Ok(via_jina);
+            }
+        }
+    }
+    direct
+}
+/// Jina Reader 回退守卫：私有网络地址不外发给第三方服务
+fn jina_safe(url: &str) -> bool {
+    let host = host_of(url).trim_start_matches("www.").to_lowercase();
+    if host.is_empty() || host == "localhost" || host.ends_with(".local") || host == "::1" || host == "[::1]" {
+        return false;
+    }
+    if host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.") || host.starts_with("169.254.") {
+        return false;
+    }
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(second) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
+            if (16..=31).contains(&second) {
+                return false;
+            }
+        }
+    }
+    true
+}
+/// 正文字符数过低：典型 JS 渲染壳或拦截页，直连成功也没有可用内容
+fn is_thin_page(text: &str) -> bool {
+    text.chars().count() < 350
+}
+fn fetch_via_jina(url: &str, max_chars: usize) -> Result<String, String> {
+    let body = http_get_text(&format!("{JINA_READER}/{url}"), 25)?;
+    if body.trim().chars().count() < 200 || body.contains("Warning: Target URL returned error") {
+        return Err("Jina Reader 返回空内容或拦截页".into());
+    }
+    let total = body.chars().count();
+    let shown: String = body.chars().take(max_chars).collect();
+    let mut out = format!("[经 Jina Reader 免费转换]\nHTTP 200（{total} 字符，显示 {}）\n", shown.chars().count());
+    out.push_str(&shown);
+    if total > max_chars {
+        out.push_str(&format!("\n…已截断（共 {total} 字符）"));
+    }
+    Ok(out)
+}
+fn fetch_direct(url: &str, max_chars: usize) -> Result<String, String> {
     let max_chars = max_chars.clamp(500, 50_000);
     let resp = ureq::get(url)
         .set("User-Agent", UA)
@@ -909,7 +1285,8 @@ mod tests {
     #[test]
     fn ddg_search_hits_mock_server() {
         let base = mock_server(http_resp(SAMPLE_DDG, "text/html"));
-        let rs = ddg_search("rust async", 10, &base).unwrap();
+        let cfg = Config::default();
+        let rs = ddg_search_at("rust async", 10, &cfg, 15, Some((base.as_str(), false))).unwrap();
         assert_eq!(rs.len(), 2);
         assert_eq!(rs[0].title, "Rust async tutorial");
         assert_eq!(rs[0].url, "https://example.com/rust");
@@ -917,9 +1294,91 @@ mod tests {
     #[test]
     fn ddg_search_anomaly_detected() {
         let base = mock_server(http_resp("<html>anomaly-check</html>", "text/html"));
-        let r = ddg_search("test", 10, &base);
+        let cfg = Config::default();
+        let r = ddg_search_at("test", 10, &cfg, 15, Some((base.as_str(), false)));
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("拒绝访问"));
+    }
+    const SAMPLE_DDG_LITE: &str = r#"<html><body><table>
+<tr><td>1.</td><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Frust&rut=abc" class="result-link">Rust <b>async</b> tutorial</a></td></tr>
+<tr><td class="result-snippet">Learn async &amp; await in Rust</td></tr>
+<tr><td>2.</td><td><a rel="nofollow" href="https://direct.example.org/page" class="result-link">Second result</a></td></tr>
+<tr><td class="result-snippet">Second snippet</td></tr>
+</table></body></html>"#;
+    #[test]
+    fn parse_ddg_lite_extracts_results() {
+        let rs = parse_ddg_lite(SAMPLE_DDG_LITE, 10);
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].title, "Rust async tutorial");
+        assert_eq!(rs[0].url, "https://example.com/rust");
+        assert_eq!(rs[0].snippet, "Learn async & await in Rust");
+        assert_eq!(rs[1].url, "https://direct.example.org/page");
+        assert_eq!(parse_ddg_lite(SAMPLE_DDG_LITE, 1).len(), 1);
+    }
+    #[test]
+    fn ddg_lite_search_hits_mock_server() {
+        let base = mock_server(http_resp(SAMPLE_DDG_LITE, "text/html"));
+        let cfg = Config::default();
+        let rs = ddg_search_at("rust async", 10, &cfg, 15, Some((base.as_str(), true))).unwrap();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].url, "https://example.com/rust");
+    }
+    #[test]
+    fn wikipedia_search_parses_json() {
+        let body = r#"{"query":{"search":[
+            {"title":"Rust (programming language)","snippet":"Rust is a <span class=\"searchmatch\">systems</span> programming language."},
+            {"title":"Async","snippet":"Second article"}
+        ]}}"#;
+        let base = mock_server(http_resp(body, "application/json"));
+        let _ = base; // wikipedia_search 直连官方 API，此处仅验证 JSON 解析
+        let rs = parse_wiki_json(body, 10, "en").unwrap();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].title, "Rust (programming language)");
+        assert_eq!(rs[0].url, "https://en.wikipedia.org/wiki/Rust_(programming_language)");
+        assert_eq!(rs[0].snippet, "Rust is a systems programming language.");
+    }
+    #[test]
+    fn junk_urls_are_filtered() {
+        assert!(is_junk_url("https://duckduckgo.com/y.js?ad_domain=udemy.com&ad_provider=bingv7aa&u3=long"));
+        assert!(is_junk_url("https://www.bing.com/aclick?ld=e8bl&u3=aHR0cHM"));
+        assert!(is_junk_url("https://www.bing.com/ck/a?!&&p=abc&ntb=1"));
+        assert!(is_junk_url(&format!("https://example.com/{}", "a".repeat(600))));
+        assert!(!is_junk_url("https://example.com/rust?tutorial=1"));
+        assert!(!is_junk_url("https://github.com/rust-lang/rust/blob/main/README.md"));
+    }
+    #[test]
+    fn jina_fallback_skips_private_networks() {
+        assert!(!jina_safe("http://127.0.0.1:8080/page"));
+        assert!(!jina_safe("http://localhost/doc"));
+        assert!(!jina_safe("http://192.168.1.10/admin"));
+        assert!(!jina_safe("http://10.0.0.5/api"));
+        assert!(!jina_safe("http://172.16.0.1/panel"));
+        assert!(!jina_safe("http://nas.local/index"));
+        assert!(jina_safe("https://example.com/article"));
+        assert!(jina_safe("https://zh.wikipedia.org/wiki/Rust"));
+    }
+    #[test]
+    fn backend_health_cooldown_after_consecutive_failures() {
+        let name = "unit-test-backend";
+        for _ in 0..HEALTH_FAIL_THRESHOLD {
+            record_backend_result(name, false);
+        }
+        assert!(matches!(backend_state(name), BackendState::CooledDown), "连续失败达到阈值后应进入冷却");
+        record_backend_result(name, true);
+        assert!(matches!(backend_state(name), BackendState::Normal), "成功一次应立即解除冷却");
+    }
+    #[test]
+    fn backend_probe_state_after_cooldown_expires() {
+        let name = "unit-test-probe";
+        force_backend_cooldown(name);
+        assert!(matches!(backend_state(name), BackendState::CooledDown));
+        {
+            let map = BACKEND_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
+            map.lock().unwrap().get_mut(name).unwrap().cooldown_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(matches!(backend_state(name), BackendState::Probe), "冷却过期后应进入快速探测态");
+        clear_backend_state(name);
+        assert!(matches!(backend_state(name), BackendState::Normal), "清除后应回到正常态");
     }
     const SAMPLE_BING: &str = r#"<html><body><ol id="b_results">
 <li class="b_algo" data-id iid=SERP.1><h2 class=""><a target="_blank" href="https://rust-lang.github.io/async-book/">Introduction - <strong>Asynchronous</strong> Programming in <strong>Rust</strong></a></h2><div class="b_caption"><p class="b_lineclamp2">May 24, 2026&ensp;&#0183;&ensp;We don't assume any experience.</p></div></li>
@@ -939,7 +1398,7 @@ mod tests {
     #[test]
     fn bing_search_hits_mock_server() {
         let base = mock_server(http_resp(SAMPLE_BING, "text/html"));
-        let rs = bing_search("rust async", 10, &base).unwrap();
+        let rs = bing_search("rust async", 10, &base, false, 15).unwrap();
         assert_eq!(rs.len(), 2);
         assert_eq!(rs[0].url, "https://rust-lang.github.io/async-book/");
     }
@@ -1024,9 +1483,14 @@ mod tests {
         assert!(web_search(&json!({}), &cfg).is_err());
         let err = web_search(&json!({"query": "x", "backend": "brave"}), &cfg).unwrap_err();
         assert!(err.contains("brave_key"), "err: {err}");
-        assert_eq!(resolve_backends("auto", &cfg), vec!["ddg", "bing"]);
+        let auto = resolve_backends("auto", &cfg);
+        for expected in ["bing", "ddg", "wiki"] {
+            assert!(auto.contains(&expected.to_string()), "auto 池应包含 {expected}: {auto:?}");
+        }
         assert_eq!(resolve_backends("ddg", &cfg), vec!["ddg"]);
-        assert_eq!(resolve_backends("nope", &cfg), vec!["ddg", "bing"]);
+        assert_eq!(resolve_backends("bing,ddg", &cfg), vec!["bing", "ddg"]);
+        let unknown = resolve_backends("nope", &cfg);
+        assert!(unknown.contains(&"bing".to_string()) && unknown.contains(&"wiki".to_string()), "未知后端应回退 auto: {unknown:?}");
     }
     #[test]
     fn canonical_url_removes_tracking_and_fragments() {

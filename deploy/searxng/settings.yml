@@ -1,0 +1,13 @@
+# 本机专用 SearXNG：仅监听 127.0.0.1，无对外暴露，无反爬压力，因此关闭限流并开放 JSON 输出。
+# JSON 格式是 yjlcoder web_search 聚合协议（search.searxng_url / 自动探测 127.0.0.1:8888）。
+use_default_settings: true
+
+server:
+  secret_key: "yjlcoder-local-searxng"
+  limiter: false
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    - json

@@ -25,7 +25,7 @@
 - 主动推进目标：`/FuckMaster` 可创建定时跟进；Agent 忙碌时提醒进入等待队列，空闲后再通过 TUI/QQ 主动询问进度。QQ 输出在代码层统一转成无 Markdown、无 emoji 的纯文本。
 - 脚本不再像“黑盒”：命令先显示，运行时原位刷新最近输出、耗时、行数和体积；Esc 或超时会清理整棵进程树，脚本也不会和输入框抢键盘。
 - 弱模型兼容路由：工具名、参数名、嵌套层级、字符串 JSON、字符串数字/布尔/数组写错时自动纠正；工具选错但参数意图明确时强制改道。
-- 聚合网络研究：`web_search` 并发聚合 DuckDuckGo、Bing 和已配置的 Brave/SearXNG，自动规范 URL、跨源去重、质量排序和域名过滤；`web_research` 一次调用自动做互补查询并抓取精选正文。
+- 聚合网络研究（免费三层）：`web_search` 零 key 开箱即用——并发聚合 Bing（国际结果）、DuckDuckGo（html/lite 双端点轮换）和 Wikipedia 官方 API，单引擎被反爬拦截时自动退避重试换端点，连续失败自动冷却 5 分钟，结果去广告跟踪链、跨源去重、质量排序和域名过滤；可选免费 key（Brave / Tavily）自动加入聚合池；终极免费稳定方案 `bash deploy/searxng/start.sh` 一键自托管本地 SearXNG（自动探测纳入）。`web_fetch` 正文抓取失败或遇到 JS 渲染壳时自动经 Jina Reader 免费转换（内网地址不外发）；`web_research` 一次调用自动做互补查询并抓取精选正文。
 - 容错编辑：`editline` 先精确匹配，再兼容 CRLF、尾随空格、智能引号、Unicode 破折号和特殊空格；只允许唯一命中。
 - 强制 Read 通道：兼容 `Read/read_file/readline` 与 `file_path/offset/limit`；Read 是原生工具列表第一项，默认读取前 2000 行，每页连续完整并给出精确下一页 offset。简单 `cat FILE` 在执行前硬转 Read，复杂 cat 直接拒绝。
 - 不会折叠的目录枚举：`ls/dir/list_directory/listdir` 统一进入连续分页器，默认 200 项、最多 1000 项；简单的 `ls -la` 命令也自动硬转。
@@ -109,6 +109,7 @@ yjlcoder --model <name>   # 临时切换模型
 ```
 
 - `provider.native_tools: true` 用原生 function calling（DeepSeek 推荐）；`false` 走 text 协议（本地小模型推荐）。
+- `search` 网络搜索全部免费、默认零 key：`web_search` 的 auto 池 = Bing + DuckDuckGo（`ddg_endpoints` 可自定义镜像，默认 html/lite 双端点）+ Wikipedia，自动重试换端点、连续失败冷却 5 分钟、过滤广告链接；可选 `brave_key` / `tavily_key`（各家免费额度以官网为准）自动加入聚合池；`searxng_url` 或本地自托管（`bash deploy/searxng/start.sh` 一键启动，自动探测 127.0.0.1:8888）；`bing_ensearch: false` 关闭 Bing 国际结果；`timeout_secs` 免费引擎请求超时（默认 15）。
 - `provider.ctx_window` 是云端模型的上下文窗口（fallback）：DeepSeek v4 系列为 1M tokens（`deepseek-v4-flash` / `deepseek-v4-pro`），填真实窗口即可，压缩阈值按此计算，不要对云端模型设过小的值。本地 llama.cpp 服务会自动检测窗口（优先于配置）；Ollama / LM Studio 检测不到，需填模型实际窗口。
 - `qq.groups` / `qq.users` 为空时默认拒绝全部；群内 `triggers` 命中或 `@` 触发回复。
 - 权限分离：`qq.admins`（管理员 QQ）可让 agent 操作电脑（全部工具）；非管理员只能闲聊。

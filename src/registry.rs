@@ -53,8 +53,8 @@ pub const CATEGORIES: &[Category] = &[
         id: "net",
         title: "网络请求与搜索",
         tools: &[
-            ToolDef { name: "web_search", desc: "聚合搜索：自动并发、去重、排序和来源质量过滤", args: "{\"query\":\"...\",\"count\":8,\"include_domains\":[],\"exclude_domains\":[]}" },
-            ToolDef { name: "web_research", desc: "深度研究：自动生成互补查询，聚合排序并抓取精选正文", args: "{\"query\":\"...\",\"depth\":\"deep\",\"fetch_top\":2}" },
+            ToolDef { name: "web_search", desc: "免费聚合搜索：自动并发 Bing/DuckDuckGo/Wikipedia（及已配置引擎），重试去重排序过滤广告；失败自动换端点，无需 API key", args: "{\"query\":\"...\",\"count\":8,\"backend\":\"auto\",\"include_domains\":[],\"exclude_domains\":[]}" },
+            ToolDef { name: "web_research", desc: "深度研究：自动生成互补查询，聚合排序并抓取精选正文（正文失败自动经 Jina Reader 免费转换）", args: "{\"query\":\"...\",\"depth\":\"deep\",\"fetch_top\":2}" },
             ToolDef { name: "web_fetch", desc: "批量抓取网页并转纯文本；url 或 urls 均可", args: "{\"urls\":[\"https://...\"],\"max_chars\":8000}" },
             ToolDef { name: "http_get", desc: "发送 HTTP GET 并返回响应", args: "{\"url\":\"...\",\"headers\":{},\"timeout\":15}" },
             ToolDef { name: "http_headers", desc: "发送 HTTP HEAD 查看响应头", args: "{\"url\":\"...\"}" },

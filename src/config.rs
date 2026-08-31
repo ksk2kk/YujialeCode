@@ -83,11 +83,39 @@ pub fn default_tool_times() -> usize {
 pub fn default_command_timeout() -> u64 {
     600
 }
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Search {
     pub brave_key: String,
     pub searxng_url: String,
     pub searxng_key: String,
+    /// Tavily 免费 key（注册即得，免费额度以官网为准）；配置后自动加入 auto 聚合池
+    #[serde(default)]
+    pub tavily_key: String,
+    /// DuckDuckGo 端点列表：可填 "html" / "lite" 或自定义镜像 URL；留空 = html+lite 自动轮换
+    #[serde(default)]
+    pub ddg_endpoints: Vec<String>,
+    /// 免费引擎（DDG/Bing/Wikipedia）请求超时（秒）
+    #[serde(default = "default_search_timeout")]
+    pub timeout_secs: u64,
+    /// Bing 是否强制国际版结果（ensearch=1），规避中国区结果偏窄
+    #[serde(default = "default_true")]
+    pub bing_ensearch: bool,
+}
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            brave_key: String::new(),
+            searxng_url: String::new(),
+            searxng_key: String::new(),
+            tavily_key: String::new(),
+            ddg_endpoints: Vec::new(),
+            timeout_secs: default_search_timeout(),
+            bing_ensearch: true,
+        }
+    }
+}
+fn default_search_timeout() -> u64 {
+    10
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -241,11 +269,7 @@ impl Default for Config {
                 tool_result_max_tokens: 1000,
             },
             pricing: Pricing::default(),
-            search: Search {
-                brave_key: String::new(),
-                searxng_url: String::new(),
-                searxng_key: String::new(),
-            },
+            search: Search::default(),
             tool_times: default_tool_times(),
             fuckloop: true,
             command_timeout_secs: default_command_timeout(),
