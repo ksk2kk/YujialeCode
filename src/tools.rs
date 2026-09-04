@@ -315,11 +315,17 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
                     crate::dynamic_tools::list_detail(ctx.cfg)
                 }
                 Some(crate::plugins::CATEGORY) => crate::plugins::list_detail(ctx.cfg),
-                Some(c) => list_category_text(c).ok_or_else(|| {
-                    format!("未知分类: {c}（无参数调用 list_tools 查看分类目录）")
-                })?,
+                Some(c) => {
+                    let mut text = list_category_text(c).ok_or_else(|| {
+                        format!("未知分类: {c}（无参数调用 list_tools 查看分类目录）")
+                    })?;
+                    // 插件归属本分类时，把其 actions 合并进分类页（如 [sec] 的 POC/EXP 武器库）
+                    text.push_str(&crate::plugins::category_overlay(ctx.cfg, c));
+                    text
+                }
                 None => {
                     let mut index = list_categories_text();
+                    index = crate::plugins::augment_category_index(index, ctx.cfg);
                     index.push_str(&crate::dynamic_tools::list_index_line(ctx.cfg));
                     index.push_str(&crate::plugins::list_index_line(ctx.cfg));
                     index
@@ -346,7 +352,7 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "appendline" => file_append(args),
         "glob" => file_glob(args),
         "grep" => file_grep(args),
-        "listdir" => file_listdir(args),
+        "listdir" => file_listdir(args, ctx),
         "web_search" => crate::web::web_search(args, ctx.cfg),
         "web_research" => crate::web::web_research(args, ctx.cfg),
         "web_fetch" => crate::web::web_fetch(args),
@@ -1357,7 +1363,7 @@ fn file_append(args: &Value) -> Result<String, String> {
     f.write_all(b"\n").ok();
     Ok(format!("已追加到 {path}"))
 }
-fn file_listdir(args: &Value) -> Result<String, String> {
+fn file_listdir(args: &Value, ctx: &ToolCtx<'_>) -> Result<String, String> {
     let path = expand_home(args.get("path").and_then(|p| p.as_str()).unwrap_or("."));
     let offset_u64 = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
     let limit_u64 = args
@@ -1427,8 +1433,19 @@ fn file_listdir(args: &Value) -> Result<String, String> {
             format!("{label}\t{}{suffix}", escape_listing_name(name))
         })
         .collect();
+    // 首页才评估目录感知提示：条目名命中插件 dir_hints 时引导模型直接调插件
+    let dir_hint = if offset == 0 && !page.is_empty() {
+        let names: Vec<String> = items.iter().map(|(_, name)| name.clone()).collect();
+        crate::plugins::collection_hint(ctx.cfg, &path, &names)
+    } else {
+        None
+    };
     loop {
-        let out = listdir_page_output(&path, total, offset, limit, skipped, &page);
+        let base = listdir_page_output(&path, total, offset, limit, skipped, &page);
+        let out = match dir_hint {
+            Some(ref hint) => format!("{base}\n{hint}\n"),
+            None => base,
+        };
         let approx_tokens = crate::compress::approx_token_count(&out);
         if approx_tokens <= FILE_LISTDIR_MAX_OUTPUT_TOKENS {
             return Ok(out);

@@ -162,6 +162,10 @@ deploy/napcat/start.sh --no-follow
 - 会话文件在 `~/.yjlcoder/sessions/<id>.jsonl`，`/new [id]`、`/ls`、`/use <id>`、`/rm <id>`（不能删当前）。
 - `/skills` 查看已安装；`/install <name>` 从 anthropics/claude-code 仓库安装（如 `pdf`），也支持 `/install <URL>` 或本地目录；`run_skill <name>` 将 SKILL.md 注入上下文。
 
+## 插件（用户自定义，仓库不内置）
+
+插件是**用户私有的单文件 Python 脚本或原生二进制**：Python 放进 `<项目>/plugins/python/` 或 `~/.yjlcoder/plugins/python/`；Rust/Go 等编译型二进制放进 `plugins/bin/` 并附同名 `<文件名>.plugin.json` 清单（无需重启即被发现），模型经 `execute_command {"op":"<插件名>","args":{"action":"..."}}` 调度。支持弹窗问用户（`request_user` 走原生 Ask 卡片）、后台长任务（`task_status/wait/cancel`）、启动前确认卡（`requires_confirmation`）、进度事件（只刷 TUI 不进上下文）、结果强制压缩（大结果落盘返回路径）。协议契约与最小示例见 [docs/plugin-api.md](docs/plugin-api.md)。本仓库不内置、不分发任何插件（`plugins/` 已声明为本机私有、永不推送）。
+
 ## 开发
 
 ```bash

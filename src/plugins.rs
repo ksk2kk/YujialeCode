@@ -17,6 +17,7 @@ use crate::tools::{ToolCtx, ToolProgress};
 pub const CATEGORY: &str = "plugins";
 const PROTOCOL: &str = "yjlcoder.plugin/v1";
 const MAX_PLUGIN_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_BINARY_PLUGIN_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_MODEL_STRING: usize = 1_200;
 const MAX_MODEL_ARRAY: usize = 40;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -33,6 +34,39 @@ struct PluginManifest {
     timeout_secs: u64,
     #[serde(default)]
     actions: Vec<PluginAction>,
+    /// 声明"本插件能处理哪类目录"：listdir 看到疑似目录时附一行提示，
+    /// 把模型从手写命令引导到插件调用（Rust 侧保持插件无关，规则由插件自带）。
+    #[serde(default)]
+    dir_hints: Vec<PluginDirHint>,
+    /// 归属的系统工具分类（如 "sec"）：本插件的 actions 会动态合并进
+    /// list_tools 该分类页，让模型把插件能力当原生工具看待。空 = 只留在 [plugins]。
+    #[serde(default)]
+    category: String,
+    /// 合并进系统分类的 action 白名单；空 = 全部 actions。
+    #[serde(default)]
+    category_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginDirHint {
+    #[serde(default)]
+    keywords: Vec<String>,
+    label: String,
+    #[serde(default = "default_hint_min_entries")]
+    min_entries: usize,
+    #[serde(default = "default_hint_min_ratio")]
+    min_ratio: f64,
+    /// 给模型照抄的调用示例；{path} 会被替换为当前列出的目录
+    #[serde(default)]
+    suggest: String,
+}
+
+fn default_hint_min_entries() -> usize {
+    2
+}
+
+fn default_hint_min_ratio() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,9 +81,18 @@ struct PluginAction {
     requires_confirmation: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginKind {
+    /// 单文件 Python 脚本，由本机 python3 解释器启动。
+    Python,
+    /// 原生可执行文件（如 Rust 二进制），宿主直接启动，manifest 来自同名 sidecar。
+    Binary,
+}
+
 #[derive(Debug, Clone)]
 struct Plugin {
     path: PathBuf,
+    kind: PluginKind,
     manifest: PluginManifest,
 }
 
@@ -89,16 +132,179 @@ pub fn list_index_line(cfg: &Config) -> String {
     let (plugins, errors) = discover(cfg);
     if plugins.is_empty() {
         if errors.is_empty() {
-            return "[plugins] 自定义插件（0）: 将单文件 Python 插件放入 ~/.yjlcoder/plugins/python/\n".into();
+            return "[plugins] 自定义插件（0）: 将单文件 Python 插件放入 ~/.yjlcoder/plugins/python/，或原生二进制放入 ~/.yjlcoder/plugins/bin/（附 <文件名>.plugin.json 清单）\n".into();
         }
         return format!("[plugins] 自定义插件（0，可疑文件 {}）\n", errors.len());
     }
     let names = plugins
         .iter()
-        .map(|plugin| plugin.manifest.name.as_str())
+        .map(|plugin| {
+            if plugin.manifest.display_name.trim().is_empty() {
+                plugin.manifest.name.clone()
+            } else {
+                format!("{}({})", plugin.manifest.name, plugin.manifest.display_name)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("[plugins] 自定义插件（{}）: {names}\n", plugins.len())
+}
+
+/// 目录感知提示：listdir 的条目名命中某个插件声明的 dir_hints 时，
+/// 返回一行可直接照抄的插件调用建议，避免模型用 shell 手工重复造轮子。
+pub fn collection_hint(cfg: &Config, path: &str, names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let (plugins, _) = discover(cfg);
+    for plugin in &plugins {
+        for hint in &plugin.manifest.dir_hints {
+            if hint.label.trim().is_empty() || hint.keywords.is_empty() {
+                continue;
+            }
+            let matched = names
+                .iter()
+                .filter(|name| {
+                    let lower = name.to_lowercase();
+                    hint.keywords
+                        .iter()
+                        .any(|keyword| !keyword.is_empty() && lower.contains(&keyword.to_lowercase()))
+                })
+                .count();
+            let ratio = matched as f64 / names.len() as f64;
+            if matched >= hint.min_entries && ratio >= hint.min_ratio {
+                let suggest = if hint.suggest.trim().is_empty() {
+                    format!(
+                        "execute_command {{\"op\":\"{}\",\"args\":{{\"action\":\"help\"}}}}",
+                        plugin.manifest.name
+                    )
+                } else {
+                    hint.suggest.replace("{path}", path)
+                };
+                return Some(format!(
+                    "提示: 本目录疑似{}；已安装插件 {} 可直接处理（优于手写命令逐个分析）: {}",
+                    hint.label,
+                    display_name(&plugin.manifest),
+                    one_line(&suggest, 400)
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 插件归属系统分类时，合并进 list_tools 该分类页的能力清单。
+/// 形如原生 ToolDef 行，让模型把插件能力当系统工具调用。
+pub fn category_overlay(cfg: &Config, category: &str) -> String {
+    if category == CATEGORY || crate::registry::find_category(category).is_none() {
+        return String::new();
+    }
+    let (plugins, _) = discover(cfg);
+    let mut out = String::new();
+    for plugin in &plugins {
+        if plugin.manifest.category != category {
+            continue;
+        }
+        for action in &plugin.manifest.actions {
+            if !plugin.manifest.category_actions.is_empty()
+                && !plugin
+                    .manifest
+                    .category_actions
+                    .iter()
+                    .any(|name| name == &action.name)
+            {
+                continue;
+            }
+            let mut badges = String::new();
+            if action.background {
+                badges.push_str("；后台任务（task_wait 轮询）");
+            }
+            if action.requires_confirmation {
+                badges.push_str("；启动前需用户确认");
+            }
+            out.push_str(&format!(
+                "- {}:{} — {}{badges}\n  调用: execute_command {{\"op\":\"{}\",\"args\":{{\"action\":\"{}\"}}}}（详细参数: {{\"action\":\"help\",\"for\":\"{}\"}}）\n",
+                plugin.manifest.name,
+                action.name,
+                first_sentence(&action.description, 110),
+                plugin.manifest.name,
+                action.name,
+                action.name
+            ));
+        }
+    }
+    out
+}
+
+/// 分类目录索引行增强：插件归属的分类行尾追加 `插件名×N`，
+/// 让模型在索引层就看到"网络安全不止 portscan"。
+pub fn augment_category_index(index: String, cfg: &Config) -> String {
+    let (plugins, _) = discover(cfg);
+    let mut counts: std::collections::HashMap<&str, Vec<(&str, usize)>> = std::collections::HashMap::new();
+    for plugin in &plugins {
+        let category = plugin.manifest.category.as_str();
+        if category.is_empty()
+            || category == CATEGORY
+            || crate::registry::find_category(category).is_none()
+        {
+            continue;
+        }
+        let total = if plugin.manifest.category_actions.is_empty() {
+            plugin.manifest.actions.len()
+        } else {
+            plugin
+                .manifest
+                .actions
+                .iter()
+                .filter(|action| {
+                    plugin
+                        .manifest
+                        .category_actions
+                        .iter()
+                        .any(|name| name == &action.name)
+                })
+                .count()
+        };
+        if total > 0 {
+            counts
+                .entry(category)
+                .or_default()
+                .push((plugin.manifest.name.as_str(), total));
+        }
+    }
+    if counts.is_empty() {
+        return index;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for line in index.lines() {
+        let mut line = line.to_string();
+        for (category, entries) in &counts {
+            if line.starts_with(&format!("[{category}]")) {
+                let joined = entries
+                    .iter()
+                    .map(|(name, total)| format!("{name}×{total}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                line = format!("{line} + 插件: {joined}");
+            }
+        }
+        lines.push(line);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn first_sentence(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let end = ['。', '；', ';', '\n']
+        .iter()
+        .filter_map(|sep| trimmed.find(*sep))
+        .min()
+        .map(|i| i + 3)
+        .unwrap_or(trimmed.len())
+        .min(trimmed.len());
+    one_line(&trimmed[..end], max_chars)
 }
 
 pub fn list_detail(cfg: &Config) -> String {
@@ -600,7 +806,11 @@ fn send_foreground_progress(ctx: &ToolCtx<'_>, started: Instant, event: &Value) 
 }
 
 fn plugin_command(plugin: &Plugin, cfg: &Config, task_id: Option<&str>) -> Result<Command, String> {
-    let (program, prefix) = python_interpreter()?;
+    let (program, prefix) = match plugin.kind {
+        PluginKind::Python => python_interpreter()?,
+        // 原生二进制：宿主直接启动，无需解释器。
+        PluginKind::Binary => (plugin.path.to_string_lossy().into_owned(), Vec::new()),
+    };
     let data_dir = cfg
         .data_dir()
         .join("plugin-data")
@@ -614,15 +824,16 @@ fn plugin_command(plugin: &Plugin, cfg: &Config, task_id: Option<&str>) -> Resul
     let mut command = Command::new(program);
     command
         .args(prefix)
-        .arg(&plugin.path)
-        .arg("--yjlcoder-plugin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("PYTHONUNBUFFERED", "1")
         .env("YJLCODER_PLUGIN_PROTOCOL", PROTOCOL)
         .env("YJLCODER_PLUGIN_DATA_DIR", data_dir)
         .env("YJLCODER_PLUGIN_LOG_DIR", log_dir);
+    if plugin.kind == PluginKind::Python {
+        command.arg(&plugin.path).env("PYTHONUNBUFFERED", "1");
+    }
+    command.arg("--yjlcoder-plugin");
     if let Some(task_id) = task_id {
         command.env("YJLCODER_PLUGIN_TASK_ID", task_id);
     }
@@ -1080,18 +1291,27 @@ fn discover(cfg: &Config) -> (Vec<Plugin>, Vec<String>) {
     let mut plugins = Vec::new();
     let mut errors = Vec::new();
     let mut names = HashSet::new();
-    for dir in plugin_dirs(cfg) {
+    for (dir, kind) in plugin_dirs(cfg) {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
         let mut paths = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "py"))
+            .filter(|path| match kind {
+                PluginKind::Python => {
+                    path.extension().is_some_and(|extension| extension == "py")
+                }
+                PluginKind::Binary => is_binary_candidate(&path),
+            })
             .collect::<Vec<_>>();
         paths.sort();
         for path in paths {
-            match read_plugin(&path) {
+            let outcome = match kind {
+                PluginKind::Python => read_plugin(&path),
+                PluginKind::Binary => read_binary_plugin(&path),
+            };
+            match outcome {
                 Ok(plugin) => {
                     if names.insert(plugin.manifest.name.clone()) {
                         plugins.push(plugin);
@@ -1122,17 +1342,74 @@ fn find_plugin(cfg: &Config, name: &str) -> Result<Option<Plugin>, String> {
     Ok(None)
 }
 
-fn plugin_dirs(cfg: &Config) -> Vec<PathBuf> {
+/// 插件目录（有序）：项目级优先于用户级；同级里 python 优先于 bin（重名时脚本版胜出）。
+fn plugin_dirs(cfg: &Config) -> Vec<(PathBuf, PluginKind)> {
     let mut dirs = Vec::new();
     if let Ok(current) = std::env::current_dir() {
-        let project = current.join("plugins").join("python");
-        dirs.push(project);
+        dirs.push((current.join("plugins").join("python"), PluginKind::Python));
+        dirs.push((current.join("plugins").join("bin"), PluginKind::Binary));
     }
-    let user = cfg.data_dir().join("plugins").join("python");
-    if !dirs.contains(&user) {
-        dirs.push(user);
-    }
+    dirs.push((cfg.data_dir().join("plugins").join("python"), PluginKind::Python));
+    dirs.push((cfg.data_dir().join("plugins").join("bin"), PluginKind::Binary));
     dirs
+}
+
+/// bin 目录里的候选：普通文件即可（是否真的可执行由 read_binary_plugin 校验），
+/// 排除 sidecar 清单（*.plugin.json）和隐藏文件。
+fn is_binary_candidate(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    !name.starts_with('.') && !name.ends_with(".plugin.json")
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+/// 原生二进制插件：manifest 放在同名 sidecar `<文件名>.plugin.json`（纯 JSON），
+/// 发现阶段同样不执行任何插件代码。
+fn read_binary_plugin(path: &Path) -> Result<Plugin, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("二进制插件必须是普通文件，不能是符号链接".into());
+    }
+    if metadata.len() > MAX_BINARY_PLUGIN_BYTES {
+        return Err(format!(
+            "二进制插件超过 {} MiB 上限",
+            MAX_BINARY_PLUGIN_BYTES / 1024 / 1024
+        ));
+    }
+    if !is_executable(&metadata) {
+        return Err("二进制插件没有可执行权限（chmod +x）".into());
+    }
+    let sidecar = sidecar_path(path);
+    let text = fs::read_to_string(&sidecar)
+        .map_err(|error| format!("缺少二进制插件清单 {}: {error}", sidecar.display()))?;
+    let manifest: PluginManifest =
+        serde_json::from_str(&text).map_err(|error| format!("清单 JSON 无效: {error}"))?;
+    validate_manifest(&manifest)?;
+    Ok(Plugin {
+        path: path.to_path_buf(),
+        kind: PluginKind::Binary,
+        manifest,
+    })
+}
+
+fn sidecar_path(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(path.file_name().unwrap_or_default());
+    name.push(".plugin.json");
+    path.parent().unwrap_or(Path::new(".")).join(name)
 }
 
 fn read_plugin(path: &Path) -> Result<Plugin, String> {
@@ -1151,6 +1428,7 @@ fn read_plugin(path: &Path) -> Result<Plugin, String> {
     validate_manifest(&manifest)?;
     Ok(Plugin {
         path: path.to_path_buf(),
+        kind: PluginKind::Python,
         manifest,
     })
 }
@@ -1353,6 +1631,205 @@ print(json.dumps({"type":"result","ok":True,"status":"completed","summary":"conf
         assert_eq!(manifest.actions[0].name, "find_free");
     }
 
+    const BINARY_SIDECAR: &str = r#"{
+        "name": "echo_probe_bin",
+        "description": "二进制插件探针：回显一个固定结果，用于验证原生插件协议",
+        "actions": [{"name": "ping", "description": "回显固定结果", "parameters": {"type": "object"}}]
+    }"#;
+
+    const BINARY_SCRIPT: &str = r#"#!/bin/sh
+read line
+printf '{"protocol":"yjlcoder.plugin/v1","type":"result","ok":true,"status":"completed","summary":"bin ok","data":{"kind":"binary"}}\n'
+"#;
+
+    fn write_binary_plugin(dir: &Path, name: &str, script: &str, sidecar: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = sidecar; // 调用方决定是否写 sidecar
+        if !sidecar.is_empty() {
+            fs::write(sidecar_path(&path), sidecar).unwrap();
+        }
+    }
+
+    fn test_cfg_with_root(root: &Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.to_path_buf());
+        cfg
+    }
+
+    #[test]
+    fn binary_plugin_uses_sidecar_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "yjlcoder-plugin-bin-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let dir = root.join("plugins/bin");
+        write_binary_plugin(&dir, "echo_probe_bin", BINARY_SCRIPT, BINARY_SIDECAR);
+        // 无 sidecar 的可执行文件应报错且不加载
+        write_binary_plugin(&dir, "orphan_bin", BINARY_SCRIPT, "");
+        let cfg = test_cfg_with_root(&root);
+        let (plugins, errors) = discover(&cfg);
+        assert!(plugins.iter().any(|p| p.manifest.name == "echo_probe_bin"
+            && p.kind == PluginKind::Binary), "{errors:?}");
+        assert!(!plugins.iter().any(|p| p.manifest.name == "orphan_bin"));
+        assert!(errors.iter().any(|e| e.contains("orphan_bin")), "{errors:?}");
+        // 清单不带执行体也应报错（sidecar 本身不是插件）
+        assert!(!plugins.iter().any(|p| p.path.ends_with(".plugin.json")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn python_wins_when_binary_shares_manifest_name() {
+        let root = std::env::temp_dir().join(format!(
+            "yjlcoder-plugin-collision-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let python_dir = root.join("plugins/python");
+        fs::create_dir_all(&python_dir).unwrap();
+        fs::write(python_dir.join("dup_probe.py"), SAMPLE).unwrap();
+        let sidecar = r#"{"name": "room_helper", "description": "与 python 插件重名的二进制清单"}"#;
+        write_binary_plugin(&root.join("plugins/bin"), "dup_probe", BINARY_SCRIPT, sidecar);
+        let cfg = test_cfg_with_root(&root);
+        let (plugins, _) = discover(&cfg);
+        let helper: Vec<_> = plugins.iter().filter(|p| p.manifest.name == "room_helper").collect();
+        assert_eq!(helper.len(), 1);
+        assert_eq!(helper[0].kind, PluginKind::Python);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_plugin_foreground_round_trip() {
+        let root = std::env::temp_dir().join(format!(
+            "yjlcoder-plugin-binrt-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        write_binary_plugin(
+            &root.join("plugins/bin"),
+            "echo_probe_bin",
+            BINARY_SCRIPT,
+            BINARY_SIDECAR,
+        );
+        let cfg = test_cfg_with_root(&root);
+        let mut store = crate::session::SessionStore::new(cfg.sessions_dir());
+        let llm = crate::llm::Llm::mock();
+        let cancel = AtomicBool::new(false);
+        let mut ctx = ToolCtx {
+            cfg: &cfg,
+            store: &mut store,
+            llm: &llm,
+            qq_tx: None,
+            cancel: &cancel,
+            mem_dir: None,
+            ask: None,
+            perm: None,
+            event_tx: None,
+        };
+        let output = execute_if_present("echo_probe_bin", &json!({"action": "ping"}), &mut ctx)
+            .unwrap()
+            .expect("二进制插件应被发现");
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["ok"], json!(true), "{output}");
+        assert_eq!(value["data"]["kind"], json!("binary"), "{output}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_poc_exp_manifest_parses_with_dir_hints() {
+        let path = std::path::Path::new("plugins/python/poc_exp.py");
+        if !path.exists() {
+            return; // 本机没有该私有插件时静默跳过（plugins/ 不入库）
+        }
+        let text = fs::read_to_string(path).unwrap();
+        let manifest = parse_manifest(&text).unwrap();
+        validate_manifest(&manifest).unwrap();
+        assert_eq!(manifest.name, "poc_exp");
+        assert!(!manifest.dir_hints.is_empty());
+        assert!(manifest.dir_hints.iter().any(|h| h.suggest.contains("{path}")));
+        assert!(manifest
+            .actions
+            .iter()
+            .any(|a| a.name == "verify" && a.background));
+        assert!(manifest.actions.iter().any(|a| a.name == "exploit"
+            && a.background
+            && a.requires_confirmation));
+        // 真实武器库目录名（会话 trace 里的实际场景）应命中提示
+        let hit = collection_hint(
+            &Config::default(),
+            "/tmp/arsenal-test",
+            &["goby-poc".into(), "some-poc".into()],
+        )
+        .expect("goby-poc/some-poc 应命中 poc_exp 的 dir_hints");
+        assert!(hit.contains("poc_exp"), "{hit}");
+        assert!(hit.contains("/tmp/arsenal-test"), "{hit}");
+        // 归属 sec 分类：能力项合并进 [sec]，索引行同步增强
+        assert_eq!(manifest.category, "sec");
+        let overlay = category_overlay(&Config::default(), "sec");
+        assert!(overlay.contains("poc_exp:verify"), "{overlay}");
+        assert!(overlay.contains("poc_exp:exploit"), "{overlay}");
+        assert!(overlay.contains("需用户确认"), "{overlay}");
+        assert!(!overlay.contains("poc_exp:import"), "管理类 action 不应进 sec: {overlay}");
+        let augmented = augment_category_index(crate::registry::list_categories_text(), &Config::default());
+        assert!(
+            augmented.contains("[sec] 网络安全: portscan, dns_lookup + 插件: poc_exp×"),
+            "{augmented}"
+        );
+    }
+
+    #[test]
+    fn category_overlay_merges_plugin_into_native_category() {
+        let root = std::env::temp_dir().join(format!(
+            "yjlcoder-plugin-overlay-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let dir = root.join("plugins/python");
+        fs::create_dir_all(&dir).unwrap();
+        let sample = r#"# /// yjlcoder-plugin
+# {"name":"zz_pen","display_name":"渗透器","description":"测试分类合并能力的示例插件（描述至少十二字符）",
+#  "category":"sec",
+#  "category_actions":["scan","pwn"],
+#  "actions":[
+#    {"name":"scan","description":"扫描目标并返回结果。第一句话应被提取为短描述","parameters":{"type":"object"}},
+#    {"name":"pwn","description":"利用漏洞。","parameters":{"type":"object"},"background":true,"requires_confirmation":true},
+#    {"name":"manage","description":"管理操作不应出现在 sec 分类里","parameters":{"type":"object"}}]}
+# ///
+"#;
+        fs::write(dir.join("zz_pen.py"), sample).unwrap();
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.clone());
+        let overlay = category_overlay(&cfg, "sec");
+        assert!(overlay.contains("zz_pen:scan"), "{overlay}");
+        assert!(overlay.contains("扫描目标并返回结果"), "{overlay}");
+        assert!(
+            overlay.contains("zz_pen:pwn") && overlay.contains("后台任务") && overlay.contains("需用户确认"),
+            "{overlay}"
+        );
+        assert!(
+            overlay.contains(r#"execute_command {"op":"zz_pen","args":{"action":"scan"}}"#),
+            "{overlay}"
+        );
+        assert!(!overlay.contains("zz_pen:manage"), "{overlay}");
+        assert!(category_overlay(&cfg, "file").is_empty());
+        let index = augment_category_index(crate::registry::list_categories_text(), &cfg);
+        // cwd 里的真实插件（如本机的 poc_exp）可能同时出现，只断言本插件的增强存在
+        assert!(
+            index.contains("[sec] 网络安全: portscan, dns_lookup + 插件:") && index.contains("zz_pen×2"),
+            "{index}"
+        );
+        assert!(index.contains("[file] 文件编辑"), "{index}");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn user_plugin_directory_is_discovered_without_restart() {
         let root = std::env::temp_dir().join(format!(
@@ -1369,6 +1846,43 @@ print(json.dumps({"type":"result","ok":True,"status":"completed","summary":"conf
         let detail = list_detail(&cfg);
         assert!(index.contains("room_helper"), "index: {index}");
         assert!(detail.contains("action\":\"help"), "detail: {detail}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dir_hints_route_collections_to_plugins() {
+        let root = std::env::temp_dir().join(format!(
+            "yjlcoder-plugin-dirhint-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let dir = root.join("plugins/python");
+        fs::create_dir_all(&dir).unwrap();
+        // 关键词用独占 token，避免与本地真实插件（如 poc_exp 的 poc/cve/exp）交叉命中
+        let sample = r#"# /// yjlcoder-plugin
+# {"name":"zz_collect","display_name":"收集器","description":"测试目录感知提示的示例插件",
+#  "dir_hints":[{"keywords":["zzmark1","zzmark2"],"label":"测试集合",
+#    "suggest":"execute_command {\"op\":\"zz_collect\",\"args\":{\"dir\":\"{path}\"}}"}],
+#  "actions":[{"name":"run","description":"运行","parameters":{"type":"object"}}]}
+# ///
+"#;
+        fs::write(dir.join("zz_collect.py"), sample).unwrap();
+        let mut cfg = Config::default();
+        cfg.set_test_data_dir(root.clone());
+        let hit = collection_hint(
+            &cfg,
+            "/tmp/zz",
+            &["zzmark1-dir/".into(), "zzmark2-dir/".into()],
+        )
+        .expect("应命中 dir_hints");
+        assert!(hit.contains("zz_collect"), "{hit}");
+        assert!(hit.contains("/tmp/zz"), "{hint} 未替换 {{path}}", hint = hit);
+        assert!(hit.contains("测试集合"), "{hit}");
+        assert!(collection_hint(&cfg, "/tmp/zz", &["src".into(), "target".into()]).is_none());
+        // 只命中 1/2 个条目，不满足 min_entries=2
+        assert!(
+            collection_hint(&cfg, "/tmp/zz", &["zzmark1-only".into(), "docs".into()]).is_none()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
