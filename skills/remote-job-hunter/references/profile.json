@@ -4,12 +4,10 @@
   "home_timezone": "Asia/Shanghai",
   "utc_offset": "+08:00",
   "languages": [
-    {"name": "Rust", "years": null, "level": "unknown"},
-    {"name": "C++", "years": null, "level": "unknown"},
-    {"name": "Go", "years": null, "level": "unknown"}
+    {"name": "Go", "years": 5, "level": "senior"}
   ],
   "other_skills": ["Linux", "Git"],
-  "english": {"reading": "can_read_docs", "writing": "unknown", "speaking": "unknown"},
+  "english": {"reading": "can_read_docs", "writing": "can_write_chat", "speaking": "unknown"},
   "role_families": [
     "backend", "systems", "distributed-systems", "database", "compiler", "embedded",
     "robotics", "networking", "security", "cloud", "devops", "sre", "platform",
@@ -17,8 +15,9 @@
     "data-infrastructure", "ai-infrastructure"
   ],
   "employment_types": ["full-time", "part-time", "contract", "freelance", "temporary", "internship"],
-  "minimum_salary": 0,
+  "minimum_salary": 3000,
   "minimum_salary_currency": "USD",
+  "minimum_salary_period": "month",
   "accept_unknown_salary": true,
   "accept_night_shift": true,
   "max_timezone_overlap_penalty": 100,
@@ -28,5 +27,5 @@
   "freshness_days": 45,
   "preferred_weekly_hours": null,
   "priority_focus": "early_career_supported",
-  "notes": "所有能带来合法收入的雇佣形式都纳入；最高优先福利较好、实习/校招/Junior、明确培训或有人带、经验要求低且人在中国可申请的岗位。"
+  "notes": "目标水位画像：按 Go 高级工程师（5–6 年）的 JD 读取要求，用于反推学习路线，不用于立即投递。当前真实水平为 Go 小白，地狱模式 1 天=常规 1 个月进度，逐步推进不跳步；只统计 Go 相关 JD 生成路线（有编程基础但不作为筛选参数）。收入底线月入 3000 美元仅作长期参考。接受夜班。"
 }
