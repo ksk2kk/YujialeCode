@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthStr;
 struct ChatState {
     running: bool,
     pending: Option<(String, bool)>,
-    reminders: VecDeque<crate::fuck_master::MasterTask>,
+    reminders: VecDeque<crate::goal_followup::FollowupTask>,
     msg_since_roll: usize,
     cancel: Arc<AtomicBool>,
 }
@@ -90,7 +90,7 @@ fn handle_ws_conn(
     let ws = Arc::new(Mutex::new(ws));                
     let (out_tx, out_rx): (Sender<String>, Receiver<String>) = channel();
     let connection_cancel = Arc::new(AtomicBool::new(false));
-    let scheduler = spawn_fuck_master_scheduler(inner.clone(), out_tx.clone(), connection_cancel.clone());
+    let scheduler = spawn_goal_followup_scheduler(inner.clone(), out_tx.clone(), connection_cancel.clone());
     log("NapCat 已连接");
     let ws_reader = ws.clone();
     let inner_r = inner.clone();
@@ -179,7 +179,7 @@ fn connect_client(inner: Arc<BridgeInner>, url: &str) -> Result<(), String> {
     let ws = Arc::new(Mutex::new(ws));
     let (out_tx, out_rx): (Sender<String>, Receiver<String>) = channel();
     let connection_cancel = Arc::new(AtomicBool::new(false));
-    let scheduler = spawn_fuck_master_scheduler(inner.clone(), out_tx.clone(), connection_cancel.clone());
+    let scheduler = spawn_goal_followup_scheduler(inner.clone(), out_tx.clone(), connection_cancel.clone());
     log("已连接 OneBot");
     let ws_reader = ws.clone();
     let inner_r = inner.clone();
@@ -277,7 +277,7 @@ fn should_respond(inner: &BridgeInner, ev: &Value, self_id: &str) -> bool {
                 return false;
             }
             let text = extract_text(ev);
-            if text.trim().split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("/FuckMaster")) {
+            if text.trim().split_whitespace().next().is_some_and(|word| word.starts_with('/') && crate::tool_compat::normalize_slash_name(word) == "followup") {
                 return true;
             }
             let has_trigger = qq.triggers.iter().any(|t| {
@@ -324,12 +324,12 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
     let target_id = ev["group_id"].as_i64().unwrap_or(ev["user_id"].as_i64().unwrap_or(0));
     log(&format!("[{cid}] {text}"));
     let trimmed = text.trim();
-    if trimmed.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("/FuckMaster")) {
+    if trimmed.split_whitespace().next().is_some_and(|word| word.starts_with('/') && crate::tool_compat::normalize_slash_name(word) == "followup") {
         let reply = if !is_admin(&inner, ev) {
-            "无权限：FuckMaster 仅管理员可注册和管理".to_string()
+            "无权限：followup 仅管理员可注册和管理".to_string()
         } else {
             let rest = trimmed.split_once(char::is_whitespace).map(|(_, rest)| rest).unwrap_or("");
-            crate::fuck_master::execute_slash(&inner.cfg, &cid, rest).unwrap_or_else(|e| format!("FuckMaster 操作失败：{e}"))
+            crate::goal_followup::execute_slash(&inner.cfg, &cid, rest).unwrap_or_else(|e| format!("followup 操作失败：{e}"))
         };
         let action = match msg_type.as_str() {
             "group" => json!({ "action": "send_group_msg", "params": { "group_id": target_id, "message": qq_clean(&reply) } }),
@@ -404,9 +404,9 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
                 log(&format!("[{cid2}] /stop 强制终结"));
             }
         }
-        let now = crate::fuck_master::current_epoch();
+        let now = crate::goal_followup::current_epoch();
         for id in delayed_reminders {
-            let _ = crate::fuck_master::mark_failed(&inner.cfg, &id, now);
+            let _ = crate::goal_followup::mark_failed(&inner.cfg, &id, now);
         }
         log(&format!("[qq] /stop 强制终结所有对话（{stopped} 个会话）"));
         let reply = format!("已强制终结所有对话（{stopped} 个会话，正在处理的请求已中断）");
@@ -457,11 +457,11 @@ fn handle_message(inner: Arc<BridgeInner>, ev: &Value, out_tx: Sender<String>) {
 
 enum QueuedTurn {
     User { text: String, allow_tools: bool },
-    Reminder(crate::fuck_master::MasterTask),
+    Reminder(crate::goal_followup::FollowupTask),
 }
 
-fn fuck_master_turn(
-    task: &crate::fuck_master::MasterTask,
+fn goal_followup_turn(
+    task: &crate::goal_followup::FollowupTask,
     msg_type: &str,
     target_id: i64,
     owner: i64,
@@ -472,13 +472,13 @@ fn fuck_master_turn(
         "私聊".to_string()
     };
     let prompt = format!(
-        "【管理员 {owner} @{where_tag}】FuckMaster 主人预先授权的最高权限推进任务：{}。立即主动推进，简短询问目前进展、遇到的阻碍和下一步计划。直接输出发给当前用户的正文，调度器会负责投递。",
+        "【管理员 {owner} @{where_tag}】followup 主人预先授权的最高权限推进任务：{}。立即主动推进，简短询问目前进展、遇到的阻碍和下一步计划。直接输出发给当前用户的正文，调度器会负责投递。",
         task.goal
     );
     (prompt, true)
 }
 
-fn fuck_master_reply(task: &crate::fuck_master::MasterTask, raw: &str) -> String {
+fn goal_followup_reply(task: &crate::goal_followup::FollowupTask, raw: &str) -> String {
     let cleaned = qq_clean(raw);
     let refusal = [
         "没有主动联系",
@@ -543,12 +543,12 @@ fn start_chat_worker(
             let (job, allow_tools, reminder) = match queued {
                 QueuedTurn::User { text, allow_tools } => (text, allow_tools, None),
                 QueuedTurn::Reminder(task) => {
-                    if !crate::fuck_master::still_dispatchable(&inner.cfg, &task.id) {
+                    if !crate::goal_followup::still_dispatchable(&inner.cfg, &task.id) {
                         continue;
                     }
                     let owner = inner.qq_cfg.admins.first().copied().unwrap_or(0);
                     let (prompt, allow_tools) =
-                        fuck_master_turn(&task, &msg_type, target_id, owner);
+                        goal_followup_turn(&task, &msg_type, target_id, owner);
                     (prompt, allow_tools, Some(task))
                 }
             };
@@ -563,10 +563,10 @@ fn start_chat_worker(
             }
             if turn.qq_sent {
                 if let Some(task) = reminder.as_ref() {
-                    let _ = crate::fuck_master::mark_delivered(
+                    let _ = crate::goal_followup::mark_delivered(
                         &inner.cfg,
                         &task.id,
-                        crate::fuck_master::current_epoch(),
+                        crate::goal_followup::current_epoch(),
                     );
                 }
                 continue;
@@ -575,14 +575,14 @@ fn start_chat_worker(
                 continue;
             }
             let cleaned = if let Some(task) = reminder.as_ref() {
-                fuck_master_reply(task, &turn.reply)
+                goal_followup_reply(task, &turn.reply)
             } else {
                 qq_clean(&turn.reply)
             };
             if cleaned.trim().is_empty() {
                 log(&format!("[qq] 回复过滤后为空，跳过发送: {:?}", turn.reply));
                 if let Some(task) = reminder.as_ref() {
-                    let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, crate::fuck_master::current_epoch());
+                    let _ = crate::goal_followup::mark_failed(&inner.cfg, &task.id, crate::goal_followup::current_epoch());
                 }
                 continue;
             }
@@ -598,12 +598,12 @@ fn start_chat_worker(
             };
             let sent = out_tx.send(action.to_string()).is_ok();
             if let Some(task) = reminder.as_ref() {
-                let now = crate::fuck_master::current_epoch();
+                let now = crate::goal_followup::current_epoch();
                 if sent {
-                    let _ = crate::fuck_master::mark_delivered(&inner.cfg, &task.id, now);
-                    log(&format!("[FuckMaster] {} 已推进 {}", task.id, task.chat));
+                    let _ = crate::goal_followup::mark_delivered(&inner.cfg, &task.id, now);
+                    log(&format!("[followup] {} 已推进 {}", task.id, task.chat));
                 } else {
-                    let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, now);
+                    let _ = crate::goal_followup::mark_failed(&inner.cfg, &task.id, now);
                 }
                 continue;
             }
@@ -639,15 +639,15 @@ fn chat_route(chat: &str) -> Option<(String, String, i64)> {
     }
 }
 
-fn spawn_fuck_master_scheduler(
+fn spawn_goal_followup_scheduler(
     inner: Arc<BridgeInner>,
     out_tx: Sender<String>,
     connection_cancel: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while !inner.cancel.load(Ordering::Relaxed) && !connection_cancel.load(Ordering::Relaxed) {
-            let now = crate::fuck_master::current_epoch();
-            match crate::fuck_master::claim_due(&inner.cfg, now) {
+            let now = crate::goal_followup::current_epoch();
+            match crate::goal_followup::claim_due(&inner.cfg, now) {
                 Ok(Some(task)) => {
                     if let Some((cid, _, _)) = chat_route(&task.chat) {
                         let mut states = inner.states.lock().unwrap();
@@ -656,11 +656,11 @@ fn spawn_fuck_master_scheduler(
                             st.reminders.push_back(task);
                         }
                     } else {
-                        let _ = crate::fuck_master::mark_failed(&inner.cfg, &task.id, now);
+                        let _ = crate::goal_followup::mark_failed(&inner.cfg, &task.id, now);
                     }
                 }
                 Ok(None) => {}
-                Err(e) => log(&format!("[FuckMaster] 调度读取失败: {e}")),
+                Err(e) => log(&format!("[followup] 调度读取失败: {e}")),
             }
             if !crate::agent::runtime_is_busy() {
                 let route = {
@@ -1656,11 +1656,11 @@ mod tests {
         assert!(!should_respond(&inner, &private_ev(789, "你好"), "10001"));
     }
     #[test]
-    fn fuck_master_command_bypasses_group_trigger_and_persists() {
+    fn goal_followup_command_bypasses_group_trigger_and_persists() {
         let mut qq = qq_cfg(vec![123], vec![456]);
         qq.admins = vec![777];
         let inner = bridge_with(qq);
-        let mut ev = group_ev(123, "/FuckMaster add 2h 推进找工作学习路线");
+        let mut ev = group_ev(123, "/followup add 2h 推进找工作学习路线");
         ev["user_id"] = json!(777);
         assert!(should_respond(&inner, &ev, "10001"));
         let (tx, rx) = channel::<String>();
@@ -1668,23 +1668,23 @@ mod tests {
         let raw = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("应返回注册结果");
         let action: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(action["params"]["message"].as_str().unwrap().contains("fm-0001"), true);
-        let list = crate::fuck_master::execute_tool(&inner.cfg, "qq_g123", &json!({"action":"list"})).unwrap();
+        let list = crate::goal_followup::execute_tool(&inner.cfg, "qq_g123", &json!({"action":"list"})).unwrap();
         assert!(list.contains("推进找工作学习路线"));
         let _ = std::fs::remove_dir_all(inner.cfg.data_dir());
     }
 
     #[test]
-    fn fuck_master_reminder_has_full_access_and_refusal_fallback() {
-        let task = crate::fuck_master::MasterTask {
+    fn goal_followup_reminder_has_full_access_and_refusal_fallback() {
+        let task = crate::goal_followup::FollowupTask {
             goal: "推进 Rust 学习路线".into(),
             ..Default::default()
         };
-        let (prompt, allow_tools) = fuck_master_turn(&task, "group", 123, 777);
-        assert!(allow_tools, "FuckMaster 必须使用管理员最高工具权限");
+        let (prompt, allow_tools) = goal_followup_turn(&task, "group", 123, 777);
+        assert!(allow_tools, "followup 必须使用管理员最高工具权限");
         assert!(prompt.contains("主人预先授权的最高权限"));
         assert!(prompt.contains("群123"));
 
-        let fallback = fuck_master_reply(
+        let fallback = goal_followup_reply(
             &task,
             "我现在没有主动联系别人或者设置定时任务的权限，只能在这儿陪你聊 Rust。",
         );

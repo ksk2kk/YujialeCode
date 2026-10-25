@@ -1,8 +1,14 @@
 # YujialeCode
 
-A code agent built for local model enthusiasts. Pure Rust, an extremely minimal system prompt, and smooth operation even at a 30-token speed budget. Fully compatible with Claude-style skills.
+[English](README.en.md) | [中文](README.md)
 
-A minimal pure-Rust local model CLI agent: few dependencies (8 crates: serde / ureq / reqwest / tokio / tungstenite, etc.), and a low-token system prompt design.
+YujialeCode is a Rust coding agent for local language models. It gives models tools to read and edit files, run commands, and manage context, with recovery for malformed tool calls. It works with OpenAI-compatible model servers such as LM Studio, Ollama, and vLLM, as well as hosted endpoints, and supports Claude-style skills.
+
+## Why I built this
+
+I wanted models running on my own computer to help with everyday coding. A model may be able to write code, yet a malformed tool call, a stuck command, or a growing conversation can interrupt the task. YujialeCode focuses on these practical problems: tool-call recovery, visible command execution, and context management, so users can follow what is happening and the agent can recover when something goes wrong. I designed the project's architecture and workflows, use AI coding tools for most of the implementation, and drive testing and improvements. The open-source components and design references used in the project are credited below.
+
+The CLI backend is written in Rust and uses a short system prompt.
 
 **The UI is now the Grok Build TUI** (launched via `ycode`): the terminal UI from [xai-org/grok-build](https://github.com/xai-org/grok-build) (Apache-2.0, vendored under `vendor/`) driven by this project's backend bridge (`yjl-bridge`) — no x.ai login whatsoever; question cards, model picker, plugin marketplace and slash completions all work, plus a first-run setup wizard with 25 built-in providers and local service auto-detection. The original hand-rolled TUI remains available via `--legacy-tui`. Works with any OpenAI-compatible endpoint including DeepSeek / Ollama / LM Studio / vLLM. The `--mock` offline demo runs the entire flow without any API key. Optional QQ integration (OneBot v11, NapCat / Lagrange) supports fast group chat and private chat responses.
 
@@ -15,7 +21,7 @@ This project is named after my friend [Yujiale](https://github.com/dawalishi821)
 - Short system prompt: native mode does not repeat function schemas, only states the role, tool entry points, and stop conditions; text mode only adds the tool format and one Read example. Detailed parameters are returned on demand by `list_tools`.
 - Dual tool-call protocols: text mode parses ```` ```tool {...} ```` code blocks; native mode registers `readline`, `execute_command`, `list_tools`, and `ask_user` as core entries, with the rest of the tools discovered dynamically.
 - Non-disruptive Computer Use: the default backend no longer touches the real desktop. On Linux, each session gets an isolated headless Sway compositor with its own Wayland socket, seat, focus, keyboard, and virtual pointer, so it can run arbitrary GUI apps without stealing the user's mouse. Web tasks may use isolated Chromium/CDP for lower cost. Native Linux Wayland, macOS, and Windows host-control backends remain available only with explicit `backend=host`.
-- Proactive goal follow-up: `/FuckMaster` schedules progress check-ins. Reminders queue while the agent is busy and are delivered through the TUI/QQ after it becomes idle; QQ output is normalized to plain text without Markdown or emoji in the transport layer.
+- Proactive goal follow-up: `/followup` schedules progress check-ins. Reminders queue while the agent is busy and are delivered through the TUI/QQ after it becomes idle; QQ output is normalized to plain text without Markdown or emoji in the transport layer.
 - Weak-model compatible routing: auto-corrects wrong tool names, parameter names, nesting levels, stringified JSON, and stringified numbers/booleans/arrays; forcibly redirects when the model picks the wrong tool but the intent is clear.
 - Aggregated web research (free, three tiers): `web_search` works with zero keys out of the box — it concurrently aggregates Bing (international results), DuckDuckGo (html/lite endpoint rotation), and the official Wikipedia API; when an engine is rate-limited it retries with backoff and endpoint rotation, cools an engine down for 5 minutes after consecutive failures, and filters ad/tracking links before deduplicating across sources, ranking by quality, and filtering domains. Optional free keys (Brave / Tavily) join the pool automatically. For a permanently free and stable setup, run `bash deploy/searxng/start.sh` to self-host a local SearXNG (auto-detected). `web_fetch` falls back to the free Jina Reader when a page fails or is a JS-rendered shell (private addresses are never sent externally); `web_research` runs complementary queries and fetches curated page bodies in a single call.
 - Fault-tolerant editing: `editline` matches exactly first, then tolerates CRLF, trailing spaces, smart quotes, Unicode dashes, and special whitespace; only unambiguous matches are applied.
@@ -95,9 +101,11 @@ On first run, `~/.yjlcoder/config.json` is generated automatically. The `YJLCODE
     "compress_threshold": 0.75,
     "tool_result_max_tokens": 1000
   },
-  "fuckloop": true
+  "tool_loop": true
 }
 ```
+
+- `tool_loop: true` enables post-tool loop handling; use `/toolloop on|off` in the legacy TUI to toggle it. Existing configurations and follow-up tasks remain readable after upgrading; subsequent saves use the new names.
 
 - `provider.native_tools: true` uses native function calling (recommended for DeepSeek); `false` uses the text protocol (recommended for small local models).
 - `search` web search is free with zero keys by default: the `web_search` auto pool = Bing + DuckDuckGo (`ddg_endpoints` accepts custom mirrors; defaults to html/lite rotation) + Wikipedia, with automatic retries, endpoint rotation, a 5-minute cooldown after consecutive failures, and ad-link filtering. Optional `brave_key` / `tavily_key` (free tiers per their sites) join the pool automatically; set `searxng_url` or self-host locally (`bash deploy/searxng/start.sh`, auto-detected on 127.0.0.1:8888). `bing_ensearch: false` disables international Bing results; `timeout_secs` is the free-engine request timeout (default 15).
@@ -183,7 +191,7 @@ src/
   skills.rs      skill install / list / inject
 ```
 
-Threading model: main rendering loop + stdin input thread + one agent worker thread per turn (`std::sync::mpsc`), with the QQ bridge on its own thread. The rest uses blocking I/O on std threads; only llm.rs runs a single-threaded tokio runtime for cancellable reqwest streaming SSE requests. Direct dependencies (8): serde / serde_json / ureq / reqwest / tokio / tungstenite / libc / unicode-width.
+Threading model: main rendering loop + stdin input thread + one agent worker thread per turn (`std::sync::mpsc`), with the QQ bridge on its own thread. The rest uses blocking I/O on std threads; only llm.rs runs a single-threaded tokio runtime for cancellable reqwest streaming SSE requests. See [Cargo.toml](Cargo.toml) for the dependency list.
 
 ## Design References
 

@@ -392,14 +392,14 @@ fn serve_single_raw_answer() -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, requests)
 }
 #[test]
-fn fuckloop_off_restores_raw_post_tool_model_flow() {
-    let (home, _home_guard) = tmp_home("fuckloop_off");
+fn tool_loop_off_restores_raw_post_tool_model_flow() {
+    let (home, _home_guard) = tmp_home("tool_loop_off");
     let file = home.join("lines.txt");
     std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
     let mut cfg = Config::default();
     cfg.provider.native_tools = true;
     cfg.provider.auto_reload = false;
-    cfg.fuckloop = false;
+    cfg.tool_loop = false;
     let (port, requests) = serve_single_raw_answer();
     let llm = Llm::remote(&format!("http://127.0.0.1:{port}/v1"), "k", "m", 10, 1024);
     let store = SessionStore::new(home.join("sessions"));

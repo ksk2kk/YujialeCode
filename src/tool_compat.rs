@@ -41,6 +41,15 @@ pub fn is_supported_name(name: &str) -> bool {
     let n = clean_name(name);
     crate::registry::find_tool(&n).is_some() || alias_name(&n).is_some() || is_generic_name(&n)
 }
+/// Keep previous command spellings usable without advertising them in the UI.
+pub fn normalize_slash_name(name: &str) -> String {
+    let name = name.trim().trim_start_matches('/').to_ascii_lowercase();
+    match name.as_str() {
+        "fuckmaster" | "goal_followup" => "followup".into(),
+        "fuckloop" | "tool_loop" => "toolloop".into(),
+        _ => name,
+    }
+}
 pub fn normalize_call(raw_op: &str, raw_args: &Value) -> NormalizedCall {
     let cleaned = clean_name(raw_op);
     let mut notes = Vec::new();
@@ -128,7 +137,8 @@ fn alias_name(name: &str) -> Option<&'static str> {
         "remember" => "memory_write",
         "recall" => "memory_search",
         "ask" | "clarify" | "ask_user" | "askuserquestion" => "ask_user_question",
-        "fuckmaster" | "proactive_goal" | "goal_reminder" => "fuck_master",
+        // Legacy tool calls can still appear in saved conversations.
+        "fuckmaster" | "fuck_master" | "followup" | "proactive_goal" | "goal_reminder" => "goal_followup",
         "computer" | "computeruse" | "computer-use" | "computer_control" | "gui" => "computer_use",
         "agent" | "subagent" | "background_agent" | "task_agent" => "spawn_agent",
         "agents" | "agent_list" | "list_subagents" => "list_agents",
@@ -718,9 +728,26 @@ mod tests {
         assert!(call.args["questions"].is_array());
     }
     #[test]
-    fn fuck_master_weak_names_map_to_system_tool() {
-        assert_eq!(normalize_call("FuckMaster", &json!({"action":"list"})).op, "fuck_master");
-        assert_eq!(normalize_call("goal-reminder", &json!({"action":"list"})).op, "fuck_master");
+    fn goal_followup_weak_names_map_to_system_tool() {
+        assert_eq!(normalize_call("followup", &json!({"action":"list"})).op, "goal_followup");
+        assert_eq!(normalize_call("goal-reminder", &json!({"action":"list"})).op, "goal_followup");
+    }
+    #[test]
+    fn legacy_commands_and_saved_tool_calls_use_current_names() {
+        for name in ["/FuckMaster", "followup", "GOAL_FOLLOWUP"] {
+            assert_eq!(normalize_slash_name(name), "followup");
+        }
+        for name in ["/fuckloop", "toolloop", "tool_loop"] {
+            assert_eq!(normalize_slash_name(name), "toolloop");
+        }
+        for name in ["FuckMaster", "fuck_master", "functions.fuck_master"] {
+            assert!(is_supported_name(name));
+            let call = normalize_call(name, &json!({"action":"pause", "id":"fm-0001"}));
+            assert_eq!(call.op, "goal_followup");
+            assert_eq!(call.args["action"], "pause");
+            assert_eq!(call.args["id"], "fm-0001");
+        }
+        assert_eq!(normalize_slash_name("/MODEL"), "model");
     }
     #[test]
     fn listdir_aliases_and_paging_fields_are_normalized() {

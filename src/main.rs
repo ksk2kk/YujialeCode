@@ -5,7 +5,7 @@ mod compress;
 mod computer_use;
 mod config;
 mod dynamic_tools;
-mod fuck_master;
+mod goal_followup;
 mod goal;
 mod llm;
 mod md;
@@ -293,7 +293,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("config", "供应商配置页（show 查看总览）"),
     ("agents", "管理受限后台 Agent"),
     ("goal", "持续执行目标（状态/暂停/恢复/清除）"),
-    ("FuckMaster", "定时主动通过 QQ 推进目标"),
+    ("followup", "定时主动通过 QQ 推进目标"),
     ("copy", "复制最近一条助手完整回复（Ctrl+O）"),
     ("new", "新建会话"),
     ("ls", "列出会话"),
@@ -306,7 +306,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("commandcountdown", "设置命令默认超时秒数（默认 600）"),
     ("autodangerous", "模型执行命令无需批准（on/off，默认 off）"),
     ("trace", "思考流实时显示开关（on/off）"),
-    ("fuckloop", "工具后思考循环整理开关（on/off）"),
+    ("toolloop", "工具后思考循环整理开关（on/off）"),
     ("save", "导出当前会话（含工具日志）到文件"),
     ("models", "列出/切换服务端模型"),
     ("reloadmodel", "重载模型"),
@@ -495,7 +495,7 @@ fn run_tui(mut cfg: Config, mut llm: Llm, with_qq: bool, open_setup: bool) {
                     Action::Command(cmd) => {
                         let live_cmd = matches!(cmd.split(' ').next(), Some("autodangerous" | "copy"))
                             || goal_control_is_safe_while_running(&cmd)
-                            || cmd.split_whitespace().next().is_some_and(|name| name.eq_ignore_ascii_case("FuckMaster"));
+                            || cmd.split_whitespace().next().is_some_and(|name| tool_compat::normalize_slash_name(name) == "followup");
                         if turns.is_active() && !live_cmd {
                             tui.push_warn(
                                 "当前回合仍在运行，斜杠命令未执行；请等待完成或按 Esc 中断".into(),
@@ -982,7 +982,7 @@ fn handle_command(
         Some((n, r)) => (n, r.trim()),
         None => (cmd, ""),
     };
-    let name = name.to_ascii_lowercase();
+    let name = tool_compat::normalize_slash_name(name);
     match name.as_str() {
         "help" => {
             tui.push_system(
@@ -994,7 +994,7 @@ fn handle_command(
                  /compress     手动压缩上下文\n\
                  /stats        上下文统计\n\
                  /goal <目标>  持续执行直到完成（status/pause/resume/continue/clear）\n\
-                 /FuckMaster [目标] 主动推进；add 2h 目标 / list / pause|resume|now|delete fm-0001\n\
+                 /followup [目标] 主动推进；add 2h 目标 / list / pause|resume|now|delete fm-0001\n\
                  /copy         复制最近一条助手完整回复（Ctrl+O；不受屏幕折行影响）\n\
                  /tool_times <N> 工具调用轮数上限（默认 24，1-200）\n\
                  /timeout <秒> 请求/流式读取超时（默认 120，10-3600）\n\
@@ -1003,7 +1003,7 @@ fn handle_command(
                  ↑↓ 选择 + 回车：允许一次 / 本会话全部同意同类 / 拒绝；随时可开，\n\
                  正在跑的回合不打断，批准面板里按 4 也可直接开启）\n\
                  /trace [on|off] 思考流实时显示开关（默认关闭；思考流全文始终记录到 ~/.yjlcoder/trace/）\n\
-                 /fuckloop [on|off] 工具后思考循环整理开关（默认开启）\n\
+                 /toolloop [on|off] 工具后思考循环整理开关（默认开启）\n\
                  /save [路径]  导出当前会话（含工具日志）到文件（默认 ~/.yjlcoder/export/）\n\
                  /reloadmodel  重载模型（卡死/输出异常时恢复）\n\
                  \n\
@@ -1035,8 +1035,8 @@ fn handle_command(
                  无需模型介入。启动时若上次会话有历史会自动开新会话，/use 可切回旧会话".into(),
             );
         }
-        "fuckmaster" => {
-            match fuck_master::execute_slash(cfg, store.current_id(), rest) {
+        "followup" => {
+            match goal_followup::execute_slash(cfg, store.current_id(), rest) {
                 Ok(reply) => tui.push_system(reply),
                 Err(error) => tui.push_error(error),
             }
@@ -1537,7 +1537,7 @@ fn handle_command(
                  \n  [其他]\n\
                  \x20 工具轮数上限: {}（/tool_times）\n\
                  \x20 请求超时: {}s（/timeout）\n\
-                 \x20 原生工具: {}（/fuckloop 相关）\n\
+                 \x20 原生工具: {}（/toolloop 相关）\n\
                  \x20 模型服务: {llama_svc}",
                 cfg.provider.base_url,
                 cfg.provider.model,
@@ -1717,30 +1717,30 @@ fn handle_command(
                 if on { "开启" } else { "关闭" }
             ));
         }
-        "fuckloop" => {
+        "toolloop" => {
             let on = match rest {
                 "on" => true,
                 "off" => false,
                 "" => {
                     tui.push_system(format!(
-                        "fuckloop 当前已{}。用法: /fuckloop on|off",
-                        if cfg.fuckloop { "开启" } else { "关闭" }
+                        "toolloop 当前已{}。用法: /toolloop on|off",
+                        if cfg.tool_loop { "开启" } else { "关闭" }
                     ));
                     return;
                 }
                 other => {
                     tui.push_error(format!(
-                        "用法: /fuckloop on|off（未知参数 {other}）"
+                        "用法: /toolloop on|off（未知参数 {other}）"
                     ));
                     return;
                 }
             };
-            cfg.fuckloop = on;
+            cfg.tool_loop = on;
             cfg.save();
             tui.push_system(if on {
-                "fuckloop 已开启：工具结果后禁止长思考，循环时硬截断并整理；精确 Read 行号直接回答。下一条消息生效。".into()
+                "toolloop 已开启：工具结果后禁止长思考，循环时硬截断并整理；精确 Read 行号直接回答。下一条消息生效。".into()
             } else {
-                "fuckloop 已关闭：工具结果后的整理、禁思考、短硬截断和精确 Read 直答均停用，恢复模型原始流程。下一条消息生效。".into()
+                "toolloop 已关闭：工具结果后的整理、禁思考、短硬截断和精确 Read 直答均停用，恢复模型原始流程。下一条消息生效。".into()
             });
         }
         "save" => {

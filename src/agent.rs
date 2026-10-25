@@ -43,7 +43,7 @@ impl Drop for ActiveTurnGuard {
         ACTIVE_AGENT_TURNS.fetch_sub(1, Ordering::AcqRel);
     }
 }
-//上面这依托说人话就是AtiveTurnGrad就是一个工牌，零大小类型，就标记一个事情，比如这个事件就叫做牛马上班。我他妈来啦！enter()函数就会给工厂的人数+1,你正常下班还是异常下班，rust的编译器会自动给你插入drop()方法
+// ActiveTurnGuard 是零大小的回合标记：进入时增加计数，离开作用域时通过 Drop 自动减少计数。
 //
 
 
@@ -508,7 +508,7 @@ impl Agent {
                 self.prepare_tool_output(op, &args, &output)
             );
             self.store.append(&message_with_tool_image("user", result_msg, None));
-            if self.cfg.fuckloop && op == "readline" {
+            if self.cfg.tool_loop && op == "readline" {
                 if let Some(answer) = deterministic_read_line_answer(user_input, &output) {
                     self.store.append(&Msg::new("assistant", answer.clone()));
                     traced(AgentEvent::Delta(answer.clone()));
@@ -555,7 +555,7 @@ impl Agent {
                 ),
                 stream: !self.chat_mode,
             };
-            let attempt = if self.cfg.fuckloop && has_tool_result {
+            let attempt = if self.cfg.tool_loop && has_tool_result {
                 self.llm
                     .stream_without_reasoning(&req, &self.cancel, |ev| fwd_stream(ev, &mut traced))
             } else {
@@ -580,7 +580,7 @@ impl Agent {
                         return Err(format!("{e}（重载也未成功，结束本轮）"));
                     }
                     interrupts = 0;
-                    if self.cfg.fuckloop && has_tool_result {
+                    if self.cfg.tool_loop && has_tool_result {
                         self.llm.stream_without_reasoning(&req, &self.cancel, |ev| {
                             fwd_stream(ev, &mut traced)
                         })?
@@ -640,7 +640,7 @@ impl Agent {
                     continue;
                 }
                 if !result.reasoning.trim().is_empty() {
-                    if self.cfg.fuckloop && has_tool_result {
+                    if self.cfg.tool_loop && has_tool_result {
                         let reason = "工具结果已就绪，但模型思考流空转且没有生成正文";
                         traced(AgentEvent::Notice(
                             "检测到工具结果后的思考流循环，立即切换无思考收尾…".into(),
@@ -680,7 +680,7 @@ impl Agent {
                 && !result.reasoning.trim().is_empty()
                 && result.tool_calls.is_empty()
             {
-                if self.cfg.fuckloop && has_tool_result {
+                if self.cfg.tool_loop && has_tool_result {
                     let reason = "工具结果已就绪，但模型思考流空转且没有生成正文";
                     traced(AgentEvent::Notice(
                         "检测到工具结果后的思考流循环，立即切换无思考收尾…".into(),

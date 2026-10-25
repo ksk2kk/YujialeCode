@@ -15,8 +15,9 @@ pub struct Config {
     pub search: Search,
     #[serde(default = "default_tool_times")]
     pub tool_times: usize,
-    #[serde(default = "default_true")]
-    pub fuckloop: bool,
+    // Read the former key for existing installations; serialization uses only tool_loop.
+    #[serde(default = "default_true", alias = "fuckloop")]
+    pub tool_loop: bool,
     #[serde(default = "default_command_timeout")]
     pub command_timeout_secs: u64,
     #[serde(default)]
@@ -271,7 +272,7 @@ impl Default for Config {
             pricing: Pricing::default(),
             search: Search::default(),
             tool_times: default_tool_times(),
-            fuckloop: true,
+            tool_loop: true,
             command_timeout_secs: default_command_timeout(),
             llama: Llama::default(),
             trace: Trace::default(),
@@ -355,7 +356,7 @@ mod tests {
         assert_eq!(c2.qq.auto_new, 0);
         assert!(!c2.pricing.enabled);
         assert_eq!(c2.tool_times, 24);
-        assert!(c2.fuckloop);
+        assert!(c2.tool_loop);
         let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
         v["qq"].as_object_mut().unwrap().remove("auto_new");
         let old: Config = serde_json::from_value(v).unwrap();
@@ -365,9 +366,9 @@ mod tests {
         let old2: Config = serde_json::from_value(v).unwrap();
         assert_eq!(old2.tool_times, default_tool_times());
         let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        v.as_object_mut().unwrap().remove("fuckloop");
-        let old_fuckloop: Config = serde_json::from_value(v).unwrap();
-        assert!(old_fuckloop.fuckloop);
+        v.as_object_mut().unwrap().remove("tool_loop");
+        let old_tool_loop: Config = serde_json::from_value(v).unwrap();
+        assert!(old_tool_loop.tool_loop);
         let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
         v.as_object_mut().unwrap().remove("llama");
         v.as_object_mut().unwrap().remove("trace");
@@ -392,6 +393,36 @@ mod tests {
         let old6: Config = serde_json::from_value(v).unwrap();
         assert!(old6.agents.enabled);
         assert_eq!(old6.agents.max_concurrent, 1);
+    }
+    #[test]
+    fn legacy_tool_loop_setting_is_preserved_and_saved_under_new_name() {
+        for enabled in [false, true] {
+            let mut value = serde_json::to_value(Config::default()).unwrap();
+            let fields = value.as_object_mut().unwrap();
+            fields.remove("tool_loop");
+            // The former key must remain readable, including an explicit false value.
+            fields.insert("fuckloop".into(), serde_json::json!(enabled));
+            let mut config: Config = serde_json::from_value(value).unwrap();
+            assert_eq!(config.tool_loop, enabled);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "yjlcoder-config-tool-loop-{}-{nonce}-{enabled}",
+                std::process::id()
+            ));
+            config.set_test_data_dir(dir.clone());
+            config.save();
+            let saved: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(dir.join("config.json")).unwrap()
+            ).unwrap();
+            assert_eq!(saved["tool_loop"], enabled);
+            assert!(saved.get("fuckloop").is_none());
+            let reloaded: Config = serde_json::from_value(saved).unwrap();
+            assert_eq!(reloaded.tool_loop, enabled);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[test]
     fn pricing_counts_cache_hits_and_misses_separately() {

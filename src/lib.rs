@@ -5,7 +5,7 @@ pub mod compress;
 pub mod computer_use;
 pub mod config;
 pub mod dynamic_tools;
-pub mod fuck_master;
+pub mod goal_followup;
 pub mod goal;
 pub mod llm;
 pub mod md;

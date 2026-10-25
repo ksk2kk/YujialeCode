@@ -162,7 +162,7 @@ pub const CATEGORIES: &[Category] = &[
         title: "持续目标",
         tools: &[
             ToolDef { name: "goal", desc: "读取目标状态，或在严格完成审计后标记 complete。\n- 同一不可克服原因连续三轮才可 blocked", args: "{\"action\":\"get\"} 或 {\"action\":\"update\",\"status\":\"complete|blocked\",\"reason\":\"证据或阻塞原因\"}" },
-            ToolDef { name: "fuck_master", desc: "管理主人授权的主动推进任务：触发时有管理员权限，模型空闲才经 QQ 追问。\n- action: add|list|pause|resume|now|delete", args: "{\"action\":\"add|list|pause|resume|now|delete\",\"goal\":\"推进找工作学习路线\",\"every\":\"1d\",\"chat\":\"private:123\",\"id\":\"fm-0001\"}" },
+            ToolDef { name: "goal_followup", desc: "管理主人授权的主动推进任务：触发时有管理员权限，模型空闲才经 QQ 追问。\n- action: add|list|pause|resume|now|delete", args: "{\"action\":\"add|list|pause|resume|now|delete\",\"goal\":\"推进找工作学习路线\",\"every\":\"1d\",\"chat\":\"private:123\",\"id\":\"fm-0001\"}" },
         ],
     },
 ];
@@ -255,7 +255,7 @@ mod tests {
         assert!(names.contains(&"portscan"));
         assert!(names.contains(&"install_skill"));
         assert!(names.contains(&"qq_send"));
-        assert!(names.contains(&"fuck_master"));
+        assert!(names.contains(&"goal_followup"));
         assert!(names.contains(&"computer_use"));
     }
     #[test]
@@ -265,7 +265,7 @@ mod tests {
         assert!(index.contains("[sec]"));
         let file = list_category_text("file").unwrap();
         assert!(file.contains("readline"));
-        assert!(list_category_text("goal").unwrap().contains("fuck_master"));
+        assert!(list_category_text("goal").unwrap().contains("goal_followup"));
         assert!(list_category_text("computer").unwrap().contains("computer_use"));
         assert!(list_category_text("nope").is_none());
     }

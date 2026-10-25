@@ -2,17 +2,19 @@
 
 [English](README.en.md) | [中文](README.md)
 
-专门为本地模型玩家开发的 code agent。纯 Rust 实现，极致简约的系统提示词设计，30 tokens 的速度下也能流畅使用。完美兼容 Claude 风格 skill。
+YujialeCode 是面向本地大语言模型的 Rust 编程代理，支持读取和编辑文件、运行命令、管理上下文，以及 Claude 风格的技能。它可以连接 LM Studio、Ollama、vLLM 等 OpenAI 兼容服务，也支持云端模型端点。
 
-> **写给第一次接触本地 Agent 的你：** 你不需要先学会复杂的提示词，也不必因为模型不够聪明而放弃。YujialeCode 不靠堆叠提示词“祈祷模型听话”，而是用纯 Rust 工具层替模型兜底：自动纠正工具调用、完整读取文件、持续推进 Goal，并支持按需热注册新工具。你只需要尽量说清楚想做什么，剩下的路由、重试和失败恢复交给它。
->
-> 这是一个会持续维护的长期项目。我会认真对待每一次卡住、崩溃和“不好用”，持续修复那些令人困惑的细节，也会不断吸收优秀开源项目的经验。希望本地模型 Agent 不只是少数人的玩具，而是一件普通用户也能放心拿起来使用的工具。
+**English overview:** YujialeCode is a Rust coding agent for local language models. It gives models tools to read and edit files, run commands, and manage context, with recovery for malformed tool calls. It works with OpenAI-compatible model servers such as LM Studio, Ollama, and vLLM, as well as hosted endpoints. [Read the English documentation →](README.en.md)
+
+## 为什么做
+
+我想让运行在自己电脑上的模型真正参与日常编程。本地模型会写代码，但在实际任务中，写错工具参数、命令卡住、上下文越来越长，都可能让任务中断。YujialeCode 围绕这些具体问题改进工具调用、命令执行和上下文管理，让用户能看清执行过程，也让模型在出错后有机会继续完成任务。我设计项目的架构和工作流程，借助 AI 编程工具完成大部分代码实现，并负责测试、定位问题和持续改进；项目采用的开源组件和设计参考在下文单独列出。
 
 ## 致谢
 
 本项目以我的朋友 [Yujiale](https://github.com/dawalishi821) 的名字命名——YujialeCode 中的 "Yujiale" 正是他的名字。祝 Yujiale 生日快乐！
 
-极简纯 Rust 本地模型 CLI Agent：依赖少（serde / ureq / reqwest / tokio / tungstenite 等 8 个 crate）、低系统提示词设计。面向 DeepSeek / Ollama / LM Studio / vLLM 等任意 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊极速响应。
+纯 Rust 本地模型 CLI Agent，采用简短的系统提示词。面向 DeepSeek / Ollama / LM Studio / vLLM 等 OpenAI 兼容端点；`--mock` 离线演示无需任何 API key 即可跑通全流程；可选接入 QQ（OneBot v11，NapCat / Lagrange），支持群聊与私聊。
 
 **界面已升级为 Grok Build TUI**（`ycode` 启动）：整树引入 [xai-org/grok-build](https://github.com/xai-org/grok-build) 的终端 UI（Apache-2.0，见 `vendor/`），由本项目实现的后端桥（`yjl-bridge`）驱动——无任何 x.ai 登录，提问卡片、模型选择器、插件市场、斜杠补全全部可用；首启内置 25 家供应商 + 本地服务自动探测的配置向导。原手写 TUI 保留为 `--legacy-tui`。
 
@@ -22,7 +24,7 @@
 - 双协议工具调用：text 模式解析 ```` ```tool {...} ```` 代码块；native 模式直接注册 `readline`、`execute_command`、`list_tools`、`ask_user` 四个核心入口，其余工具动态发现。
 - 不打扰用户的 Computer Use：默认不再碰真实桌面。Linux 每个会话拥有独立的 headless Sway compositor（独立 Wayland socket、seat、焦点、键盘和虚拟指针），可运行任意 GUI；网页可选独立 Chromium/CDP，成本更低。原有 Linux Wayland、macOS、Windows 宿主桌面后端仍保留，但必须明确传 `backend=host`。连续动作可一次提交，最后只送一张截图给本地视觉模型。
   - 原理、成熟方案对比和平台边界见 [Computer Use 隔离设计](docs/computer-use-isolation.md)。
-- 主动推进目标：`/FuckMaster` 可创建定时跟进；Agent 忙碌时提醒进入等待队列，空闲后再通过 TUI/QQ 主动询问进度。QQ 输出在代码层统一转成无 Markdown、无 emoji 的纯文本。
+- 主动推进目标：`/followup` 可创建定时跟进；Agent 忙碌时提醒进入等待队列，空闲后再通过 TUI/QQ 主动询问进度。QQ 输出在代码层统一转成无 Markdown、无 emoji 的纯文本。
 - 脚本不再像“黑盒”：命令先显示，运行时原位刷新最近输出、耗时、行数和体积；Esc 或超时会清理整棵进程树，脚本也不会和输入框抢键盘。
 - 弱模型兼容路由：工具名、参数名、嵌套层级、字符串 JSON、字符串数字/布尔/数组写错时自动纠正；工具选错但参数意图明确时强制改道。
 - 聚合网络研究（免费三层）：`web_search` 零 key 开箱即用——并发聚合 Bing（国际结果）、DuckDuckGo（html/lite 双端点轮换）和 Wikipedia 官方 API，单引擎被反爬拦截时自动退避重试换端点，连续失败自动冷却 5 分钟，结果去广告跟踪链、跨源去重、质量排序和域名过滤；可选免费 key（Brave / Tavily）自动加入聚合池；终极免费稳定方案 `bash deploy/searxng/start.sh` 一键自托管本地 SearXNG（自动探测纳入）。`web_fetch` 正文抓取失败或遇到 JS 渲染壳时自动经 Jina Reader 免费转换（内网地址不外发）；`web_research` 一次调用自动做互补查询并抓取精选正文。
@@ -30,7 +32,7 @@
 - 强制 Read 通道：兼容 `Read/read_file/readline` 与 `file_path/offset/limit`；Read 是原生工具列表第一项，默认读取前 2000 行，每页连续完整并给出精确下一页 offset。简单 `cat FILE` 在执行前硬转 Read，复杂 cat 直接拒绝。
 - 不会折叠的目录枚举：`ls/dir/list_directory/listdir` 统一进入连续分页器，默认 200 项、最多 1000 项；简单的 `ls -la` 命令也自动硬转。
 - 结构化提问：`ask_user_question` 对齐 Grok Build 协议（`question/options[{label,description,preview}]/multi_select`，一屏一题卡片、单选 `(●)` 多选 `[x]`、Other 免输入行、Esc 阶梯取消；取消是成功结果，模型收到"按最佳判断继续"）。
-- Grok Build UI 深度兼容：供应商向导（25 家注册表 + 本地探测，选完自动填端点/密钥/模型）、`/model` 切换真实落盘、`/plugin` 插件市场（安装走 grok 原生编排，装完自动把技能同步给本 agent）、Skills 面板、`/skills` `/cfg show` `/server` `/apikey` `/ctx` `/budget` `/price` `/save` `/ls` `/new` `/use` `/rm` `/stats` `/goal` `/FuckMaster` `/qqadmin` 等斜杠命令全部接入。
+- Grok Build UI 深度兼容：供应商向导（25 家注册表 + 本地探测，选完自动填端点/密钥/模型）、`/model` 切换真实落盘、`/plugin` 插件市场（安装走 grok 原生编排，装完自动把技能同步给本 agent）、Skills 面板、`/skills` `/cfg show` `/server` `/apikey` `/ctx` `/budget` `/price` `/save` `/ls` `/new` `/use` `/rm` `/stats` `/goal` `/followup` `/qqadmin` 等斜杠命令全部接入。
 - 前台回合硬串行：生成中继续发送消息会进入 FIFO 队列；Ctrl+C、过程错误和连续 `ask_user` 都不会提前释放回合锁。
 - 控制层防空转：第三次相同调用、连续三次相同结果或连续四次失败会熔断；达到工具上限或模型损坏时执行一次无工具收尾。
 - 大结果外置：普通工具的超长结果完整保存到 `~/.yjlcoder/tool-results/`。
@@ -104,9 +106,11 @@ yjlcoder --model <name>   # 临时切换模型
     "compress_threshold": 0.75,
     "tool_result_max_tokens": 1000
   },
-  "fuckloop": true
+  "tool_loop": true
 }
 ```
+
+- `tool_loop: true` 启用工具结果后的循环整理；旧版 TUI 中可用 `/toolloop on|off` 切换。升级时会继续读取旧配置和跟进任务，保存时使用新名称。
 
 - `provider.native_tools: true` 用原生 function calling（DeepSeek 推荐）；`false` 走 text 协议（本地小模型推荐）。
 - `search` 网络搜索全部免费、默认零 key：`web_search` 的 auto 池 = Bing + DuckDuckGo（`ddg_endpoints` 可自定义镜像，默认 html/lite 双端点）+ Wikipedia，自动重试换端点、连续失败冷却 5 分钟、过滤广告链接；可选 `brave_key` / `tavily_key`（各家免费额度以官网为准）自动加入聚合池；`searxng_url` 或本地自托管（`bash deploy/searxng/start.sh` 一键启动，自动探测 127.0.0.1:8888）；`bing_ensearch: false` 关闭 Bing 国际结果；`timeout_secs` 免费引擎请求超时（默认 15）。
@@ -201,7 +205,7 @@ src/
   skills.rs      技能安装 / 列表 / 注入
 ```
 
-线程模型：主线程渲染循环 + stdin 输入线程 + 每轮一个 agent 工作线程（`std::sync::mpsc` 通信），QQ 桥接独立线程。其余阻塞 I/O 用 std 线程；仅 llm.rs 用单线程 tokio runtime 跑可取消的 reqwest 流式 SSE 请求。直接依赖 8 个：serde / serde_json / ureq / reqwest / tokio / tungstenite / libc / unicode-width。
+线程模型：主线程渲染循环 + stdin 输入线程 + 每轮一个 agent 工作线程（`std::sync::mpsc` 通信），QQ 桥接独立线程。其余阻塞 I/O 用 std 线程；仅 llm.rs 用单线程 tokio runtime 跑可取消的 reqwest 流式 SSE 请求。依赖列表见 [Cargo.toml](Cargo.toml)。
 
 ### Grok UI 桥接（vendor/grok-build + yjl-bridge）
 

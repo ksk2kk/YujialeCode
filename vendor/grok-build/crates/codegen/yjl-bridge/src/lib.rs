@@ -52,7 +52,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cfg", "配置总览（/cfg show）"),
     ("agents", "管理受限后台 Agent"),
     ("goal", "持续执行目标（状态/暂停/恢复/清除）"),
-    ("FuckMaster", "定时主动通过 QQ 推进目标"),
+    ("followup", "定时主动通过 QQ 推进目标"),
     ("new", "新建会话"),
     ("ls", "列出会话"),
     ("use", "切换会话"),
@@ -854,7 +854,7 @@ impl YjlAgent {
     /// 只覆盖无副作用或作用于会话存储的命令；配置类命令提示用 yjlcoder TUI。
     fn handle_slash_command(&self, _session_id: &str, line: &str) -> String {
         let mut parts = line.trim_start_matches('/').splitn(2, ' ');
-        let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let name = yjlcoder::tool_compat::normalize_slash_name(parts.next().unwrap_or_default());
         let rest = parts.next().unwrap_or_default().trim().to_string();
         let mut guard = match self.session.lock() {
             Ok(guard) => guard,
@@ -967,9 +967,9 @@ impl YjlAgent {
                 // 与原版 TUI 同一入口：goal::handle_slash
                 yjlcoder::goal::handle_slash(&session.cfg, session.store.current_id(), &rest).notice
             }
-            "fuckmaster" => {
-                // 与原版 TUI 同一入口：fuck_master::execute_slash
-                match yjlcoder::fuck_master::execute_slash(&session.cfg, session.store.current_id(), &rest)
+            "followup" => {
+                // 与原版 TUI 同一入口：goal_followup::execute_slash
+                match yjlcoder::goal_followup::execute_slash(&session.cfg, session.store.current_id(), &rest)
                 {
                     Ok(reply) => reply,
                     Err(e) => format!("⚠ {e}"),

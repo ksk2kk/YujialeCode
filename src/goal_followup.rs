@@ -2,7 +2,7 @@ use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,7 @@ const STALE_QUEUE_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct MasterTask {
+pub struct FollowupTask {
     pub id: String,
     pub chat: String,
     pub goal: String,
@@ -27,7 +27,7 @@ pub struct MasterTask {
     pub created_at: u64,
 }
 
-impl Default for MasterTask {
+impl Default for FollowupTask {
     fn default() -> Self {
         Self {
             id: String::new(),
@@ -47,9 +47,9 @@ impl Default for MasterTask {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-struct MasterStore {
+struct FollowupStore {
     version: u32,
-    tasks: Vec<MasterTask>,
+    tasks: Vec<FollowupTask>,
 }
 
 fn now_epoch() -> u64 {
@@ -60,29 +60,46 @@ fn now_epoch() -> u64 {
 }
 
 fn store_path(cfg: &Config) -> PathBuf {
+    cfg.data_dir().join("goal_followup.json")
+}
+
+fn legacy_store_path(cfg: &Config) -> PathBuf {
+    // Read-only migration source; all future writes use the neutral filename.
     cfg.data_dir().join("fuck_master.json")
 }
 
-fn load_unlocked(cfg: &Config) -> MasterStore {
-    fs::read_to_string(store_path(cfg))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(|| MasterStore {
-            version: 1,
-            tasks: Vec::new(),
-        })
+fn read_store(path: &Path) -> Result<Option<FollowupStore>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("解析目标跟进状态失败（{}）: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读取目标跟进状态失败（{}）: {e}", path.display())),
+    }
 }
 
-fn save_unlocked(cfg: &Config, store: &MasterStore) -> Result<(), String> {
+fn load_unlocked(cfg: &Config) -> Result<FollowupStore, String> {
+    // An existing new store is authoritative, even if all tasks were deleted.
+    // Never replace unreadable or invalid data with an empty store.
+    if let Some(store) = read_store(&store_path(cfg))? {
+        return Ok(store);
+    }
+    Ok(read_store(&legacy_store_path(cfg))?.unwrap_or_else(|| FollowupStore {
+        version: 1,
+        tasks: Vec::new(),
+    }))
+}
+
+fn save_unlocked(cfg: &Config, store: &FollowupStore) -> Result<(), String> {
     let path = store_path(cfg);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建 FuckMaster 目录失败: {e}"))?;
+        fs::create_dir_all(parent).map_err(|e| format!("创建 followup 目录失败: {e}"))?;
     }
     let text =
-        serde_json::to_string_pretty(store).map_err(|e| format!("序列化 FuckMaster 失败: {e}"))?;
+        serde_json::to_string_pretty(store).map_err(|e| format!("序列化 followup 失败: {e}"))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text).map_err(|e| format!("保存 FuckMaster 失败: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("替换 FuckMaster 状态失败: {e}"))
+    fs::write(&tmp, text).map_err(|e| format!("保存 followup 失败: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("替换 followup 状态失败: {e}"))
 }
 
 fn chat_from_session(session_id: &str) -> Option<String> {
@@ -168,7 +185,7 @@ fn interval_label(secs: u64) -> String {
     }
 }
 
-fn task_id(tasks: &[MasterTask]) -> String {
+fn task_id(tasks: &[FollowupTask]) -> String {
     let next = tasks
         .iter()
         .filter_map(|task| task.id.strip_prefix("fm-")?.parse::<u64>().ok())
@@ -191,8 +208,8 @@ pub fn execute_tool(cfg: &Config, session_id: &str, args: &Value) -> Result<Stri
         .to_ascii_lowercase();
     let _guard = STORE_LOCK
         .lock()
-        .map_err(|_| "FuckMaster 状态锁损坏".to_string())?;
-    let mut store = load_unlocked(cfg);
+        .map_err(|_| "followup 状态锁损坏".to_string())?;
+    let mut store = load_unlocked(cfg)?;
     match action.as_str() {
         "add" | "create" | "register" => {
             let goal = arg_text(args, "goal")
@@ -213,7 +230,7 @@ pub fn execute_tool(cfg: &Config, session_id: &str, args: &Value) -> Result<Stri
             let interval_secs = parse_interval(every)?;
             let now = now_epoch();
             let id = task_id(&store.tasks);
-            store.tasks.push(MasterTask {
+            store.tasks.push(FollowupTask {
                 id: id.clone(),
                 chat: chat.clone(),
                 goal: goal.to_string(),
@@ -236,15 +253,15 @@ pub fn execute_tool(cfg: &Config, session_id: &str, args: &Value) -> Result<Stri
             let chat_filter = arg_text(args, "chat")
                 .map(str::to_string)
                 .or_else(|| chat_from_session(session_id));
-            let tasks: Vec<&MasterTask> = store
+            let tasks: Vec<&FollowupTask> = store
                 .tasks
                 .iter()
                 .filter(|task| chat_filter.as_ref().is_none_or(|chat| &task.chat == chat))
                 .collect();
             if tasks.is_empty() {
-                return Ok("FuckMaster 暂无推进任务".into());
+                return Ok("followup 暂无推进任务".into());
             }
-            let mut out = String::from("FuckMaster 推进任务\n");
+            let mut out = String::from("followup 推进任务\n");
             for task in tasks {
                 let state = if !task.enabled {
                     "已暂停"
@@ -270,7 +287,7 @@ pub fn execute_tool(cfg: &Config, session_id: &str, args: &Value) -> Result<Stri
                 .tasks
                 .iter()
                 .position(|task| task.id == id)
-                .ok_or_else(|| format!("没有找到 FuckMaster 任务 {id}"))?;
+                .ok_or_else(|| format!("没有找到 followup 任务 {id}"))?;
             if matches!(action.as_str(), "delete" | "remove") {
                 store.tasks.remove(index);
                 save_unlocked(cfg, &store)?;
@@ -356,11 +373,11 @@ pub fn execute_slash(cfg: &Config, session_id: &str, raw: &str) -> Result<String
     )
 }
 
-pub fn claim_due(cfg: &Config, now: u64) -> Result<Option<MasterTask>, String> {
+pub fn claim_due(cfg: &Config, now: u64) -> Result<Option<FollowupTask>, String> {
     let _guard = STORE_LOCK
         .lock()
-        .map_err(|_| "FuckMaster 状态锁损坏".to_string())?;
-    let mut store = load_unlocked(cfg);
+        .map_err(|_| "followup 状态锁损坏".to_string())?;
+    let mut store = load_unlocked(cfg)?;
     let mut recovered_stale_queue = false;
     for task in &mut store.tasks {
         if task.queued
@@ -397,22 +414,21 @@ pub fn still_dispatchable(cfg: &Config, id: &str) -> bool {
     let Ok(_guard) = STORE_LOCK.lock() else {
         return false;
     };
-    load_unlocked(cfg)
-        .tasks
-        .iter()
-        .any(|task| task.id == id && task.enabled && task.queued)
+    load_unlocked(cfg).is_ok_and(|store| {
+        store.tasks.iter().any(|task| task.id == id && task.enabled && task.queued)
+    })
 }
 
 pub fn mark_delivered(cfg: &Config, id: &str, now: u64) -> Result<(), String> {
     let _guard = STORE_LOCK
         .lock()
-        .map_err(|_| "FuckMaster 状态锁损坏".to_string())?;
-    let mut store = load_unlocked(cfg);
+        .map_err(|_| "followup 状态锁损坏".to_string())?;
+    let mut store = load_unlocked(cfg)?;
     let task = store
         .tasks
         .iter_mut()
         .find(|task| task.id == id)
-        .ok_or_else(|| format!("没有找到 FuckMaster 任务 {id}"))?;
+        .ok_or_else(|| format!("没有找到 followup 任务 {id}"))?;
     task.queued = false;
     task.queued_at = None;
     task.last_sent_at = Some(now);
@@ -424,13 +440,13 @@ pub fn mark_delivered(cfg: &Config, id: &str, now: u64) -> Result<(), String> {
 pub fn mark_failed(cfg: &Config, id: &str, now: u64) -> Result<(), String> {
     let _guard = STORE_LOCK
         .lock()
-        .map_err(|_| "FuckMaster 状态锁损坏".to_string())?;
-    let mut store = load_unlocked(cfg);
+        .map_err(|_| "followup 状态锁损坏".to_string())?;
+    let mut store = load_unlocked(cfg)?;
     let task = store
         .tasks
         .iter_mut()
         .find(|task| task.id == id)
-        .ok_or_else(|| format!("没有找到 FuckMaster 任务 {id}"))?;
+        .ok_or_else(|| format!("没有找到 followup 任务 {id}"))?;
     task.queued = false;
     task.queued_at = None;
     task.next_due_at = now.saturating_add(task.interval_secs.min(5 * 60));
@@ -458,6 +474,84 @@ mod tests {
         ));
         cfg.set_test_data_dir(dir);
         cfg
+    }
+
+    fn write_legacy_store(cfg: &Config) -> String {
+        fs::create_dir_all(cfg.data_dir()).unwrap();
+        let original = serde_json::json!({
+            "version": 1,
+            "tasks": [{
+                "id": "fm-0007", "chat": "group:123", "goal": "已有目标",
+                "interval_secs": 3600, "enabled": true, "next_due_at": 100,
+                "last_sent_at": 50, "queued": false, "queued_at": null,
+                "delivery_count": 3, "created_at": 10
+            }]
+        }).to_string();
+        fs::write(legacy_store_path(cfg), &original).unwrap();
+        original
+    }
+
+    #[test]
+    fn legacy_store_migrates_on_mutation_without_losing_task_state() {
+        let cfg = cfg();
+        let original = write_legacy_store(&cfg);
+        assert!(execute_slash(&cfg, "qq_g123", "list").unwrap().contains("已有目标"));
+        assert!(!store_path(&cfg).exists(), "reading must not rewrite the legacy store");
+        let added = execute_slash(&cfg, "qq_g123", "add 2h 新目标").unwrap();
+        assert!(added.contains("fm-0008"));
+        let migrated: Value = serde_json::from_str(
+            &fs::read_to_string(store_path(&cfg)).unwrap()
+        ).unwrap();
+        let previous: Value = serde_json::from_str(&original).unwrap();
+        assert_eq!(migrated["tasks"][0], previous["tasks"][0]);
+        assert_eq!(migrated["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(fs::read_to_string(legacy_store_path(&cfg)).unwrap(), original);
+        fs::remove_dir_all(cfg.data_dir()).unwrap();
+    }
+
+    #[test]
+    fn empty_new_store_does_not_restore_deleted_legacy_tasks() {
+        let cfg = cfg();
+        write_legacy_store(&cfg);
+        execute_slash(&cfg, "qq_g123", "delete fm-0007").unwrap();
+        assert!(legacy_store_path(&cfg).exists());
+        assert!(load_unlocked(&cfg).unwrap().tasks.is_empty());
+        assert!(claim_due(&cfg, 1000).unwrap().is_none());
+        assert!(execute_slash(&cfg, "qq_g123", "list").unwrap().contains("暂无"));
+        fs::remove_dir_all(cfg.data_dir()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_new_store_does_not_fall_back_or_get_overwritten() {
+        let cfg = cfg();
+        write_legacy_store(&cfg);
+        fs::write(store_path(&cfg), "{invalid").unwrap();
+        assert!(execute_slash(&cfg, "qq_g123", "add 2h 新目标").is_err());
+        assert!(claim_due(&cfg, 1000).is_err());
+        assert!(!still_dispatchable(&cfg, "fm-0007"));
+        assert_eq!(fs::read_to_string(store_path(&cfg)).unwrap(), "{invalid");
+        fs::remove_dir_all(cfg.data_dir()).unwrap();
+    }
+
+    #[test]
+    fn unreadable_new_store_does_not_fall_back_or_get_overwritten() {
+        let cfg = cfg();
+        write_legacy_store(&cfg);
+        fs::create_dir(store_path(&cfg)).unwrap();
+        assert!(execute_slash(&cfg, "qq_g123", "add 2h 新目标").is_err());
+        assert!(store_path(&cfg).is_dir());
+        fs::remove_dir_all(cfg.data_dir()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_legacy_store_does_not_create_empty_replacement() {
+        let cfg = cfg();
+        fs::create_dir_all(cfg.data_dir()).unwrap();
+        fs::write(legacy_store_path(&cfg), "{invalid").unwrap();
+        assert!(execute_slash(&cfg, "qq_g123", "add 2h 新目标").is_err());
+        assert!(!store_path(&cfg).exists());
+        assert_eq!(fs::read_to_string(legacy_store_path(&cfg)).unwrap(), "{invalid");
+        fs::remove_dir_all(cfg.data_dir()).unwrap();
     }
 
     #[test]

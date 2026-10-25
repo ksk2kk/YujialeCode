@@ -183,7 +183,7 @@ pub const KNOWN_OPS: &[&str] = &[
     "memory_write",
     "ask_user_question",
     "goal",
-    "fuck_master",
+    "goal_followup",
     "computer_use",
     "spawn_agent",
     "list_agents",
@@ -377,7 +377,7 @@ fn execute_normalized(op: &str, args: &Value, ctx: &mut ToolCtx) -> Result<Strin
         "memory_write" => memory_write(args, ctx),
         "ask_user_question" => ask_user(args, ctx),
         "goal" => crate::goal::execute_tool(ctx.cfg, ctx.store.current_id(), args),
-        "fuck_master" => crate::fuck_master::execute_tool(ctx.cfg, ctx.store.current_id(), args),
+        "goal_followup" => crate::goal_followup::execute_tool(ctx.cfg, ctx.store.current_id(), args),
         "computer_use" => crate::computer_use::execute(
             ctx.cfg,
             ctx.store.current_id(),
@@ -3476,22 +3476,22 @@ mod tests {
         assert!(r.contains("[file]"));
     }
     #[test]
-    fn fuck_master_is_a_persistent_system_tool() {
+    fn goal_followup_is_a_persistent_system_tool() {
         let dir =
-            std::env::temp_dir().join(format!("yjlcoder_fuck_master_tool_{}", std::process::id()));
+            std::env::temp_dir().join(format!("yjlcoder_goal_followup_tool_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut t = TestCtx::new(dir.join("sessions"));
         t.cfg.set_test_data_dir(dir.clone());
         t.cfg.qq.groups.push(123);
         t.store.new_session("qq_g123");
         let added = execute(
-            "FuckMaster",
+            "followup",
             &json!({"action":"add","goal":"推进学习路线","every":"1h"}),
             &mut t.ctx(),
         )
         .unwrap();
         assert!(added.contains("fm-0001"));
-        let listed = execute("fuck_master", &json!({"action":"list"}), &mut t.ctx()).unwrap();
+        let listed = execute("goal_followup", &json!({"action":"list"}), &mut t.ctx()).unwrap();
         assert!(listed.contains("推进学习路线"));
         let _ = std::fs::remove_dir_all(&dir);
     }
