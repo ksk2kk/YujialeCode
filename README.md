@@ -2,9 +2,52 @@
 
 [English](README.en.md) | [中文](README.md)
 
-YujialeCode 是面向本地大语言模型的 Rust 编程代理，支持读取和编辑文件、运行命令、管理上下文，以及 Claude 风格的技能。它可以连接 LM Studio、Ollama、vLLM 等 OpenAI 兼容服务，也支持云端模型端点。
+**A Rust coding agent built for local LLMs — and for the malformed tool calls that usually kill them.**
 
-**English overview:** YujialeCode is a Rust coding agent for local language models. It gives models tools to read and edit files, run commands, and manage context, with recovery for malformed tool calls. It works with OpenAI-compatible model servers such as LM Studio, Ollama, and vLLM, as well as hosted endpoints. [Read the English documentation →](README.en.md)
+Local models can write code. What they can't reliably do is call tools: wrong tool names, wrong argument names, numbers sent as strings, JSON nested one level too deep. One bad call and the whole task dies.
+
+YujialeCode is built around that failure. Its compatibility layer detects and repairs malformed tool calls — and reroutes a call when the model picked the wrong tool but its intent is clear — so a small local model can actually finish a real coding task, end to end.
+
+Works with LM Studio, Ollama, and vLLM, plus any OpenAI-compatible endpoint. Pure Rust, a deliberately tiny system prompt, smooth even at ~30 tokens/sec. Supports Claude-style skills.
+
+> **中文一句话：** YujialeCode 是专为本地大模型玩家开发的 Rust coding agent——本地模型最容易死在写错工具调用上，它的核心工作就是把这些错误救回来，让弱模型也能真正完成编程任务。
+
+<!-- TODO(demo): 在这里放一段 60–90 秒的 demo（录屏或 GIF）。建议脚本：
+     1) 在 Ollama / LM Studio 里启动一个本地模型，画面里露出模型名；
+     2) 在一个小仓库里给 YujialeCode 一个真实的多步任务；
+     3) 展示一次 malformed tool call 被自动纠正并继续执行——这是整个 demo 的高光；
+     4) 最后停在完成的 diff / 通过的测试上。
+     招生官和新用户应该只看这段就能懂这个项目。 -->
+
+## Quick start
+
+```bash
+# macOS / Linux（一键安装）
+curl -fsSL https://raw.githubusercontent.com/ksk2kk/YujialeCode/main/install.sh | bash
+```
+
+```powershell
+# Windows（PowerShell）
+irm https://raw.githubusercontent.com/ksk2kk/YujialeCode/main/install.ps1 | iex
+```
+
+```bash
+# 离线演示：无需任何 API key、无需下载模型即可跑通全流程
+yjlcoder --mock
+```
+
+## Why local models need a different agent
+
+Frontier-model agents assume the model almost never breaks the protocol. Local models break it constantly. YujialeCode treats that as the normal case:
+
+- **Malformed-call recovery** — Tool names, argument names, nesting depth, string-encoded JSON, and numbers/booleans/arrays sent as strings are auto-corrected. If the model picks the wrong tool but the intent is unambiguous, the call is rerouted instead of failing.
+- **A system prompt that stays out of the way** — Native mode doesn't repeat function schemas; text mode adds only the tool format and one example. More of the context window goes to your code, not to instructions.
+- **Context that survives long tasks** — Automatic context compression (adapted from openai/codex, Apache-2.0), large tool results spilled to disk, and multi-session history you can resume.
+- **Built for weak-model reality** — Dual tool-calling protocols (native function calling, or a text protocol for small models), fault-tolerant file editing, and circuit-breaker guards so a confused model stops instead of spinning.
+
+完整功能列表见下方「特性」章节。
+
+---
 
 ## 为什么做
 
